@@ -1,0 +1,70 @@
+# Rust
+/target
+**/target
+Cargo.lock.bak
+
+# Node (docs + icon generation)
+node_modules
+.vite
+*.local
+
+# Release artifacts
+/dist
+/dist-appimage
+
+# VitePress
+docs/.vitepress/dist
+docs/.vitepress/cache
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Editor / OS
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+*.swp
+
+# RepoHarbor runtime (should never live in repo)
+*.sqlite
+*.sqlite3
+/models
+
+# Secrets / local credentials (never commit)
+.env
+.env.*
+!.env.example
+*.pem
+*credentials*
+*github_token*
+.github_token
+github_disconnected
+**/github_disconnected
+# RepoHarbor machine-local state if ever copied into the tree by mistake
+**/cache.sqlite
+**/cache.sqlite-*
+**/cache.sqlite3
+github_token
+**/.config/repoharbor/**
+**/.local/share/repoharbor/**
+# Legacy Orrery XDG paths (migration source; never commit)
+**/.config/orrery/**
+**/.local/share/orrery/**
+
+# Bundled llama-server runtime — fetched by CI into packaging/llama-runtime/ for
+# the AppImage build, never committed.
+/packaging/llama-runtime/
+
+# Cate IDE local workspace state (machine-specific layout)
+.cate/
+
+# Editor / agent local state (machine-specific; never publish)
+.cursor/
+.claude/
+.codex/
+agent-transcripts/

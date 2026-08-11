@@ -1,0 +1,110 @@
+# RepoHarbor — Design Spec
+
+> A Linux-native command center that puts every repo in your git fleet at harbor — live git status at a glance, one-click launch into your IDE or a terminal coding agent, enriched with multi-host data and local-AI summaries.
+
+This is the living design reference. Decisions here were settled during the design phase (June 2026) and are considered locked unless explicitly revisited.
+
+## Identity
+
+- **Name:** RepoHarbor · **Tagline:** *every repo at harbor — a Linux-native command center for your git fleet*
+- **App id:** `com.digitscode.repoharbor` · **Window title:** "RepoHarbor"
+- **Org/domain (when needed):** DigitsCode · `repoharbor.app` · `repoharbor.dev`
+
+RepoHarbor is DigitsCode's independent Linux-native command center for managing a local git fleet at a glance — discovery, status, host enrichment, and launchers in one dense mission-control surface.
+
+## Stack
+
+> History: RepoHarbor began as a Tauri 2 + React/TypeScript app (Rust core ↔ webview
+> over IPC). It was rewritten as a **native Rust GPUI app** — the webview was
+> CPU-bound on the NVIDIA path; GPU compositing removed that bottleneck. The
+> tables below describe the current stack.
+
+| Layer | Choice | Notes |
+|---|---|---|
+| UI | **GPUI** (Zed's GPU UI framework) | Native Rust, in-process — no webview, no IPC. `gpui-component` for widgets |
+| Rendering | **`blade` (Vulkan)** | GPU-composited; Wayland/X11 direct |
+| Aesthetic | **Dark, dense, "mission control"** | 4–5 cards/row, data-rich, neon accents |
+| Git | **`git2`** (libgit2) | No per-repo subprocess |
+| Persistence | **SQLite** + **TOML config** | `~/.local/share/repoharbor/` (cache, models), `~/.config/repoharbor/config.toml` |
+| Hosts | **`GitForge` providers** | GitHub + GitLab (incl. self-hosted), device-flow OAuth |
+| AI | **Ollama** or embedded **llama.cpp** | Ollama over HTTP, or a bundled `llama-server` (GGUF weights downloaded on first run) |
+
+## Architecture
+
+A three-crate Cargo workspace; the UI calls the core directly (no IPC boundary).
+
+```
+┌──────────────────────────────── repoharbor-core ────────────────────────────────┐
+│  Config (toml)   Scanner (walk→.git)   GitMeta (git2)   Launcher (templates) │
+│  Cache (SQLite)  GitForge providers ── GitHub | GitLab(+self-hosted)         │
+│  AiService (Ollama / bundled llama.cpp + downloaded GGUF)                    │
+└──────────────────────────────────────────────────────────────────────────┘
+        ↑ direct calls (sync git/fs on a bg pool; network via a tokio bridge)
+┌──────────────────────── repoharbor (GPUI app) ──────┬─── repoharbor-platform ────────┐
+│  Shell · Card · Drawer · Command palette ·       │  appearance · tray ·       │
+│  views/ (Inbox/Feed/Explore/Cleanup/Agents/      │  notify · watcher ·        │
+│  DevTools/Settings) · new-project dialog         │  shortcut · agent detect   │
+└──────────────────────────────────────────────────┴────────────────────────┘
+```
+
+## Repo identity / name resolution
+
+Display name resolves in this order (works offline from Phase 1; hosts only enrich):
+
+1. **README H1** (`# Next.js`) → human display name **only when it looks like a short project name** (≤ ~40 chars; not legal notices, "Modules Overview", bilingual ownership banners, etc.)
+2. **Remote repo short name** from `owner/repo` → primary fallback (large on card)
+3. **Directory basename** → final fallback
+4. **Host description** / README first paragraph → tagline/subtitle (not the card title)
+
+The remote slug `owner/repo` remains the host join key regardless of display name.
+
+> Note: GitHub/GitLab have no separate human "display name" field — only a slug + description. A short README H1 is still a good title when it is a real project name; long legal/overview headings are ignored so the card shows the repo or folder name.
+
+## Card anatomy (MVP)
+
+```
+┌─────────────────────────────────────┐
+│ ●  Display Name        ⌥ Rust        │  big name + language dot/badge
+│    owner/repo · ~/dev/folder         │  slug + path, small
+│    First line of README description  │  enrichment
+│  ⎇ main   ↑2 ↓0   ● 3 changes        │  branch · ahead/behind · dirty count
+│  ⟳ last commit 4h ago     [stale?]   │  activity (heuristic)
+│  [ Open in IDE ]   [ ◗ Agent ]       │  launchers
+└─────────────────────────────────────┘
+```
+
+## Multi-host (`GitForge` trait, Phase 2)
+
+Match by parsing the **remote URL host** → route to the right provider. The card model stays uniform; only the provider plumbing differs.
+
+- **GitHub** — `api.github.com`, device-flow OAuth
+- **GitLab** — `gitlab.com` **and configurable self-hosted base URLs** (e.g. `gitlab.acme.io`), device-flow / PAT
+- Future drop-ins: Gitea / Codeberg, Bitbucket
+
+## Roadmap
+
+- **Phase 1 — Local-first grid (current).** Config · scanner (depth + ignore globs, worktree-aware) · git metadata · dark dense grid · sort/filter/search · command palette · IDE/agent launcher · heuristic language/type/activity. Zero external deps, usable daily.
+- **Phase 2 — Multi-host sync.** `GitForge` (GitHub + GitLab/self-hosted), device-flow auth, stars/topics/releases/issues on cards, offline cache.
+- **Phase 3 — Local AI summaries.** Bundled llama.cpp, per-repo "what is this / recent activity" blurbs.
+- **Phase 4 — Starred / followed browser.** Separate view for discovering starred + followed repos across hosts.
+
+## Settled defaults
+
+**Scanning**
+- Locate repos by finding `.git`; do **not** recurse into a repo once found (submodules count as one repo).
+- Configurable scan **depth** (default 3) and **ignore globs** (`node_modules`, `.cache`, `vendor`, `target`, …).
+- Support **multiple root directories**.
+- **Worktree-aware** — surface worktrees under their parent repo, not as duplicates.
+- Manual **refresh** for MVP; `inotify` live-watch is a Phase 1.5 addition.
+
+**Config & data (XDG)**
+- Config: `~/.config/repoharbor/config.toml`
+- Cache + SQLite + models: `~/.local/share/repoharbor/`
+
+**Launcher**
+- `{path}`-templated commands, e.g. IDE `code {path}`, agent `kitty --working-directory {path} -e claude`.
+- PATH-detected sensible defaults (`code` / `zed` / `nvim`; agent via the user's terminal emulator).
+
+**Heuristic classification (Phase 1, no AI)**
+- Project type / primary language from manifest + extension signals (`Cargo.toml` → Rust, `package.json` → Node, `pyproject.toml`/`requirements.txt` → Python, `go.mod` → Go, …).
+- Activity signal (`active` / `stale`) from last-commit recency.

@@ -1,0 +1,7 @@
+# Pinned workspace-wide to current stable. repoharbor (the app crate) is on edition
+# 2024 (gpui + gpui-component, both pinned to Zed rev 1d217ee); repoharbor-core and
+# repoharbor-platform build on the same toolchain, so one channel covers all.
+[toolchain]
+channel = "1.95.0"
+profile = "minimal"
+components = ["clippy", "rustfmt"]

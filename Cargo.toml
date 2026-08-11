@@ -1,0 +1,13 @@
+# Workspace for RepoHarbor — a clean native Rust app, no webview. The Tauri shell
+# and React frontend that used to live alongside this were removed at cutover.
+[workspace]
+resolver = "2"
+members = [
+    "crates/repoharbor-core",     # logic: scan/git/forge/inbox/ai/cache/config/launch
+    "crates/repoharbor-platform", # desktop integration: appearance/tray/notify/watcher
+    "crates/repoharbor",          # the GPUI desktop app (UI + binary)
+]
+
+# Keep app release builds reasonably fast; GPUI's compile dominates regardless.
+[profile.release]
+opt-level = 2
