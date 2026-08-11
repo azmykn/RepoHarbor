@@ -29,13 +29,13 @@ submodules). Highlights:
 |---|---|
 | **Submodule TREE** | Sidebar tree of parents → checked-out submodules; grid hides children by default |
 | **Submodule Update** | Discover + pull each child on its branch; toast lists per-path results |
-| **Actions ⚙ / Discard** | Fleet Stage, Commit, Push, Fetch, Pull, Discard, Reset from the toolbar gear |
+| **Actions ▾ / Discard** | Fleet Stage, Commit, Push, Fetch, Pull, Discard, Reset — Actions only when selected |
 | **Pull behind** | One action pulls every repo that is behind upstream |
 | **Pull-only paths** | Settings prefixes for upstream trees (Pull, no Push; upstream CI demoted) |
-| **Attention chips** | Reason badges + suggested actions; merge conflicts Urgent; empty → All clear |
+| **Needs me mode** | Attention count on the mode segment; reason badges + suggested actions; empty → All clear |
 | **External diff** | Changes drawer opens `meld` / configured `diff_command` |
 | **Terminal + AI commit** | Terminal/agent launcher; Generate & commit when `aiReady` |
-| **Stageable / Commitable / Pushable** | Action chips + right-click on cards **and list** rows |
+| **Working chips** | Dirty / Stageable / Pushable under Working mode + right-click on cards **and list** rows |
 | **Smart +** | One dark **+** chip → tabbed modal: Add local path / Clone from GitHub / New repository |
 | **Top tabs** | Primary nav as horizontal tabs; sidebar stays GROUPS / TREE / ROOTS / … |
 | **Readable chrome** | Window min/max/close and header **+** load gpui-component icons with clearer contrast |
@@ -66,7 +66,7 @@ Point RepoHarbor at the directories where you keep your projects. It discovers e
 
 ## Features
 
-- **Mission Control** — a virtualized grid that scales to hundreds of repos, with filters for visibility (public/private/all), dirty / stageable / commitable / pushable / ahead / behind / starred / stale, workspace root, language, and name search, plus an activity graph and a <kbd>⌘K</kbd> command palette.
+- **Mission Control** — a virtualized grid that scales to hundreds of repos, with **work modes** (Needs me / Behind / Working / All), contextual chips, workspace root / language / name search, Sort: recent|name, and a <kbd>⌘K</kbd> command palette.
 - **Submodule TREE** — parents expand to checked-out submodule children; focusing a parent scopes the grid to that family (children stay out of the flat grid otherwise).
 - **Context menus & fleet** — right-click on grid cards or list rows for Stage all, Commit All / Generate & commit (`aiReady`), Push, Fetch, Pull; multi-select fleet Stage all / Push.
 - **One-click launchers** — open in your IDE or drop a terminal agent into any repo. Pick your tools from preset chips with real brand logos (VS Code, Cursor, Zed, the JetBrains family, …; Kitty/Alacritty/Ghostty/… × Claude Code/Aider/Codex/…). The card buttons show whatever you configured.
@@ -161,8 +161,8 @@ DigitsCode fork (in tree / recent):
 - ✅ Submodule scan + TREE sidebar + hide-children grid.
 - ✅ Submodule Update (discover + pull on branch) + Pull behind + pull-only prefixes (CI silent on cards).
 - ✅ Activity **Log** view (in-memory ring of scans / fleet / toast outcomes).
-- ✅ Actions ⚙ fleet bar (Fetch/Pull/Discard/…) + attention chips + external diff.
-- ✅ Stageable / Commitable / Pushable filters + context menus (grid + list) + fleet Stage/Push.
+- ✅ Actions ▾ (selection-gated) + Needs me / Behind / Working / All work modes + external diff.
+- ✅ Working-mode Dirty / Stageable / Pushable + context menus (grid + list) + fleet Stage/Push.
 - ✅ Smart **+** tabbed modal (path / clone / new repo); Commit All from working tree.
 - ✅ Top tabs chrome; visible TitleBar / header action icons.
 

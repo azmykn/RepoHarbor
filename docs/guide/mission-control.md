@@ -17,18 +17,26 @@ Each card fuses local git state with host enrichment and an optional AI summary:
 - **Host row** — a lock for private repos, CI state, stars, latest release, last-commit time, and the host icon.
 - **Launch actions** — Open in IDE, Agent, reveal Folder, and Open on the host. See [Launchers](./launchers).
 
-## Filtering & sorting
+## Work modes & filtering
 
-The toolbar and chip row narrow the grid:
+The toolbar uses **work modes** instead of a dense all-filters chip strip:
 
-- **Visibility** — `All` / `Public` / `Private`. Public means a non-private remote; private covers private remotes *and* local-only repos (which aren't published anywhere).
-- **Chips** — `Dirty`, `Ahead`, `Starred`, `Stale`, Stageable / Commitable / Pushable (multi-select).
-- **Attention** — repos that need action (merge conflicts, reviews, dirty work, behind, …). Cards show reason badges and a suggested-action line; an empty filter shows **All clear**.
-- **Pull behind** — toolbar action that fleet-pulls every repo currently behind upstream.
-- **Sort** — by Activity, Name, or Stars.
-- **Roots & Languages** — the sidebar filters by workspace root and detected language.
+| Mode | Shows |
+|------|--------|
+| **Needs me** | Attention filter — repos that need action (reviews, dirty work, behind, …). Segment shows the count when &gt; 0. Empty state: **All clear**. |
+| **Behind** | Repos behind upstream. **Pull behind** stays on the toolbar to fleet-pull them. |
+| **Working** | Contextual chips: Dirty / Stageable / Pushable (no Commitable / Ahead duplicates). |
+| **All** | No git filter; optional Public / Private / Starred / Stale chips. |
 
-The activity graph at the top summarises recent commit activity across the visible repos; toggle it from the toolbar.
+Also on the toolbar:
+
+- **Filter…** — substring search over name / slug / path.
+- **Pull behind** — fleet-pulls every repo currently behind upstream.
+- **More ⋮** — Fetch all (host enrichment refresh) and Summarize (when local AI is ready).
+- **Sort: recent** / **Sort: name** — card ordering (not a heatmap toggle).
+- **Grid | List** — layout switch.
+
+Row two holds select-all, **Actions ▾** (only when something is selected), and the mode's contextual chips.
 
 ### Projects & saved views
 
@@ -37,20 +45,22 @@ The sidebar adds two ways to carve up a large workspace:
 - **Projects** — tag repos to group related work, then filter the grid to one tag.
 - **Saved views** — capture the current filter/sort/visibility combination as a named preset and jump back to it in one click. Presets persist locally.
 
+Roots & Languages in the sidebar still filter by workspace root and detected language.
+
 ## Selecting repos
 
 Each card has a checkbox; select one or more (or use the toolbar's select-all) to bring up the **fleet bar** for batch git operations across the selection. See [Fleet operations](./fleet).
 
-The toolbar **Actions ⚙** menu runs the same fleet ops (Fetch, Pull, Stage, Commit, Discard, Submodule Update, …). Keyboard shortcuts on the current selection:
+**Actions ▾** appears next to select-all only when there is a selection; it runs the same fleet ops (Fetch, Pull, Stage, Commit, Discard, Submodule Update, …). Keyboard shortcuts on the current selection:
 
 - <kbd>Ctrl/Cmd+Shift+F</kbd> — Fetch selected
 - <kbd>Ctrl/Cmd+Shift+P</kbd> — Pull selected
 
-**Pull behind** (toolbar / command palette) selects every repo with `behind > 0` and fleet-pulls them — useful for upstream Odoo/core trees you keep current without hunting the Behind chip. Pair with **pull-only prefixes** in Settings so those trees never offer Push and upstream CI stays off the Attention chips (silence — you'll only hear about it if a push is attempted and fails).
+**Pull behind** (toolbar / command palette) selects every repo with `behind > 0` and fleet-pulls them — useful for upstream Odoo/core trees you keep current without hunting the Behind mode. Pair with **pull-only prefixes** in Settings so those trees never offer Push and upstream CI stays off the Needs me / Attention chips (silence — you'll only hear about it if a push is attempted and fails).
 
 ## List view
 
-Switch to a compact, single-line view from the segmented control — useful when you're scanning a lot of repos at once.
+Switch to a compact, single-line view from the Grid | List control — useful when you're scanning a lot of repos at once.
 
 ## The repo drawer
 

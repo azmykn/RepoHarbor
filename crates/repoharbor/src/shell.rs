@@ -13,8 +13,10 @@ use gpui::{
     StatefulInteractiveElement, Styled, Subscription, Window, div, prelude::FluentBuilder, px, rgb,
 };
 use gpui_component::TitleBar;
+use gpui_component::button::Button;
 use gpui_component::input::{Input, InputState};
-use gpui_component::menu::ContextMenuExt as _;
+use gpui_component::menu::{ContextMenuExt as _, DropdownMenu, PopupMenuItem};
+use gpui_component::{IconName, Sizable};
 
 /// Expanded sidebar width bounds (px). Collapsed mode uses [`SIDEBAR_COLLAPSED`].
 pub(crate) const SIDEBAR_DEFAULT: f32 = 236.;
@@ -50,7 +52,9 @@ pub enum View {
 }
 
 /// A Mission Control quick filter. Single-select (radio): one is active at a
-/// time, `All` meaning no filtering.
+/// time, `All` meaning no filtering. Work modes ([`WorkMode`]) decide which
+/// filters are offered as contextual chips; duplicates (`Commitable` /
+/// `Ahead`) remain for saved-view compatibility but are no longer shown.
 #[derive(Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum RepoFilter {
     #[default]
@@ -60,11 +64,13 @@ pub enum RepoFilter {
     Dirty,
     /// Working-tree changes not yet staged (`unstaged > 0`).
     Stageable,
-    /// Anything commitable via Commit All (`dirty > 0`).
+    /// Anything commitable via Commit All (`dirty > 0`). Kept for saved views;
+    /// the Working-mode strip uses [`RepoFilter::Dirty`] instead.
     Commitable,
-    /// Local commits not pushed (`ahead > 0`) — needs push.
+    /// Local commits not pushed (`ahead > 0`). Kept for saved views; the
+    /// Working-mode strip uses [`RepoFilter::Pushable`] instead.
     Ahead,
-    /// Ready to push (`ahead > 0`) — alias chip for actionability.
+    /// Ready to push (`ahead > 0`).
     Pushable,
     /// Upstream commits not pulled (`behind > 0`) — needs pull.
     Behind,
@@ -72,26 +78,90 @@ pub enum RepoFilter {
     Stale,
     /// Repos with at least one attention item (`repoharbor_core::attention`) —
     /// dirty/unpushed, review requests, prunable branches, agent sessions, ….
-    /// Toolbar-only (not a chip), driven by the "Attention" button.
+    /// Driven by the Needs me work mode.
     Attention,
 }
 
-impl RepoFilter {
-    /// The chip order shown in the toolbar.
-    pub const ORDER: [RepoFilter; 11] = [
-        RepoFilter::All,
-        RepoFilter::Public,
-        RepoFilter::Private,
-        RepoFilter::Dirty,
-        RepoFilter::Stageable,
-        RepoFilter::Commitable,
-        RepoFilter::Pushable,
-        RepoFilter::Ahead,
-        RepoFilter::Behind,
-        RepoFilter::Starred,
-        RepoFilter::Stale,
+/// Mission Control work mode — the top-level segmented control that gates
+/// which filter chips appear and sets the primary filter.
+#[derive(Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub enum WorkMode {
+    /// Attention filter — repos that need you. Shows the attention count badge.
+    NeedsMe,
+    /// Behind filter — upstream updates waiting to pull.
+    Behind,
+    /// Dirty / Stageable / Pushable chips (no Commitable / Ahead duplicates).
+    Working,
+    /// No git filter; optional Public / Private / Starred / Stale chips.
+    #[default]
+    All,
+}
+
+impl WorkMode {
+    const ORDER: [WorkMode; 4] = [
+        WorkMode::NeedsMe,
+        WorkMode::Behind,
+        WorkMode::Working,
+        WorkMode::All,
     ];
 
+    fn label(self) -> &'static str {
+        match self {
+            WorkMode::NeedsMe => "Needs me",
+            WorkMode::Behind => "Behind",
+            WorkMode::Working => "Working",
+            WorkMode::All => "All",
+        }
+    }
+
+    /// Primary filter applied when entering this mode.
+    fn default_filter(self) -> RepoFilter {
+        match self {
+            WorkMode::NeedsMe => RepoFilter::Attention,
+            WorkMode::Behind => RepoFilter::Behind,
+            WorkMode::Working => RepoFilter::Dirty,
+            WorkMode::All => RepoFilter::All,
+        }
+    }
+
+    /// Contextual chip strip for this mode (empty for Needs me / Behind).
+    fn chips(self) -> &'static [RepoFilter] {
+        match self {
+            WorkMode::NeedsMe | WorkMode::Behind => &[],
+            WorkMode::Working => &[
+                RepoFilter::Dirty,
+                RepoFilter::Stageable,
+                RepoFilter::Pushable,
+            ],
+            WorkMode::All => &[
+                RepoFilter::Public,
+                RepoFilter::Private,
+                RepoFilter::Starred,
+                RepoFilter::Stale,
+            ],
+        }
+    }
+
+    /// Infer the mode that owns a (possibly saved) filter.
+    fn from_filter(f: RepoFilter) -> WorkMode {
+        match f {
+            RepoFilter::Attention => WorkMode::NeedsMe,
+            RepoFilter::Behind => WorkMode::Behind,
+            RepoFilter::Dirty
+            | RepoFilter::Stageable
+            | RepoFilter::Pushable
+            | RepoFilter::Commitable
+            | RepoFilter::Ahead => WorkMode::Working,
+            RepoFilter::All
+            | RepoFilter::Public
+            | RepoFilter::Private
+            | RepoFilter::Starred
+            | RepoFilter::Stale => WorkMode::All,
+        }
+    }
+}
+
+impl RepoFilter {
     fn label(self) -> &'static str {
         match self {
             RepoFilter::All => "All",
@@ -105,7 +175,7 @@ impl RepoFilter {
             RepoFilter::Behind => "Behind",
             RepoFilter::Starred => "Starred",
             RepoFilter::Stale => "Stale",
-            RepoFilter::Attention => "Attention",
+            RepoFilter::Attention => "Needs me",
         }
     }
 
@@ -163,10 +233,11 @@ pub enum SortMode {
 }
 
 impl SortMode {
+    /// Toolbar label — "Sort: recent" / "Sort: name" (not the activity heatmap).
     fn label(self) -> &'static str {
         match self {
-            SortMode::Activity => "Activity",
-            SortMode::Name => "Name",
+            SortMode::Activity => "Sort: recent",
+            SortMode::Name => "Sort: name",
         }
     }
 
@@ -434,7 +505,9 @@ pub struct RepoHarborApp {
 /// root/language facets, sort + layout, persisted saved views, and the
 /// contribution graph.
 pub struct GridState {
-    /// Active quick filter (All = no filtering).
+    /// Active work mode (Needs me / Behind / Working / All).
+    pub mode: WorkMode,
+    /// Active quick filter (All = no filtering). Gated by [`Self::mode`].
     pub filter: RepoFilter,
     /// Active scanned-root filter (sidebar ROOTS); `None` = all roots.
     pub root: Option<SharedString>,
@@ -449,7 +522,8 @@ pub struct GridState {
     /// Contribution-graph data (commits/day across repos), computed in the
     /// background; `None` until the first pass lands.
     pub activity: Option<repoharbor_core::activity::Activity>,
-    /// Whether the contribution graph is shown (dismissible).
+    /// Whether the contribution graph is shown (dismissible). Kept off —
+    /// DigitsCode fleets skip the heatmap (noise + cost on 400+ repos).
     pub activity_open: bool,
     /// Case-insensitive substring filter over repo name / slug / path.
     /// Synced from [`RepoHarborApp::repo_search`] on each keystroke.
@@ -479,6 +553,7 @@ pub struct Services {
 impl Default for GridState {
     fn default() -> Self {
         GridState {
+            mode: WorkMode::default(),
             filter: RepoFilter::default(),
             root: None,
             language: None,
@@ -487,8 +562,7 @@ impl Default for GridState {
             saved_views: load_saved_views(),
             activity: None,
             // Contribution heatmap hidden for DigitsCode fleets (noise + costly
-            // on 400+ repos). Re-enable by flipping this and wiring the toolbar
-            // toggle back in `toolbar`.
+            // on 400+ repos). Do not re-add a toolbar heatmap toggle.
             activity_open: false,
             query: String::new(),
             tree_expanded: Default::default(),
@@ -3740,6 +3814,26 @@ impl RepoHarborApp {
             return;
         }
         self.grid.filter = f;
+        self.grid.mode = WorkMode::from_filter(f);
+        self.clear_selection_quiet();
+        cx.notify();
+    }
+
+    /// Switch Mission Control work mode (segmented control) and apply its
+    /// primary filter.
+    pub fn set_mode(&mut self, mode: WorkMode, cx: &mut Context<Self>) {
+        if self.grid.mode == mode {
+            // Re-clicking the active mode clears any secondary chip refinement.
+            let primary = mode.default_filter();
+            if self.grid.filter != primary {
+                self.grid.filter = primary;
+                self.clear_selection_quiet();
+                cx.notify();
+            }
+            return;
+        }
+        self.grid.mode = mode;
+        self.grid.filter = mode.default_filter();
         self.clear_selection_quiet();
         cx.notify();
     }
@@ -3753,17 +3847,6 @@ impl RepoHarborApp {
     /// Switch the Mission Control card layout (grid ↔ list).
     pub fn set_layout(&mut self, layout: Layout, cx: &mut Context<Self>) {
         self.grid.layout = layout;
-        cx.notify();
-    }
-
-    /// Toggle the "Attention" filter (repos with attention items).
-    pub fn toggle_attention(&mut self, cx: &mut Context<Self>) {
-        self.grid.filter = if self.grid.filter == RepoFilter::Attention {
-            RepoFilter::All
-        } else {
-            RepoFilter::Attention
-        };
-        self.clear_selection_quiet();
         cx.notify();
     }
 
@@ -4009,6 +4092,7 @@ impl RepoHarborApp {
     pub fn apply_view(&mut self, idx: usize, cx: &mut Context<Self>) {
         if let Some(v) = self.grid.saved_views.get(idx) {
             self.grid.filter = v.filter;
+            self.grid.mode = WorkMode::from_filter(v.filter);
             self.grid.sort = v.sort;
             self.grid.root = v.root.clone().map(SharedString::from);
             self.grid.language = v.language.clone().map(SharedString::from);
@@ -5615,9 +5699,8 @@ impl RepoHarborApp {
             _ => None,
         };
         let visible = self.visible_rows();
-        // The fleet bar (multi-select bulk ops) pins under the scrolling cards;
-        // `None` (no element at all) until a selection exists or a run is live.
-        // Select-all is the checkbox beside the All filter chip (above the list).
+        // Select-all + contextual chips sit above the list; Actions appears only
+        // when something is selected.
         let fleet_bar = self.fleet_bar(t, cx);
         let list_area: gpui::AnyElement = if self.grid.filter == RepoFilter::Attention
             && visible.is_empty()
@@ -5650,7 +5733,7 @@ impl RepoHarborApp {
                                 .text_size(px(t.text_small))
                                 .text_color(rgb(t.fg2))
                                 .child(
-                                    "No repos need attention right now. Pull behind updates upstream checkouts; digits work stays Pushable.",
+                                    "No repos need attention right now. Pull behind updates upstream checkouts; digits work stays under Working → Pushable.",
                                 ),
                         ),
                 )
@@ -5671,14 +5754,9 @@ impl RepoHarborApp {
             .children(fleet_bar)
     }
 
-    /// The "All repos · N repos" heading + name filter + right-aligned actions.
+    /// The mode title · count + name filter + work-mode segments + actions.
     fn toolbar(&self, t: &Theme, cx: &mut Context<Self>, count: usize) -> impl IntoElement {
-        let title = if self.grid.filter == RepoFilter::All {
-            "All repos".to_string()
-        } else {
-            format!("{} repos", self.grid.filter.label())
-        };
-        let attention_label = format!("Attention {}", self.attention_count());
+        let title = format!("{} · {count}", self.grid.mode.label());
         let mut bar = div()
             .flex()
             .flex_row()
@@ -5692,28 +5770,13 @@ impl RepoHarborApp {
                     .text_size(px(t.text_h3))
                     .text_color(rgb(t.fg0))
                     .child(SharedString::from(title)),
-            )
-            .child(
-                div()
-                    .font_family("monospace")
-                    .text_size(px(t.text_data_sm))
-                    .text_color(rgb(t.fg2))
-                    .child(SharedString::from(format!("{count} repos"))),
             );
         if let Some(search) = &self.repo_search {
             bar = bar.child(div().w(px(260.)).child(Input::new(search)));
         }
         bar = bar
             .child(div().flex_1())
-            // Attention filter: repos that need you (with reasons on cards).
-            .child(tool_btn(
-                "tb-attention",
-                "circle-alert",
-                Some(attention_label.as_str()),
-                self.grid.filter == RepoFilter::Attention,
-                t,
-                cx.listener(|this, _ev, _w, cx| this.toggle_attention(cx)),
-            ))
+            .child(self.mode_segments(t, cx))
             // One-click Pull for every repo behind its upstream (vendor trees).
             .child(tool_btn(
                 "tb-pull-behind",
@@ -5723,28 +5786,8 @@ impl RepoHarborApp {
                 t,
                 cx.listener(|this, _ev, _w, cx| this.pull_behind_repos(cx)),
             ))
-            // Force-refresh host enrichment.
-            .child(tool_btn(
-                "tb-fetch",
-                "refresh-cw",
-                Some("Fetch all"),
-                false,
-                t,
-                cx.listener(|this, _ev, _w, cx| this.fetch_all_hosts(cx)),
-            ))
-            // Summarize (local AI) — hidden unless a backend is ready.
-            .children(self.services.ai_ready.then(|| {
-                tool_btn(
-                    "tb-summarize",
-                    "sparkles",
-                    Some("Summarize"),
-                    false,
-                    t,
-                    cx.listener(|this, _ev, _w, cx| this.summarize_all(cx)),
-                )
-                .into_any_element()
-            }))
-            // Sort order (cycles Activity ↔ Name).
+            .child(self.more_menu_button(cx))
+            // Sort order (cycles Sort: recent ↔ Sort: name). Not the heatmap.
             .child(tool_btn(
                 "tb-sort",
                 "arrow-up-down",
@@ -5773,8 +5816,84 @@ impl RepoHarborApp {
         bar
     }
 
-    /// The single-select quick-filter chips (All / Public / … / Stale), with a
-    /// select-all checkbox and Actions gear immediately before the All chip.
+    /// Segmented work-mode control: Needs me | Behind | Working | All.
+    fn mode_segments(&self, t: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
+        let attention_n = self.attention_count();
+        let mut group = div()
+            .id("mc-work-modes")
+            .flex()
+            .flex_row()
+            .items_center()
+            .rounded(px(t.r_sm))
+            .border_1()
+            .border_color(rgb(t.border))
+            .bg(rgb(t.button_bg))
+            .overflow_hidden();
+        for (i, mode) in WorkMode::ORDER.iter().copied().enumerate() {
+            let active = self.grid.mode == mode;
+            let (bg, fg) = if active {
+                (t.accent_wash, t.accent_bright)
+            } else {
+                (t.button_bg, t.fg1)
+            };
+            let label = if mode == WorkMode::NeedsMe && attention_n > 0 {
+                format!("{} {attention_n}", mode.label())
+            } else {
+                mode.label().to_string()
+            };
+            // Emphasize Needs me when there is outstanding attention.
+            let primary_hint = mode == WorkMode::NeedsMe && attention_n > 0 && !active;
+            let fg = if primary_hint { t.accent_bright } else { fg };
+            let mut seg = div()
+                .id(SharedString::from(format!("mode-{}", mode.label())))
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(5.))
+                .px(px(10.))
+                .py(px(6.))
+                .bg(rgb(bg))
+                .text_size(px(t.text_small))
+                .text_color(rgb(fg))
+                .cursor_pointer()
+                .hover(move |s| s.bg(rgb(t.accent_wash)))
+                .on_click(cx.listener(move |this, _ev, _w, cx| this.set_mode(mode, cx)))
+                .child(SharedString::from(label));
+            if i > 0 {
+                seg = seg.border_l_1().border_color(rgb(t.border));
+            }
+            group = group.child(seg);
+        }
+        group
+    }
+
+    /// Overflow menu for secondary toolbar actions (Fetch all / Summarize).
+    fn more_menu_button(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let app = cx.entity();
+        let ai_ready = self.services.ai_ready;
+        Button::new("mc-more")
+            .outline()
+            .small()
+            .compact()
+            .icon(IconName::EllipsisVertical)
+            .label("More")
+            .dropdown_caret(true)
+            .dropdown_menu(move |menu, _window, _cx| {
+                let a = app.clone();
+                let mut m = menu.item(PopupMenuItem::new("Fetch all").on_click(move |_, _, cx| {
+                    a.update(cx, |this, cx| this.fetch_all_hosts(cx));
+                }));
+                if ai_ready {
+                    let a = app.clone();
+                    m = m.item(PopupMenuItem::new("Summarize").on_click(move |_, _, cx| {
+                        a.update(cx, |this, cx| this.summarize_all(cx));
+                    }));
+                }
+                m
+            })
+    }
+
+    /// Select-all + Actions (when selection) + contextual chips for the mode.
     fn filter_chips(&self, t: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
         let mut row = div()
             .flex()
@@ -5785,11 +5904,11 @@ impl RepoHarborApp {
             .px(px(16.))
             .py(px(12.));
         let hov = t.border_strong;
-        // Select-all beside All — same visual language as card selection boxes.
         row = row.child(self.select_all_checkbox(t, cx));
-        // Fleet Actions gear (dropdown) next to the select-all checkbox.
-        row = row.child(self.fleet_actions_button(t, cx));
+        // Fleet Actions only when something is selected — avoid a misleading
+        // gear that opens "Select repos first".
         if !self.selected.is_empty() {
+            row = row.child(self.fleet_actions_button(t, cx));
             row = row.child(
                 div()
                     .font_family("monospace")
@@ -5801,8 +5920,8 @@ impl RepoHarborApp {
                     ))),
             );
         }
-        for f in RepoFilter::ORDER {
-            let active = self.grid.filter == f;
+        for f in self.grid.mode.chips() {
+            let active = self.grid.filter == *f;
             let (bg, border, fg) = if active {
                 (t.accent_wash, t.border_accent, t.accent_bright)
             } else {
@@ -5824,7 +5943,7 @@ impl RepoHarborApp {
                 .text_color(rgb(fg))
                 .cursor_pointer()
                 .hover(move |s| s.border_color(rgb(hov)))
-                .on_click(cx.listener(move |this, _ev, _w, cx| this.set_filter(f, cx)));
+                .on_click(cx.listener(move |this, _ev, _w, cx| this.set_filter(*f, cx)));
             if let Some(icon) = f.icon() {
                 chip = chip.child(lucide(icon, 13., fg));
             }

@@ -24,8 +24,8 @@ accidental `cache.sqlite` copies. Do not force-add those paths.
 - The in-app **Log** view redacts your home directory to `~` before display so
   screenshots leak less identifying path prefix.
 
-## Attention filter vs secrets
+## Needs me mode vs secrets
 
-Mission Control **Attention** flags git/host work (dirty trees, PRs, CI), not a
+Mission Control **Needs me** (Attention) flags git/host work (dirty trees, PRs, CI), not a
 secret scanner. Treat it as a work queue — not an audit that your public fork is
 clean.
