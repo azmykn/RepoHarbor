@@ -12,6 +12,12 @@ versioned trees, including nested submodule parents).
 
 ### Changed
 
+- **Mission Control work modes** — toolbar segmented control **Needs me |
+  Behind | Working | All** replaces the dense chip strip. Needs me shows the
+  attention count; Working offers Dirty / Stageable / Pushable only; All offers
+  Public / Private / Starred / Stale. **Fetch all** / **Summarize** move under
+  **More ⋮**; **Actions** appears only with a selection; sort labels are
+  **Sort: recent** / **Sort: name** (heatmap stays hidden).
 - **Brand icon** — new harbor + repo-stack mark (SVG + packaging PNGs + tray
   glyphs); default accent aligned to harbor teal `#1dd3c4`.
 - **Docs shots** — removed Orrery-branded screenshots from `docs/public/shots/`
