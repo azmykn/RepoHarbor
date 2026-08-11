@@ -8,10 +8,10 @@ export default defineConfig({
   lang: "en-US",
   cleanUrls: true,
   lastUpdated: true,
-  // The design-system page links into the source tree (../../src/...) — those
-  // are meant to be read on GitHub, not as site pages. Ignore them; real
-  // cross-page links are still validated.
-  ignoreDeadLinks: [/\.\.\/\.\.\/src\//, /^\.\.\/\.\.\//],
+  // The design-system page links into the source tree (../../crates/...,
+  // ../../src/...) — those are meant to be read on GitHub, not as site pages.
+  // Match both `../../…` and vitepress-normalized `./../../…` forms.
+  ignoreDeadLinks: [/\.\.\/\.\.\/(src|crates)\//],
   head: [
     ["link", { rel: "icon", href: "/RepoHarbor/logo.svg" }],
     ["meta", { name: "theme-color", content: "#1dd3c4" }],
