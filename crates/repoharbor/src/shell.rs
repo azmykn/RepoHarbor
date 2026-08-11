@@ -5068,7 +5068,7 @@ impl RepoHarborApp {
                     "Notifications".into(),
                     None,
                 ),
-                (Some("about".into()), "orbit", "About".into(), None),
+                (Some("about".into()), "harbor", "About".into(), None),
             ],
         )
     }
@@ -6033,7 +6033,7 @@ impl Render for RepoHarborApp {
                     .items_center()
                     .gap(px(6.))
                     .pl(px(4.))
-                    .child(lucide("orbit", 13., t.primary))
+                    .child(lucide("harbor", 13., t.primary))
                     .child(
                         div()
                             .font_weight(FontWeight::MEDIUM)

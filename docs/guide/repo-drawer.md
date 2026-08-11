@@ -2,8 +2,6 @@
 
 Click any card in [Mission Control](./mission-control) to slide out the repo drawer — a focused detail view that never leaves the grid. It's organised into tabs, and the footer keeps the same [launch actions](./launchers) as the card.
 
-![The repo detail drawer](/shots/repo-drawer.png)
-
 ## Overview
 
 The home tab for a repo:

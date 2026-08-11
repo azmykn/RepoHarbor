@@ -3,7 +3,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-test "$(basename "$(pwd)")" = "Orrery"
+test "$(basename "$(pwd)")" = "RepoHarbor"
 git rev-parse --verify repoharbor-main >/dev/null
 
 # Commit orphan tree if needed
@@ -21,9 +21,9 @@ fi
 git branch -M main
 # Drop local pre-wipe history refs
 git branch -D feat/digitscode-roadmap-p0-p3 2>/dev/null || true
-# Point origin at independent RepoHarbor (keep old fork as orrery-old)
+# Point origin at independent RepoHarbor (keep old fork remote as legacy-origin if needed)
 if git remote get-url origin 2>/dev/null | grep -q 'azmykn/Orrery'; then
-  git remote rename origin orrery-old
+  git remote rename origin legacy-orrery-origin
 fi
 if ! git remote get-url origin >/dev/null 2>&1; then
   git remote add origin git@github.com:azmykn/RepoHarbor.git
@@ -35,9 +35,9 @@ fi
 
 git push -u origin main --force
 
-# Delete obsolete feature branch on the OLD Orrery fork (safe; PR already merged)
-if git remote get-url orrery-old >/dev/null 2>&1; then
-  git push orrery-old --delete feat/digitscode-roadmap-p0-p3 2>/dev/null || true
+# Delete obsolete feature branch on the OLD fork remote (safe; PR already merged)
+if git remote get-url legacy-orrery-origin >/dev/null 2>&1; then
+  git push legacy-orrery-origin --delete feat/digitscode-roadmap-p0-p3 2>/dev/null || true
 fi
 
 echo

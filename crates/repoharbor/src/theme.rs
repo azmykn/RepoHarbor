@@ -25,7 +25,7 @@ pub struct Theme {
     pub fg3: u32, // faint
 
     // Identity + semantics.
-    pub primary: u32,       // --primary orbit cyan
+    pub primary: u32,       // --primary harbor teal (default accent)
     pub accent_bright: u32, // --orr-accent-bright (primary + white 22%)
     pub accent_wash: u32,   // --orr-accent-wash (primary 12% over page) — active nav bg
     pub accent_badge: u32,  // accent 20% over page — nav count badge bg
@@ -68,18 +68,18 @@ impl Theme {
             button_bg: 0x1f222a,
             border: 0x1c2028,
             border_strong: 0x2c3037,
-            // --primary 40% over page (≈ orbit-cyan-tinted edge).
-            border_accent: 0x1b4b56,
+            // --primary 40% over page (≈ harbor-teal-tinted edge).
+            border_accent: 0x125d5c,
 
             fg0: 0xeef2f8,
             fg1: 0xafb9cb,
             fg2: 0x6c778c,
             fg3: 0x434e63,
 
-            primary: 0x38dbf0,
-            accent_bright: 0x64e3f3,
-            accent_wash: 0x102730,
-            accent_badge: 0x133742,
+            primary: 0x1dd3c4,
+            accent_bright: 0x4fddd1,
+            accent_wash: 0x0c262b,
+            accent_badge: 0x0e3539,
             // danger (--orr-behind #ff6b6b) 20% over page; static — the danger
             // hue doesn't follow the system accent.
             danger_badge: over_page((0xff, 0x6b, 0x6b), 0.20),
@@ -93,7 +93,7 @@ impl Theme {
             act_folder: 0xf5b94b,
             act_host: 0x46c8a0,
 
-            heat: heat_ramp((0x38, 0xdb, 0xf0)),
+            heat: heat_ramp((0x1d, 0xd3, 0xc4)),
 
             r_xs: 4.,
             r_sm: 6.,
@@ -106,7 +106,7 @@ impl Theme {
         }
     }
 
-    /// Override the built-in orbit-cyan accent with the desktop's system accent
+    /// Override the built-in harbor-teal accent with the desktop's system accent
     /// when one is present, recomputing the derived accent tokens (bright/wash/
     /// badge/border). Matches the design system's "primary overridden by the
     /// system accent at runtime". No-op when `accent` is `None`.

@@ -1,6 +1,6 @@
 # RepoHarbor — UI & Design System
 
-> Every repo in orbit. A dense, "mission-control" dashboard that feels native on
+> Every repo at harbor. A dense, "mission-control" dashboard that feels native on
 > the Linux desktop it runs on.
 
 This is the living spec for RepoHarbor's UI. It describes what is actually
@@ -18,7 +18,8 @@ it here too.
 > references to `.orr-*` CSS classes, `src/index.css`, or `src/lib/appearance.ts`
 > anywhere, they're stale.
 
-The brand mark lives at [`assets/orbit-mark.svg`](assets/orbit-mark.svg).
+The brand mark lives at [`assets/harbor-mark.svg`](assets/harbor-mark.svg)
+(app icon: [`assets/app-icon.svg`](assets/app-icon.svg)).
 
 ---
 
@@ -76,7 +77,7 @@ them as `rgb(theme.fg0)` etc.
   when present (it's what Qt apps paint, so borrowing it matches KDE).
 - A background task subscribes to `SettingChanged` and re-emits, so accent flips
   apply **live**. Everything degrades gracefully — no bus/portal → the built-in
-  orbit-cyan accent stays.
+  harbor teal accent stays.
 
 ### Layer 3 — the app applies it (`main.rs` at startup, `live.rs` live)
 `Theme::with_system_accent(Some((r,g,b)))` overrides `primary` and recomputes the
@@ -91,8 +92,8 @@ system accent change repaints immediately.
 match the rest of the UI.
 
 > **The seam to respect:** `primary` and the derived accent tokens are
-> runtime-owned. Never hard-code a brand cyan — read `theme.primary` /
-> `theme.accent_*` so the system accent flows through. The orbit-cyan `#38dbf0`
+> runtime-owned. Never hard-code a brand teal — read `theme.primary` /
+> `theme.accent_*` so the system accent flows through. The harbor teal `#1dd3c4`
 > is only the *default* for when the OS exposes no accent.
 >
 > Not (yet) ported from the webview version: light mode, and borrowing KDE's
@@ -117,7 +118,7 @@ system accent at runtime.
 | `button_bg` | `#1f222a` | button / input fill |
 | `border` | `#1c2028` | hairline border |
 | `border_strong` | `#2c3037` | emphasised border |
-| `border_accent` | `#1b4b56` | accent-tinted edge (accent @40% over page) |
+| `border_accent` | `#125d5c` | accent-tinted edge (accent @40% over page) |
 
 ### 3.2 Foreground tiers (`fg0…3`)
 A four-step text ramp.
@@ -133,10 +134,10 @@ A four-step text ramp.
 
 | Token | Default | Notes |
 |---|---|---|
-| `primary` | `#38dbf0` orbit cyan | replaced by the system accent |
-| `accent_bright` | `#64e3f3` | accent + 22% white |
-| `accent_wash` | `#102730` | accent 12% over page — active nav bg |
-| `accent_badge` | `#133742` | accent 20% over page — nav count badge |
+| `primary` | `#1dd3c4` harbor teal | replaced by the system accent |
+| `accent_bright` | `#4fddd1` | accent + 22% white |
+| `accent_wash` | `#0c262b` | accent 12% over page — active nav bg |
+| `accent_badge` | `#0e3539` | accent 20% over page — nav count badge |
 
 ### 3.4 Semantic hues — **fixed, meaning-bearing**
 These do **not** follow the OS; their meaning is the point.
@@ -240,4 +241,6 @@ adaptive tokens through `apply_gpui_component_theme`.
 | OS accent read (portal + kdeglobals) | `crates/repoharbor-platform/src/appearance.rs` |
 | Live re-theming on accent change | `crates/repoharbor/src/live.rs` |
 | Icons (lucide + brand + devicon) | `crates/repoharbor/assets/icons/`, `src/icon.rs` |
-| Brand mark | `docs/design-system/assets/orbit-mark.svg` |
+| Brand mark | `docs/design-system/assets/harbor-mark.svg` |
+| App icon | `docs/design-system/assets/app-icon.svg` |
+| Packaging icons | `packaging/icons/repoharbor.svg` (+ PNG sizes) |

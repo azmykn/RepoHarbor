@@ -10,6 +10,13 @@ and this project (upstream) uses calendar versioning (`YYYY.M.P`).
 DigitsCode RepoHarbor — multi-repo workspaces (hundreds of checkouts across
 versioned trees, including nested submodule parents).
 
+### Changed
+
+- **Brand icon** — new harbor + repo-stack mark (SVG + packaging PNGs + tray
+  glyphs); default accent aligned to harbor teal `#1dd3c4`.
+- **Docs shots** — removed Orrery-branded screenshots from `docs/public/shots/`
+  and unlinked them from the guide (re-capture pending from the native app).
+
 ### Added
 
 - **Submodule discovery** — after scanning top-level checkouts, parse each
@@ -89,13 +96,12 @@ versioned trees, including nested submodule parents).
 
 ### Screenshots
 
+Pre-rebrand UI shots that showed the old product name in chrome were removed.
+Re-capture from the native RepoHarbor app before linking images here again.
+
 | Surface | Shot |
 |---------|------|
-| Mission Control | ![Mission Control](docs/public/shots/mission-control.png) |
-| Header: **+** chip + window controls (add entry is now a tabbed modal) | ![Header add](docs/public/shots/header-add-and-window-controls.png) |
-| Changes / commit | ![Changes](docs/public/shots/changes-commit.png) |
-| Explore | ![Explore](docs/public/shots/explore.png) |
-| List view | ![List view](docs/public/shots/list-view.png) |
+| Header: **+** chip + window controls | ![Header add](docs/public/shots/header-add-and-window-controls.png) |
 | Header before contrast fix (reference) | ![Header before](docs/public/shots/header-before-contrast-fix.png) |
 
 > When re-capturing shots, keep private repos and machine-specific home paths out

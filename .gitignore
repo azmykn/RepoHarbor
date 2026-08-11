@@ -56,6 +56,9 @@ github_token
 **/.config/orrery/**
 **/.local/share/orrery/**
 
+# Local git history backups from the rebrand (never publish)
+.git.orrery-history.bak/
+
 # Bundled llama-server runtime — fetched by CI into packaging/llama-runtime/ for
 # the AppImage build, never committed.
 /packaging/llama-runtime/

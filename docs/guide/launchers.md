@@ -17,8 +17,6 @@ The IDE and Agent buttons show the configured tool's logo and name (e.g. *VS Cod
 
 In **Settings → Launchers**, pick your editor and agent from preset chips with real brand logos — no command syntax required.
 
-![Settings — launcher presets](/shots/settings-launchers.png)
-
 - **Open in IDE** — VS Code, VSCodium, Cursor, Windsurf, Zed, Sublime Text, Fleet, Lapce, the JetBrains family (IntelliJ, WebStorm, PyCharm, GoLand, CLion, Rider, RustRover, PhpStorm), Emacs, GNOME Builder, Kate, Geany.
 - **Terminal agent** — two axes: a **terminal emulator** (Kitty, Alacritty, Ghostty, WezTerm, Foot, Konsole, GNOME Terminal, xterm) and an **agent CLI** (Claude Code, Codex, Gemini CLI, Aider, OpenCode, Cursor Agent, Crush, Qwen Code). Picking a terminal preserves your agent and vice-versa.
 

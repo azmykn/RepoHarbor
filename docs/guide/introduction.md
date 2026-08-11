@@ -8,7 +8,9 @@
 
 …and every card is a launchpad: one click to open the repo in your IDE, or to drop a terminal coding agent (Claude Code, Aider, Codex, …) straight into it.
 
-![Mission Control — the repo grid](/shots/mission-control.png)
+::: tip Screenshots
+Docs shots will be re-captured from the native RepoHarbor UI after the rebrand. Until then, run the app (`cargo run -p repoharbor`) for the live Mission Control grid.
+:::
 
 ## Why?
 

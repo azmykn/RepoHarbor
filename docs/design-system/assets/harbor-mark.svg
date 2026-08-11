@@ -1,4 +1,5 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" aria-label="RepoHarbor">
+  <!-- Compact brand mark: repo stack over a dock line -->
   <rect x="5" y="3.5" width="14" height="3.2" rx="1" fill="#14B8A6" opacity="0.45"/>
   <rect x="6" y="7.2" width="12" height="3.4" rx="1" fill="#14B8A6" opacity="0.72"/>
   <rect x="7" y="11" width="10" height="3.8" rx="1.1" fill="#2DD4BF"/>

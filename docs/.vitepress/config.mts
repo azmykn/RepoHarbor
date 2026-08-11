@@ -71,8 +71,8 @@ export default defineConfig({
       text: "Edit this page on GitHub",
     },
     footer: {
-      message: "Released under the MIT License.",
-      copyright: "© 2026 Seb Burrell",
+      message: "Released under the MIT License. DigitsCode product.",
+      copyright: "© 2026 DigitsCode",
     },
   },
 });

@@ -34,8 +34,6 @@ ollama pull nomic-embed-text
 
 3. In **Settings → AI & search**, choose the **Ollama** backend, confirm the endpoint, enable AI, and pick your models. Hit **Test** to verify the connection end-to-end.
 
-![Settings — AI & semantic search](/shots/settings-ai.png)
-
 ::: tip Model choice
 A small model like `qwen3:0.6b` is plenty for the short summaries RepoHarbor generates and keeps things fast. Point the endpoint at a remote Ollama host if you'd rather run the model elsewhere.
 :::

@@ -17,8 +17,8 @@ const OUT = join(import.meta.dirname, "icons");
 const LUCIDE_ICONS = [
   // nav
   "layout-grid", "inbox", "rss", "compass", "square-terminal", "wrench", "scissors", "settings",
-  // header
-  "orbit", "search", "plus", "refresh-cw", "folder",
+  // header — `lucide/harbor.svg` is hand-authored (not from lucide-react)
+  "search", "plus", "refresh-cw", "folder",
   // card status + meta + actions
   "git-branch", "arrow-up", "arrow-down", "circle-dot", "star", "clock", "tag", "lock",
   "folder-open", "external-link", "sparkles",

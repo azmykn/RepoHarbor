@@ -2,11 +2,9 @@
 
 Mission Control is the home view: a windowed grid of every repo RepoHarbor found across your workspace roots. It's built to scale to hundreds of repos — the grid is virtualized, so only what's on screen is rendered.
 
-![Mission Control — the repo grid](/shots/mission-control.png)
-
-> **Screenshots:** when re-capturing docs shots, avoid private remotes and
-> machine-specific home paths in published images (prefer generic `~/dev/…`
-> layouts).
+> **Screenshots:** re-capture from the native app after the RepoHarbor rebrand.
+> Avoid private remotes and machine-specific home paths in published images
+> (prefer generic `~/dev/…` layouts).
 
 ## The repo card
 
@@ -54,13 +52,9 @@ The toolbar **Actions ⚙** menu runs the same fleet ops (Fetch, Pull, Stage, Co
 
 Switch to a compact, single-line view from the segmented control — useful when you're scanning a lot of repos at once.
 
-![Mission Control — list view](/shots/list-view.png)
-
 ## The repo drawer
 
 Click a card to slide out a detail drawer with the repo's branches, recent commits, staged-diff view, README, a PR/CI panel, and per-repo notes — plus the same launch actions in the footer.
-
-![The repo detail drawer](/shots/repo-drawer.png)
 
 It's covered in full on its own page: [The repo drawer](./repo-drawer).
 

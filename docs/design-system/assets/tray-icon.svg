@@ -1,17 +1,16 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128" fill="none">
   <!--
-    Symbolic tray glyph: the orbit mark only, single colour, transparent
-    background. Monochrome so it reads like the other symbolic panel icons.
-    Rendered in two tints (light for dark panels, dark for light panels) and
-    swapped at runtime from the desktop colour-scheme — see repoharbor-platform/src/tray.rs.
-    This source is white; the build recolours it for the dark-panel variant.
+    Symbolic tray glyph: harbor mark only, single colour, transparent background.
+    Rendered in light (dark panels) and dark (light panels) tints at build time
+    — see crates/repoharbor-platform/src/tray.rs.
   -->
-  <g transform="translate(12,12) scale(4.3333)" stroke="#FFFFFF" stroke-width="2.4"
-     stroke-linecap="round" stroke-linejoin="round" fill="none">
-    <path d="M20.341 6.484A10 10 0 0 1 10.266 21.85"/>
-    <path d="M3.659 17.516A10 10 0 0 1 13.74 2.152"/>
-    <circle cx="12" cy="12" r="3" fill="#FFFFFF" stroke="none"/>
-    <circle cx="19" cy="5" r="2" fill="#FFFFFF" stroke="none"/>
-    <circle cx="5" cy="19" r="2" fill="#FFFFFF" stroke="none"/>
+  <g fill="#FFFFFF">
+    <rect x="28" y="18" width="72" height="16" rx="5" opacity="0.45"/>
+    <rect x="34" y="38" width="60" height="17" rx="5" opacity="0.72"/>
+    <rect x="40" y="59" width="48" height="19" rx="6"/>
+    <rect x="22" y="88" width="84" height="12" rx="4"/>
+    <rect x="30" y="100" width="10" height="16" rx="3"/>
+    <rect x="59" y="100" width="10" height="16" rx="3"/>
+    <rect x="88" y="100" width="10" height="16" rx="3"/>
   </g>
 </svg>
