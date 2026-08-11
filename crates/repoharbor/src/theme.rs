@@ -9,7 +9,7 @@
 
 /// Dark-theme token set. One value per `--orr-*`/shadcn var the grid touches.
 pub struct Theme {
-    // Surfaces (deep blue-black void the system orbits in).
+    // Surfaces (deep blue-black void).
     pub page: u32,          // --background #0a0e16
     pub surface: u32,       // --orr-glass over page (card background)
     pub surface_hover: u32, // --orr-glass-hover over page
