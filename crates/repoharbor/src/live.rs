@@ -86,6 +86,9 @@ pub fn spawn(
     }
 
     // Global shortcut (Ctrl+Alt+O) → raise the window, via the portal.
+    // Registration is gated off in `shortcut::spawn` so first-run does not
+    // pop the desktop "add a shortcut" permission dialog; install stays opt-in
+    // via `scripts/install-desktop.sh` / desktop settings.
     {
         let tx = tx.clone();
         repoharbor_platform::shortcut::spawn(move || {

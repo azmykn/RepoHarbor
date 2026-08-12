@@ -92,9 +92,28 @@ pub enum WorkMode {
     Behind,
     /// Dirty / Stageable / Pushable chips (no Commitable / Ahead duplicates).
     Working,
-    /// No git filter; optional Public / Private / Starred / Stale chips.
+    /// No git filter. Visibility chips (Public / Private / Starred / Stale) live
+    /// in the always-on strip, not only in this mode.
     #[default]
     All,
+}
+
+/// Always-visible Mission Control chips (top filter strip) — visibility /
+/// bookkeeping filters independent of the active work mode.
+const VISIBILITY_CHIPS: [RepoFilter; 4] = [
+    RepoFilter::Public,
+    RepoFilter::Private,
+    RepoFilter::Starred,
+    RepoFilter::Stale,
+];
+
+/// True for Public / Private / Starred / Stale — orthogonal to work-mode filters
+/// (AND’d, never switches Needs me / Behind / Working → All).
+fn is_visibility_filter(f: RepoFilter) -> bool {
+    matches!(
+        f,
+        RepoFilter::Public | RepoFilter::Private | RepoFilter::Starred | RepoFilter::Stale
+    )
 }
 
 impl WorkMode {
@@ -124,20 +143,15 @@ impl WorkMode {
         }
     }
 
-    /// Contextual chip strip for this mode (empty for Needs me / Behind).
+    /// Contextual chip strip for this mode (empty for Needs me / Behind / All).
+    /// Visibility chips are always rendered separately via [`VISIBILITY_CHIPS`].
     fn chips(self) -> &'static [RepoFilter] {
         match self {
-            WorkMode::NeedsMe | WorkMode::Behind => &[],
+            WorkMode::NeedsMe | WorkMode::Behind | WorkMode::All => &[],
             WorkMode::Working => &[
                 RepoFilter::Dirty,
                 RepoFilter::Stageable,
                 RepoFilter::Pushable,
-            ],
-            WorkMode::All => &[
-                RepoFilter::Public,
-                RepoFilter::Private,
-                RepoFilter::Starred,
-                RepoFilter::Stale,
             ],
         }
     }
@@ -264,6 +278,9 @@ pub enum Layout {
 pub struct SavedView {
     pub name: String,
     pub filter: RepoFilter,
+    /// Optional Public / Private / Starred / Stale overlay (AND with `filter`).
+    #[serde(default)]
+    pub visibility: Option<RepoFilter>,
     #[serde(default)]
     pub root: Option<String>,
     #[serde(default)]
@@ -507,8 +524,12 @@ pub struct RepoHarborApp {
 pub struct GridState {
     /// Active work mode (Needs me / Behind / Working / All).
     pub mode: WorkMode,
-    /// Active quick filter (All = no filtering). Gated by [`Self::mode`].
+    /// Active work-mode / git quick filter (All = no git filtering).
+    /// Gated by [`Self::mode`]. Orthogonal to [`Self::visibility`].
     pub filter: RepoFilter,
+    /// Optional visibility overlay (Public / Private / Starred / Stale).
+    /// AND’d with [`Self::filter`] so chips never yank the work mode to All.
+    pub visibility: Option<RepoFilter>,
     /// Active scanned-root filter (sidebar ROOTS); `None` = all roots.
     pub root: Option<SharedString>,
     /// Active language filter (sidebar LANGUAGES); `None` = all languages.
@@ -555,6 +576,7 @@ impl Default for GridState {
         GridState {
             mode: WorkMode::default(),
             filter: RepoFilter::default(),
+            visibility: None,
             root: None,
             language: None,
             sort: SortMode::default(),
@@ -3807,9 +3829,24 @@ impl RepoHarborApp {
     }
 
     /// Set the active Mission Control quick filter.
+    ///
+    /// Visibility chips (Public / Private / Starred / Stale) are orthogonal:
+    /// they AND with the work-mode filter and never switch Needs me / Behind /
+    /// Working to All. Re-click toggles a visibility chip off.
+    ///
     /// Clears the fleet selection so ops can't accidentally target repos that
     /// are no longer in the visible set after the chip change.
     pub fn set_filter(&mut self, f: RepoFilter, cx: &mut Context<Self>) {
+        if is_visibility_filter(f) {
+            self.grid.visibility = if self.grid.visibility == Some(f) {
+                None
+            } else {
+                Some(f)
+            };
+            self.clear_selection_quiet();
+            cx.notify();
+            return;
+        }
         if self.grid.filter == f {
             return;
         }
@@ -3819,14 +3856,31 @@ impl RepoHarborApp {
         cx.notify();
     }
 
+    /// Git/attention filter AND optional visibility overlay.
+    fn row_matches_chips(&self, r: &crate::data::Row) -> bool {
+        self.grid.filter.matches(r, &self.attention_by_repo)
+            && self
+                .grid
+                .visibility
+                .is_none_or(|v| v.matches(r, &self.attention_by_repo))
+    }
+
     /// Switch Mission Control work mode (segmented control) and apply its
     /// primary filter.
     pub fn set_mode(&mut self, mode: WorkMode, cx: &mut Context<Self>) {
         if self.grid.mode == mode {
-            // Re-clicking the active mode clears any secondary chip refinement.
+            // Re-clicking the active mode clears secondary refinements: Working
+            // git chips and the orthogonal visibility overlay.
             let primary = mode.default_filter();
+            let mut changed = false;
             if self.grid.filter != primary {
                 self.grid.filter = primary;
+                changed = true;
+            }
+            if self.grid.visibility.take().is_some() {
+                changed = true;
+            }
+            if changed {
                 self.clear_selection_quiet();
                 cx.notify();
             }
@@ -3834,6 +3888,7 @@ impl RepoHarborApp {
         }
         self.grid.mode = mode;
         self.grid.filter = mode.default_filter();
+        // Keep visibility overlay across mode switches (AND with the new mode).
         self.clear_selection_quiet();
         cx.notify();
     }
@@ -4049,6 +4104,9 @@ impl RepoHarborApp {
         if self.grid.filter != RepoFilter::All {
             parts.push(self.grid.filter.label().to_string());
         }
+        if let Some(v) = self.grid.visibility {
+            parts.push(v.label().to_string());
+        }
         if let Some(l) = &language {
             parts.push(l.clone());
         }
@@ -4063,6 +4121,7 @@ impl RepoHarborApp {
         SavedView {
             name,
             filter: self.grid.filter,
+            visibility: self.grid.visibility,
             root,
             language,
             sort: self.grid.sort,
@@ -4071,7 +4130,13 @@ impl RepoHarborApp {
 
     /// Whether `v` matches the live filter combo (drives the active highlight).
     fn view_is_active(&self, v: &SavedView) -> bool {
-        v.filter == self.grid.filter
+        let (want_filter, want_vis) = if is_visibility_filter(v.filter) {
+            (RepoFilter::All, v.visibility.or(Some(v.filter)))
+        } else {
+            (v.filter, v.visibility)
+        };
+        want_filter == self.grid.filter
+            && want_vis == self.grid.visibility
             && v.sort == self.grid.sort
             && v.root.as_deref() == self.grid.root.as_deref()
             && v.language.as_deref() == self.grid.language.as_deref()
@@ -4091,8 +4156,17 @@ impl RepoHarborApp {
     /// Apply a saved quick view's filter combo.
     pub fn apply_view(&mut self, idx: usize, cx: &mut Context<Self>) {
         if let Some(v) = self.grid.saved_views.get(idx) {
-            self.grid.filter = v.filter;
-            self.grid.mode = WorkMode::from_filter(v.filter);
+            // Legacy views stored Public/Private/… as `filter`; migrate to the
+            // orthogonal visibility overlay so work modes stay intact.
+            if is_visibility_filter(v.filter) {
+                self.grid.mode = WorkMode::All;
+                self.grid.filter = RepoFilter::All;
+                self.grid.visibility = v.visibility.or(Some(v.filter));
+            } else {
+                self.grid.filter = v.filter;
+                self.grid.mode = WorkMode::from_filter(v.filter);
+                self.grid.visibility = v.visibility;
+            }
             self.grid.sort = v.sort;
             self.grid.root = v.root.clone().map(SharedString::from);
             self.grid.language = v.language.clone().map(SharedString::from);
@@ -4169,10 +4243,9 @@ impl RepoHarborApp {
             .iter()
             .filter(|r| r.parent_id.is_none())
             .filter(|r| {
-                let self_chip = self.grid.filter.matches(r, &self.attention_by_repo);
+                let self_chip = self.row_matches_chips(r);
                 let child_chip = self.rows.iter().any(|c| {
-                    c.parent_id.as_ref() == Some(&r.id)
-                        && self.grid.filter.matches(c, &self.attention_by_repo)
+                    c.parent_id.as_ref() == Some(&r.id) && self.row_matches_chips(c)
                 });
                 if !(self_chip || child_chip) {
                     return false;
@@ -4328,8 +4401,7 @@ impl RepoHarborApp {
             }));
             if has_children && expanded {
                 for c in self.rows.iter().filter(|r| {
-                    r.parent_id.as_ref() == Some(&p.id)
-                        && self.grid.filter.matches(r, &self.attention_by_repo)
+                    r.parent_id.as_ref() == Some(&p.id) && self.row_matches_chips(r)
                 }) {
                     let cid = c.id.clone();
                     let cid_sel = c.id.clone();
@@ -4423,7 +4495,7 @@ impl RepoHarborApp {
             .rows
             .iter()
             .enumerate()
-            .filter(|(_, r)| self.grid.filter.matches(r, &self.attention_by_repo))
+            .filter(|(_, r)| self.row_matches_chips(r))
             .filter(|(_, r)| self.grid.root.as_ref().is_none_or(|root| &r.root == root))
             .filter(|(_, r)| {
                 self.grid
@@ -5754,7 +5826,8 @@ impl RepoHarborApp {
             .children(fleet_bar)
     }
 
-    /// The mode title · count + name filter + work-mode segments + actions.
+    /// Top Mission Control bar: title · count, search, work modes, always-on
+    /// visibility chips (Public / Private / Starred / Stale), then sort/layout.
     fn toolbar(&self, t: &Theme, cx: &mut Context<Self>, count: usize) -> impl IntoElement {
         let title = format!("{} · {count}", self.grid.mode.label());
         let mut bar = div()
@@ -5776,7 +5849,12 @@ impl RepoHarborApp {
         }
         bar = bar
             .child(div().flex_1())
-            .child(self.mode_segments(t, cx))
+            .child(self.mode_segments(t, cx));
+        // Always-visible filter chips in the upper toolbar (every work mode).
+        for f in VISIBILITY_CHIPS {
+            bar = bar.child(self.filter_chip(f, t, cx));
+        }
+        bar = bar
             // One-click Pull for every repo behind its upstream (vendor trees).
             .child(tool_btn(
                 "tb-pull-behind",
@@ -5893,7 +5971,8 @@ impl RepoHarborApp {
             })
     }
 
-    /// Select-all + Actions (when selection) + contextual chips for the mode.
+    /// Secondary strip under the toolbar: select-all, Working git chips, and
+    /// selection fleet primaries. Visibility chips live in [`Self::toolbar`].
     fn filter_chips(&self, t: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
         let mut row = div()
             .flex()
@@ -5903,53 +5982,66 @@ impl RepoHarborApp {
             .gap(px(7.))
             .px(px(16.))
             .py(px(12.));
-        let hov = t.border_strong;
         row = row.child(self.select_all_checkbox(t, cx));
-        // Fleet Actions only when something is selected — avoid a misleading
-        // gear that opens "Select repos first".
-        if !self.selected.is_empty() {
-            row = row.child(self.fleet_actions_button(t, cx));
-            row = row.child(
-                div()
-                    .font_family("monospace")
-                    .text_size(px(t.text_data_sm))
-                    .text_color(rgb(t.fg2))
-                    .child(SharedString::from(format!(
-                        "{} selected",
-                        self.selected.len()
-                    ))),
-            );
-        }
+        // Working-mode git chips only while that mode is active.
         for f in self.grid.mode.chips() {
-            let active = self.grid.filter == *f;
-            let (bg, border, fg) = if active {
-                (t.accent_wash, t.border_accent, t.accent_bright)
-            } else {
-                (t.button_bg, t.border, t.fg1)
-            };
-            let mut chip = div()
-                .id(SharedString::from(format!("chip-{}", f.label())))
-                .flex()
-                .flex_row()
-                .items_center()
-                .gap(px(5.))
-                .px(px(11.))
-                .py(px(5.))
-                .rounded_full()
-                .bg(rgb(bg))
-                .border_1()
-                .border_color(rgb(border))
-                .text_size(px(t.text_small))
-                .text_color(rgb(fg))
-                .cursor_pointer()
-                .hover(move |s| s.border_color(rgb(hov)))
-                .on_click(cx.listener(move |this, _ev, _w, cx| this.set_filter(*f, cx)));
-            if let Some(icon) = f.icon() {
-                chip = chip.child(lucide(icon, 13., fg));
-            }
-            row = row.child(chip.child(SharedString::from(f.label())));
+            row = row.child(self.filter_chip(*f, t, cx));
+        }
+        // Selection-scoped primaries: Fetch / Pull / [Push] / Submodules /
+        // [Gen commit] / [Empty commit] beside Actions ▾. Hidden when nothing
+        // is selected so the chip row stays calm.
+        if !self.selected.is_empty() {
+            row = row
+                .child(self.fleet_primary_sync_buttons(t, cx))
+                .child(self.fleet_actions_button(t, cx))
+                .child(
+                    div()
+                        .font_family("monospace")
+                        .text_size(px(t.text_data_sm))
+                        .text_color(rgb(t.fg2))
+                        .child(SharedString::from(format!(
+                            "{} selected",
+                            self.selected.len()
+                        ))),
+                );
         }
         row
+    }
+
+    /// One rounded filter chip (icon + label) matching Mission Control styling.
+    fn filter_chip(&self, f: RepoFilter, t: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
+        let active = if is_visibility_filter(f) {
+            self.grid.visibility == Some(f)
+        } else {
+            self.grid.filter == f
+        };
+        let (bg, border, fg) = if active {
+            (t.accent_wash, t.border_accent, t.accent_bright)
+        } else {
+            (t.button_bg, t.border, t.fg1)
+        };
+        let hov = t.border_strong;
+        let mut chip = div()
+            .id(SharedString::from(format!("chip-{}", f.label())))
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(5.))
+            .px(px(11.))
+            .py(px(5.))
+            .rounded_full()
+            .bg(rgb(bg))
+            .border_1()
+            .border_color(rgb(border))
+            .text_size(px(t.text_small))
+            .text_color(rgb(fg))
+            .cursor_pointer()
+            .hover(move |s| s.border_color(rgb(hov)))
+            .on_click(cx.listener(move |this, _ev, _w, cx| this.set_filter(f, cx)));
+        if let Some(icon) = f.icon() {
+            chip = chip.child(lucide(icon, 13., fg));
+        }
+        chip.child(SharedString::from(f.label()))
     }
 
     /// Fleet select-all checkbox at the top of the repo list (next to All).
@@ -6593,6 +6685,25 @@ mod tests {
         );
         let unlinked = item(AttentionKind::ReviewRequested, "a", None);
         assert!(attention_key(&unlinked).contains("github.com/o/a"));
+    }
+
+    #[test]
+    fn visibility_filters_are_orthogonal_helpers() {
+        assert!(is_visibility_filter(RepoFilter::Public));
+        assert!(is_visibility_filter(RepoFilter::Private));
+        assert!(is_visibility_filter(RepoFilter::Starred));
+        assert!(is_visibility_filter(RepoFilter::Stale));
+        assert!(!is_visibility_filter(RepoFilter::Dirty));
+        assert!(!is_visibility_filter(RepoFilter::Attention));
+        assert!(!is_visibility_filter(RepoFilter::All));
+        assert!(matches!(
+            WorkMode::from_filter(RepoFilter::Public),
+            WorkMode::All
+        ));
+        assert!(matches!(
+            WorkMode::from_filter(RepoFilter::Dirty),
+            WorkMode::Working
+        ));
     }
 
     #[test]

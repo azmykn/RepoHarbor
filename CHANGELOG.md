@@ -25,6 +25,10 @@ versioned trees, including nested submodule parents).
 
 ### Added
 
+- **Empty commit** — Mission Control selection primary + Actions menu item
+  creates `git commit --allow-empty` with message `Empty commit` on pushable
+  paths (hidden/blocked for pull-only selections, same gating as Push).
+
 - **Submodule discovery** — after scanning top-level checkouts, parse each
   parent’s `.gitmodules` and register checked-out submodules with `parent_id` /
   `submodule_path` (no deep WalkDir into every repo).

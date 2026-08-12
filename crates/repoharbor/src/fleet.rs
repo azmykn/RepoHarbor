@@ -71,6 +71,9 @@ pub enum FleetOp {
     /// Manual bulk commit — same user-typed message on every selected repo.
     /// Only started through the message strip ([`RepoHarborApp::confirm_fleet_commit`]).
     CommitAll,
+    /// `git commit --allow-empty` with a default message (CI trigger).
+    /// Skips pull-only paths like Push.
+    EmptyCommit,
     /// Per-repo AI message only — no commit/push (toast + Log).
     GenerateMessageOnly,
     /// Per-repo AI message → `commit_all` → `push` (push skipped on pull-only).
@@ -97,6 +100,7 @@ impl FleetOp {
             FleetOp::Push => "Pushing",
             FleetOp::SubmoduleUpdate => "Updating submodules",
             FleetOp::CommitAll => "Committing",
+            FleetOp::EmptyCommit => "Creating empty commit",
             FleetOp::GenerateMessageOnly => "Generating",
             FleetOp::GenerateCommitAndPush => "Generating",
             FleetOp::Prune => "Pruning",
@@ -114,6 +118,7 @@ impl FleetOp {
             FleetOp::Push => "Push",
             FleetOp::SubmoduleUpdate => "Update submodules",
             FleetOp::CommitAll => "Commit",
+            FleetOp::EmptyCommit => "Empty commit",
             FleetOp::GenerateMessageOnly => "Generate message",
             FleetOp::GenerateCommitAndPush => "Generate, commit & push",
             FleetOp::Prune => "Prune",
@@ -353,19 +358,30 @@ impl RepoHarborApp {
         if self.fleet_run.is_some() || repos.is_empty() {
             return;
         }
-        if matches!(op, FleetOp::Push) {
+        if matches!(op, FleetOp::Push | FleetOp::EmptyCommit) {
             let prefixes = &self.config.pull_only_prefixes;
             let before = repos.len();
             repos.retain(|r| !repoharbor_core::model::path_is_pull_only(r, prefixes));
             let blocked = before - repos.len();
+            let (blocked_title, blocked_detail, skip_detail) = if matches!(op, FleetOp::EmptyCommit)
+            {
+                (
+                    "Empty commit blocked",
+                    "Selected repos are pull-only (upstream / vendor). Empty commit is disabled.",
+                    "skipped — empty commit runs only on digits / pushable paths.",
+                )
+            } else {
+                (
+                    "Push blocked",
+                    "Selected repos are pull-only (upstream / vendor). Push is disabled.",
+                    "skipped — push runs only on digits / pushable paths.",
+                )
+            };
             if repos.is_empty() {
                 self.push_toast(
                     ToastKind::Error,
-                    "Push blocked",
-                    Some(
-                        "Selected repos are pull-only (upstream / vendor). Push is disabled."
-                            .into(),
-                    ),
+                    blocked_title,
+                    Some(blocked_detail.into()),
                     cx,
                 );
                 return;
@@ -376,7 +392,7 @@ impl RepoHarborApp {
                     "Skipped pull-only",
                     Some(
                         format!(
-                            "{blocked} {} skipped — push runs only on digits / pushable paths.",
+                            "{blocked} {} {skip_detail}",
                             if blocked == 1 { "repo" } else { "repos" }
                         )
                         .into(),
@@ -513,6 +529,18 @@ impl RepoHarborApp {
                                 &cancel,
                                 progress,
                                 fleet::commit_all_op(msg),
+                            )
+                        }
+                        FleetOp::EmptyCommit => {
+                            let msg = commit_message
+                                .filter(|m| !m.trim().is_empty())
+                                .unwrap_or_else(|| "Empty commit".into());
+                            fleet::run(
+                                &repos,
+                                workers,
+                                &cancel,
+                                progress,
+                                fleet::empty_commit_op(msg),
                             )
                         }
                         FleetOp::GenerateMessageOnly => fleet::run(
@@ -1086,18 +1114,127 @@ impl RepoHarborApp {
         Some(bar.into_any_element())
     }
 
+    /// Selected repo ids in grid order (stable for fleet ops + menus).
+    fn selected_repos_ordered(&self) -> Vec<String> {
+        self.rows
+            .iter()
+            .filter(|r| self.selected.contains(&r.id))
+            .map(|r| r.id.to_string())
+            .collect()
+    }
+
+    /// Compact selection-scoped primaries beside Actions ▾:
+    /// Fetch / Pull / [Push] / Submodules / [Gen commit] / [Empty commit] —
+    /// Push / Empty commit only when a non–pull-only path is in the selection;
+    /// Submodules always shown (dimmed without nested checkouts); Gen commit
+    /// only when AI is ready (dimmed unless something is dirty).
+    pub fn fleet_primary_sync_buttons(
+        &self,
+        t: &Theme,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let idle = self.fleet_actions_idle();
+        let ai_ready = self.services.ai_ready;
+        let repos = self.selected_repos_ordered();
+        let caps = crate::menu_actions::fleet_menu_caps(self, &repos);
+        let mut row = div()
+            .id("mc-fleet-primaries")
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(6.));
+        row = row.child(bar_btn(
+            "mc-fleet-fetch",
+            "refresh-cw",
+            "Fetch",
+            idle,
+            false,
+            t,
+            cx.listener(|this, _e, _w, cx| {
+                let repos = this.selected_repos_ordered();
+                this.run_fleet_repos(FleetOp::Fetch, repos, cx);
+            }),
+        ));
+        row = row.child(bar_btn(
+            "mc-fleet-pull",
+            "arrow-down",
+            "Pull",
+            idle,
+            false,
+            t,
+            cx.listener(|this, _e, _w, cx| {
+                let repos = this.selected_repos_ordered();
+                this.run_fleet_repos(FleetOp::Pull, repos, cx);
+            }),
+        ));
+        if caps.has_pushable_path {
+            row = row.child(bar_btn(
+                "mc-fleet-push",
+                "arrow-up",
+                "Push",
+                idle && caps.can_push,
+                false,
+                t,
+                cx.listener(|this, _e, _w, cx| {
+                    let repos = this.selected_repos_ordered();
+                    this.run_fleet_repos(FleetOp::Push, repos, cx);
+                }),
+            ));
+        }
+        // Always visible with a selection — same handler as Actions → Update
+        // submodules; dimmed when none of the targets have nested checkouts.
+        row = row.child(bar_btn(
+            "mc-fleet-subs",
+            "box",
+            "Submodules",
+            idle && caps.has_submodules,
+            false,
+            t,
+            cx.listener(|this, _e, _w, cx| {
+                let repos = this.selected_repos_ordered();
+                this.run_fleet_repos(FleetOp::SubmoduleUpdate, repos, cx);
+            }),
+        ));
+        if ai_ready {
+            row = row.child(bar_btn(
+                "mc-fleet-gen",
+                "sparkles",
+                "Gen commit",
+                idle && caps.has_dirty,
+                false,
+                t,
+                cx.listener(|this, _e, _w, cx| {
+                    let repos = this.selected_repos_ordered();
+                    this.adopt_fleet_targets(&repos);
+                    this.prompt_generate_commit_selected(cx);
+                }),
+            ));
+        }
+        // Same pull-only gating as Push — hide when selection is entirely vendor.
+        if caps.has_pushable_path {
+            row = row.child(bar_btn(
+                "mc-fleet-empty-commit",
+                "git-commit",
+                "Empty commit",
+                idle,
+                false,
+                t,
+                cx.listener(|this, _e, _w, cx| {
+                    let repos = this.selected_repos_ordered();
+                    this.run_fleet_repos(FleetOp::EmptyCommit, repos, cx);
+                }),
+            ));
+        }
+        row
+    }
+
     /// Gear "Actions" dropdown for the Mission Control chip row — same fleet
     /// ops as card/TREE right-click, scoped to the current selection.
     pub fn fleet_actions_button(&self, _t: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
         let app = cx.entity();
         let idle = self.fleet_actions_idle();
         let ai_ready = self.services.ai_ready;
-        let repos: Vec<String> = self
-            .rows
-            .iter()
-            .filter(|r| self.selected.contains(&r.id))
-            .map(|r| r.id.to_string())
-            .collect();
+        let repos = self.selected_repos_ordered();
         let n = repos.len();
         let caps = crate::menu_actions::fleet_menu_caps(self, &repos);
         let label = if n > 0 {
