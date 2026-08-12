@@ -222,6 +222,9 @@ fn action_item(text: impl Into<String>, action: fn(&mut Model)) -> MenuItem<Mode
 
 impl ksni::Tray for Model {
     fn id(&self) -> String {
+        // Keep stable and short; some hosts also look up IconName via the
+        // freedesktop theme — see [`icon_name`]. Must not collide with the
+        // D-Bus well-known name shape used for KRunner.
         "repoharbor".into()
     }
 
@@ -241,6 +244,17 @@ impl ksni::Tray for Model {
         } else {
             ksni::Status::Active
         }
+    }
+
+    /// Themable fallback (`packaging/icons` / hicolor `repoharbor`). Hosts that
+    /// prefer names over pixmaps still get the teal harbor mark; pixmap below
+    /// wins on SNI panels that honour ARGB glyphs.
+    fn icon_name(&self) -> String {
+        "repoharbor".into()
+    }
+
+    fn attention_icon_name(&self) -> String {
+        "repoharbor".into()
     }
 
     /// The badged glyph doubles as the base icon while urgent, so hosts that
