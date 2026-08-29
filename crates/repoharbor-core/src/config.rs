@@ -381,12 +381,23 @@ mod tests {
         };
         assert!(heal_agent_command(&mut cfg));
         assert!(
-            !template_program_missing(&cfg.agent_command),
-            "healed command should resolve on PATH: {}",
+            !cfg.agent_command.contains("definitely-not-a-real-terminal-xyz"),
+            "stale binary must be replaced: {}",
             cfg.agent_command
         );
         assert!(!cfg.agent_command.contains("claude"));
-        // Second heal is a no-op.
+        // GitHub-hosted runners often have none of `TERMINALS` and no
+        // `xdg-terminal-exec`. The fallback string is still a successful heal;
+        // requiring it on PATH made CI fail while desktops stayed green.
+        if template_program_missing(&cfg.agent_command) {
+            assert!(
+                cfg.agent_command == "xdg-terminal-exec"
+                    || cfg.agent_command.starts_with("xdg-terminal-exec "),
+                "PATH-less fallback should be xdg-terminal-exec, got {}",
+                cfg.agent_command
+            );
+        }
+        // Second heal is a no-op even when the fallback is also missing.
         assert!(!heal_agent_command(&mut cfg));
     }
 

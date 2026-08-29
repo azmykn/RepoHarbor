@@ -38,10 +38,11 @@ jobs:
           cache: pnpm
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
+      # Do not pass `enablement: true` — creating a Pages site needs admin and
+      # fails with "Resource not accessible by integration" on GITHUB_TOKEN.
+      # Enable Pages once in the repo settings (Build and deployment: GitHub Actions).
       - name: Configure Pages
         uses: actions/configure-pages@v5
-        with:
-          enablement: true
       - name: Build docs
         run: pnpm docs:build
       - name: Upload artifact
