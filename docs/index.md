@@ -37,7 +37,7 @@ features:
     linkText: Inbox, Feed & Explore
   - icon: ✨
     title: Local AI
-    details: On-device summaries, commit messages, changelogs, a daily briefing, and semantic search — via Ollama or a bundled llama.cpp engine. Nothing leaves your machine; turn it off and the UI hides it.
+    details: On-device summaries, commit messages, changelogs, a daily briefing, and semantic search — via Ollama or a bundled llama.cpp engine. Local by default, so nothing leaves your machine; an OpenAI-compatible endpoint is opt-in when you want hosted speed. Turn it off and the UI hides it.
     link: /guide/local-ai
     linkText: Set up local AI
   - icon: 🛠️

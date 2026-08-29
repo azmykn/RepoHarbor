@@ -55,6 +55,11 @@ pub struct SettingsState {
     pub llama_server: Entity<InputState>,
     /// llama.cpp: a GGUF model URL to download.
     pub llama_url: Entity<InputState>,
+    /// Cloud: base URL of the OpenAI-compatible endpoint.
+    pub openai_base: Entity<InputState>,
+    /// Cloud: API key entry. Starts empty (the stored key is never displayed);
+    /// a blank value on Save leaves the existing key alone.
+    pub openai_key: Entity<InputState>,
     pub client_id: Entity<InputState>,
     pub ignore: Entity<InputState>,
     pub add_root: Entity<InputState>,
@@ -102,6 +107,21 @@ impl SettingsState {
                 &cfg.llama_server_path,
             ),
             llama_url: field(window, cx, "https://…/model.gguf", ""),
+            openai_base: field(
+                window,
+                cx,
+                "https://api.groq.com/openai/v1",
+                &cfg.openai_base,
+            ),
+            openai_key: cx.new(|cx| {
+                InputState::new(window, cx)
+                    .placeholder(if repoharbor_core::cloud::has_api_key() {
+                        "•••••• (stored — type to replace)"
+                    } else {
+                        "API key"
+                    })
+                    .masked(true)
+            }),
             client_id: field(window, cx, "GitHub OAuth client id", &cfg.github_client_id),
             ignore: field(window, cx, "node_modules, .cache", &cfg.ignore.join(", ")),
             add_root: field(window, cx, "~/Projects or ~/code/my-app", ""),
@@ -645,6 +665,15 @@ fn backend_is_llama(backend: &str) -> bool {
     matches!(backend, "llamaCpp" | "llama_cpp" | "llamacpp")
 }
 
+/// True when the configured backend string selects the OpenAI-compatible
+/// endpoint. Mirrors `repoharbor_core::ai`'s accepted spellings.
+fn backend_is_cloud(backend: &str) -> bool {
+    matches!(
+        backend,
+        "cloud" | "openai" | "openaiCompat" | "openai_compat"
+    )
+}
+
 fn ai_section(
     s: &SettingsState,
     ai: &AiStatus,
@@ -653,6 +682,7 @@ fn ai_section(
     app: &Entity<RepoHarborApp>,
 ) -> impl IntoElement {
     let is_llama = backend_is_llama(&s.draft.ai_backend);
+    let is_cloud = backend_is_cloud(&s.draft.ai_backend);
     let mut sec = section(t, "AI & search")
         .child(toggle(
             "Enable AI features",
@@ -665,8 +695,22 @@ fn ai_section(
                 }
             },
         ))
-        .child(backend_picker(is_llama, t, app));
-    if is_llama {
+        .child(backend_picker(&s.draft.ai_backend, t, app));
+    if is_cloud {
+        sec = sec
+            .child(labeled("Base URL", s.openai_base.clone(), t))
+            .child(labeled("Chat model", s.ai_model.clone(), t))
+            .child(cloud_key_row(s, t, app))
+            // Amber, not red: this is a standing caution about where the data
+            // goes, not a failure. Red (`behind`) reads as "something broke".
+            .child(note_line(
+                SharedString::from(
+                    "Cloud backend: prompts — including your staged diffs and commit history — are sent to this endpoint. Pick Ollama or llama.cpp to keep everything on-device. Embeddings and semantic search always stay local.",
+                ),
+                t.dirty,
+                t,
+            ));
+    } else if is_llama {
         sec = sec
             .child(labeled("llama-server path", s.llama_server.clone(), t))
             .child(llama_download_row(s, t, app))
@@ -679,7 +723,7 @@ fn ai_section(
     }
     sec = sec
         .child(labeled("GitHub OAuth client id", s.client_id.clone(), t))
-        .child(ai_status_block(s, is_llama, ai, t, app));
+        .child(ai_status_block(s, is_llama, is_cloud, ai, t, app));
     // Semantic recall index — an aiReady affordance (hidden, not broken, when
     // AI is off/unreachable or the backend can't embed).
     if ai_ready && repoharbor_core::ai::embeddings_supported() {
@@ -721,11 +765,40 @@ fn semantic_index_block(
         }))
 }
 
-/// Two-way Ollama / llama.cpp backend picker. Takes effect on Save.
-fn backend_picker(is_llama: bool, t: &Theme, app: &Entity<RepoHarborApp>) -> impl IntoElement {
-    let opt = |label: &'static str, llama: bool| {
+/// API-key row for the cloud backend: a masked field plus a Clear button. The
+/// stored key is never rendered back, so an empty field means "keep as is".
+fn cloud_key_row(s: &SettingsState, t: &Theme, app: &Entity<RepoHarborApp>) -> impl IntoElement {
+    let app_clear = app.clone();
+    div()
+        .flex()
+        .flex_col()
+        .gap(px(4.))
+        .child(field_label("API key (stored outside config.toml)", t))
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(8.))
+                .child(div().flex_1().child(Input::new(&s.openai_key)))
+                .child(button("Clear key", t, move |cx| {
+                    app_clear.update(cx, |this, cx| this.ai_clear_cloud_key(cx));
+                })),
+        )
+}
+
+/// Three-way Ollama / llama.cpp / Cloud backend picker. Takes effect on Save.
+fn backend_picker(backend: &str, t: &Theme, app: &Entity<RepoHarborApp>) -> impl IntoElement {
+    let current: SharedString = if backend_is_llama(backend) {
+        "llamaCpp".into()
+    } else if backend_is_cloud(backend) {
+        "cloud".into()
+    } else {
+        "ollama".into()
+    };
+    let opt = |label: &'static str, value: &'static str| {
         let app = app.clone();
-        let on = llama == is_llama;
+        let on = current.as_ref() == value;
         div()
             .id(label)
             .px(px(12.))
@@ -740,12 +813,18 @@ fn backend_picker(is_llama: bool, t: &Theme, app: &Entity<RepoHarborApp>) -> imp
             .child(label)
             .on_click(move |_ev, _win, cx| {
                 app.update(cx, |this, cx| {
+                    let changed = this
+                        .settings
+                        .as_ref()
+                        .is_some_and(|s| s.draft.ai_backend != value);
                     if let Some(s) = &mut this.settings {
-                        s.draft.ai_backend = if llama {
-                            "llamaCpp".into()
-                        } else {
-                            "ollama".into()
-                        };
+                        s.draft.ai_backend = value.into();
+                    }
+                    // The live status describes the *saved* backend, so keeping
+                    // it would advertise the old engine's models under the newly
+                    // picked one. Drop it until Save applies the change.
+                    if changed {
+                        this.invalidate_ai_status(cx);
                     }
                     cx.notify();
                 });
@@ -761,8 +840,9 @@ fn backend_picker(is_llama: bool, t: &Theme, app: &Entity<RepoHarborApp>) -> imp
                 .flex()
                 .flex_row()
                 .gap(px(6.))
-                .child(opt("Ollama", false))
-                .child(opt("llama.cpp", true)),
+                .child(opt("Ollama", "ollama"))
+                .child(opt("llama.cpp", "llamaCpp"))
+                .child(opt("Cloud", "cloud")),
         )
 }
 
@@ -821,6 +901,7 @@ fn llama_model_line(s: &SettingsState, t: &Theme) -> impl IntoElement {
 fn ai_status_block(
     s: &SettingsState,
     is_llama: bool,
+    is_cloud: bool,
     ai: &AiStatus,
     t: &Theme,
     app: &Entity<RepoHarborApp>,
@@ -873,9 +954,11 @@ fn ai_status_block(
         }));
     block = block.child(head);
     block = block.child(note_line(
-        SharedString::from(
-            "If Generate commit fails with a runner / 500 error, free GPU VRAM (or wait — RepoHarbor retries on CPU) and restart Ollama if needed. Prefer qwen2.5:3b when VRAM allows; qwen3:0.6b is a lighter fallback.",
-        ),
+        SharedString::from(if is_cloud {
+            "Test checks the endpoint and key. Small hosted models (e.g. llama-3.1-8b-instant on Groq) draft a commit message in well under a second."
+        } else {
+            "If Generate commit fails with a runner / 500 error, free GPU VRAM (or wait — RepoHarbor retries on CPU) and restart Ollama if needed. Prefer qwen2.5:3b when VRAM allows; qwen3:0.6b is a lighter fallback."
+        }),
         t.fg3,
         t,
     ));
@@ -885,7 +968,15 @@ fn ai_status_block(
 
     if let AiStatus::Ready(models) = ai {
         if models.is_empty() {
-            block = block.child(note_line("No models installed.".into(), t.fg3, t));
+            block = block.child(note_line(
+                if is_cloud {
+                    "No models offered by this endpoint.".into()
+                } else {
+                    "No models installed.".into()
+                },
+                t.fg3,
+                t,
+            ));
         } else {
             block = block.child(note_line("Click a model to use it.".into(), t.fg3, t));
             for (name, size) in models {
@@ -915,7 +1006,7 @@ fn ai_status_block(
                                 .text_color(rgb(t.fg1))
                                 .child(name.clone()),
                         )
-                        .child(super::muted_mono(size.clone(), t))
+                        .children((!is_cloud).then(|| super::muted_mono(size.clone(), t)))
                         .on_click(move |_ev, window, cx| {
                             let pick = pick.clone();
                             if is_llama {
@@ -943,7 +1034,7 @@ fn ai_status_block(
         // Ollama can pull the configured chat model from the registry; the
         // llama.cpp backend downloads GGUFs via the field above instead.
         let model = s.draft.ai_model.clone();
-        if !is_llama && !model.trim().is_empty() {
+        if !is_llama && !is_cloud && !model.trim().is_empty() {
             block = block.child(div().child(button(&format!("Pull \"{model}\""), t, {
                 let app = app.clone();
                 move |cx| {

@@ -13,7 +13,12 @@ use crate::shell::RepoHarborApp;
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct FleetMenuCaps {
     pub has_dirty: bool,
+    /// At least one selected repo is ahead on a non–pull-only path.
     pub can_push: bool,
+    /// At least one selected repo is not under a pull-only prefix (Digits /
+    /// pushable path). Used to hide Push as a primary when the selection is
+    /// entirely vendor / upstream.
+    pub has_pushable_path: bool,
     pub has_submodules: bool,
 }
 
@@ -27,7 +32,11 @@ pub(crate) fn fleet_menu_caps(app: &RepoHarborApp, targets: &[String]) -> FleetM
         if row.dirty > 0 {
             caps.has_dirty = true;
         }
-        if row.ahead > 0 && !app.is_pull_only(id) {
+        let pull_only = app.is_pull_only(id);
+        if !pull_only {
+            caps.has_pushable_path = true;
+        }
+        if row.ahead > 0 && !pull_only {
             caps.can_push = true;
         }
         if row.child_count > 0 {
@@ -53,7 +62,7 @@ pub(crate) struct FleetMenuOpts {
 }
 
 /// Canonical action order (sync-first):
-/// Open drawer / Open on host → Fetch / Pull → Stage / Commit / Generate / Push
+/// Open drawer / Open on host → Fetch / Pull → Stage / Commit / Generate / Push / Empty commit
 /// → Update submodules → Discard / Prune / Reset → Open in IDE → Clear selection.
 pub(crate) fn fill_fleet_actions_menu(
     menu: PopupMenu,
@@ -159,6 +168,17 @@ pub(crate) fn fill_fleet_actions_menu(
             .on_click(move |_, _, cx| {
                 a.update(cx, |this, cx| {
                     this.run_fleet_repos(FleetOp::Push, r.clone(), cx);
+                });
+            }),
+    );
+    let empty_on = on && opts.caps.has_pushable_path;
+    let (a, r) = (app.clone(), repos.clone());
+    m = m.item(
+        PopupMenuItem::new("Empty commit")
+            .disabled(!empty_on)
+            .on_click(move |_, _, cx| {
+                a.update(cx, |this, cx| {
+                    this.run_fleet_repos(FleetOp::EmptyCommit, r.clone(), cx);
                 });
             }),
     );

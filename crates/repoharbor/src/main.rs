@@ -111,10 +111,14 @@ fn main() {
                 KeyBinding::new("ctrl-shift-p", FleetPullSelected, None),
             ]);
 
-            let bounds = Bounds::centered(None, size(px(1320.), px(880.)), cx);
+            // Restore size if the user un-maximizes; open maximized (not exclusive
+            // fullscreen) so Mission Control fills the display on first paint.
+            // Centered 1320×880 is the un-maximize restore target; Maximized
+            // triggers platform zoom() (see gpui WindowBounds match).
+            let restore = Bounds::centered(None, size(px(1320.), px(880.)), cx);
             cx.open_window(
                 WindowOptions {
-                    window_bounds: Some(WindowBounds::Windowed(bounds)),
+                    window_bounds: Some(WindowBounds::Maximized(restore)),
                     // Client-side decorations (Wayland default) need an in-app
                     // TitleBar for minimize / maximize / close. Without this the
                     // window has no system chrome and no window-control buttons.
@@ -127,6 +131,11 @@ fn main() {
                 },
                 |window, cx| {
                     window.set_window_title("RepoHarbor");
+                    // Second zoom pass helps some Wayland CSD compositors that
+                    // ignore the initial Maximized hint on first map.
+                    if !window.is_maximized() {
+                        window.zoom_window();
+                    }
                     let sidebar_width = config
                         .sidebar_width
                         .clamp(shell::SIDEBAR_MIN, shell::SIDEBAR_MAX);

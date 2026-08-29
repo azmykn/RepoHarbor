@@ -61,6 +61,23 @@ cd RepoHarbor
 cargo run -p repoharbor          # first build is slow: it compiles all of GPUI
 ```
 
+## Pin to the Dash / taskbar
+
+Source builds are not registered with the desktop shell until you install a
+user-local `.desktop` entry and icons:
+
+```sh
+cargo build -p repoharbor
+bash scripts/install-desktop.sh
+```
+
+Then quit the app (if it is running), launch **RepoHarbor** from the
+applications menu, and right-click its Dash / task manager icon → **Pin to
+Dash** (GNOME) or **Pin to Task Manager** (KDE). The window `app_id`
+(`com.digitscode.repoharbor`) must match `StartupWMClass` in the desktop file —
+the install script wires that up. Relaunch after install; if the Pin option is
+still missing, log out and back in once.
+
 On first launch, open **Settings → Workspace roots** and point RepoHarbor at the directories where you keep your projects (defaults to `~/dev`). Then **Save**.
 
 ## Build a release

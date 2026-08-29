@@ -108,10 +108,13 @@ pub fn render(
                 .child(cancel_btn(t, app)),
         );
 
+    // Full-screen occlude (same as palette): when this dialog sits above the
+    // drawer, clicks must not fall through to the drawer scrim and dismiss it.
     div()
         .id("gen-commit-backdrop")
         .absolute()
         .inset_0()
+        .occlude()
         .flex()
         .items_center()
         .justify_center()

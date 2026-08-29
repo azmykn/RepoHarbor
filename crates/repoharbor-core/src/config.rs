@@ -179,6 +179,7 @@ impl Default for AppConfig {
             ai_model: crate::model::default_ai_model(),
             ai_enabled: true,
             ai_backend: crate::model::default_ai_backend(),
+            openai_base: String::new(),
             llama_server_path: String::new(),
             llama_model_path: String::new(),
             embed_model: crate::model::default_embed_model(),

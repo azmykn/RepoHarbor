@@ -23,5 +23,5 @@ Closing the window **hides RepoHarbor to the system tray** rather than quitting,
 Prefer RepoHarbor fully closed? Quit from the tray menu.
 
 ::: tip Summon it back
-A global shortcut — <kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>O</kbd> — brings the window back to the front from anywhere. (Best-effort on native Wayland, which may gate global shortcuts behind a portal.)
+Global-shortcut registration is disabled so cold start does not pop the desktop “add a shortcut” portal dialog. Use the tray or Dash / taskbar pin to raise the window; bind a summon hotkey in your desktop’s global-shortcuts settings if you want one.
 :::

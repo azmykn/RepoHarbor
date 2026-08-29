@@ -1265,6 +1265,37 @@ pub fn commit(path: &str, message: &str) -> Result<String, String> {
     Ok(oid.to_string()[..7.min(oid.to_string().len())].to_string())
 }
 
+/// Create a commit even when the index matches HEAD (`git commit --allow-empty`).
+/// Used to trigger CI / rebuilds without tree changes. Returns the short hash.
+pub fn commit_empty(path: &str, message: &str) -> Result<String, String> {
+    let msg = message.trim();
+    if msg.is_empty() {
+        return Err("empty commit message".into());
+    }
+    let repo = Repository::open(path).map_err(|e| e.to_string())?;
+
+    // Refuse to commit on a detached HEAD — it would orphan the commit.
+    if let Ok(head) = repo.head() {
+        if !head.is_branch() {
+            return Err("HEAD is detached — check out a branch before committing".into());
+        }
+    }
+
+    let mut index = repo.index().map_err(|e| e.to_string())?;
+    let tree_id = index.write_tree().map_err(|e| e.to_string())?;
+    let tree = repo.find_tree(tree_id).map_err(|e| e.to_string())?;
+    let parent = repo.head().ok().and_then(|h| h.peel_to_commit().ok());
+
+    let sig = repo
+        .signature()
+        .map_err(|_| "set git user.name and user.email first".to_string())?;
+    let parents: Vec<&git2::Commit> = parent.iter().collect();
+    let oid = repo
+        .commit(Some("HEAD"), &sig, &sig, msg, &tree, &parents)
+        .map_err(|e| e.to_string())?;
+    Ok(oid.to_string()[..7.min(oid.to_string().len())].to_string())
+}
+
 /// Stage every unstaged/untracked/deleted path, then commit — the Cursor /
 /// PyCharm "Commit All" flow so the user doesn't need a separate `git add`.
 pub fn commit_all(path: &str, message: &str) -> Result<String, String> {
@@ -1590,6 +1621,25 @@ mod tests {
             .unwrap();
         let path = dir.path().to_string_lossy().into_owned();
         (dir, path)
+    }
+
+    #[test]
+    fn commit_empty_allows_identical_tree() {
+        let (_dir, path) = init_repo();
+        // Clean tree would refuse a normal commit.
+        assert_eq!(
+            commit(&path, "noop").unwrap_err(),
+            "no staged changes to commit"
+        );
+        let hash = commit_empty(&path, "Empty commit").unwrap();
+        assert_eq!(hash.len(), 7);
+        // Second empty commit also succeeds.
+        let hash2 = commit_empty(&path, "Empty commit").unwrap();
+        assert_ne!(hash, hash2);
+        assert_eq!(
+            commit_empty(&path, "   ").unwrap_err(),
+            "empty commit message"
+        );
     }
 
     #[test]

@@ -226,6 +226,21 @@ pub fn commit_all_op(message: String) -> impl Fn(&str) -> Outcome + Sync {
     }
 }
 
+/// Create an empty commit (`git commit --allow-empty`) with `message` on every
+/// repo. Used to trigger CI without tree changes. Blank messages fail.
+pub fn empty_commit_op(message: String) -> impl Fn(&str) -> Outcome + Sync {
+    move |path| {
+        let msg = message.trim();
+        if msg.is_empty() {
+            return Outcome::Failed("empty commit message".into());
+        }
+        match git_ops::commit_empty(path, msg) {
+            Ok(hash) => Outcome::Ok(format!("empty commit {hash}")),
+            Err(e) => Outcome::Failed(e),
+        }
+    }
+}
+
 /// Push the current branch to its upstream (or set upstream on origin).
 pub fn push_op() -> impl Fn(&str) -> Outcome + Sync {
     |path| match git_ops::push(path) {
@@ -556,6 +571,19 @@ mod tests {
         );
         assert_eq!(
             commit_all_op("   ".into())(&path),
+            Outcome::Failed("empty commit message".into())
+        );
+    }
+
+    #[test]
+    fn empty_commit_op_commits_clean_tree() {
+        let (_d, path) = init_repo();
+        match empty_commit_op("Empty commit".into())(&path) {
+            Outcome::Ok(s) => assert!(s.starts_with("empty commit "), "{s}"),
+            other => panic!("expected Ok, got {other:?}"),
+        }
+        assert_eq!(
+            empty_commit_op("   ".into())(&path),
             Outcome::Failed("empty commit message".into())
         );
     }
