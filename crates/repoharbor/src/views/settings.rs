@@ -701,11 +701,13 @@ fn ai_section(
             .child(labeled("Base URL", s.openai_base.clone(), t))
             .child(labeled("Chat model", s.ai_model.clone(), t))
             .child(cloud_key_row(s, t, app))
+            // Amber, not red: this is a standing caution about where the data
+            // goes, not a failure. Red (`behind`) reads as "something broke".
             .child(note_line(
                 SharedString::from(
                     "Cloud backend: prompts — including your staged diffs and commit history — are sent to this endpoint. Pick Ollama or llama.cpp to keep everything on-device. Embeddings and semantic search always stay local.",
                 ),
-                t.behind,
+                t.dirty,
                 t,
             ));
     } else if is_llama {
