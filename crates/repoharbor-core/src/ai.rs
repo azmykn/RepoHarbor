@@ -826,16 +826,24 @@ pub fn commit_prompt_with_extras(
     repo_path: Option<&str>,
     extras: &CommitExtras,
 ) -> String {
-    let hint = odoo_manifest_version_hint(diff, repo_path)
-        .map(|h| format!("\n{h}\n"))
-        .unwrap_or_default();
+    // The Odoo version requirement is only stated when a manifest version was
+    // actually found. Stating it unconditionally taught models to invent one:
+    // a Rust repo got `feat(ai): add cloud backend support (19.0.1.0.0)`.
+    let version_hint = odoo_manifest_version_hint(diff, repo_path);
+    let version_rule = if version_hint.is_some() {
+        "- You MUST mention the module version shown below in the subject or body.\n"
+    } else {
+        ""
+    };
+    let hint = version_hint.map(|h| format!("\n{h}\n")).unwrap_or_default();
     let hint = format!("{hint}{}", extras_block(extras));
     format!(
         "Write a Conventional Commit message for these staged changes.\n\n\
 Requirements:\n\
 - Subject line in Conventional Commit form (e.g. `feat(scope): summary`), under ~72 characters.\n\
 - Then a blank line, then a real body of 2–5 short sentences or bullets explaining WHAT changed and WHY — not a subject-only one-liner.\n\
-- If the diff touches `__manifest__.py` or `__openerp__.py` and shows a `version` change, you MUST mention the module version in the subject or body.\n\
+- Do not invent version numbers, issue ids or file names that are not in the input.\n\
+{version_rule}\
 - Output ONLY the commit message — no code fences, no preamble, no quotes around the whole message.\n\
 - Write in English.\n\
 {hint}\n\
@@ -1268,7 +1276,17 @@ diff --git a/addons/foo/__manifest__.py b/addons/foo/__manifest__.py
 
         let prompt = commit_prompt_with_context(diff, None);
         assert!(prompt.contains("19.0.1.2.0"));
-        assert!(prompt.contains("__manifest__.py"));
+        assert!(prompt.contains("MUST mention the module version"));
+    }
+
+    #[test]
+    fn non_odoo_prompt_never_asks_for_a_module_version() {
+        // Stating the Odoo rule unconditionally made models invent a version on
+        // repos that have no manifest at all.
+        let p = commit_prompt("diff --git a/src/main.rs b/src/main.rs\n+fn main() {}\n");
+        assert!(!p.contains("MUST mention the module version"), "{p}");
+        assert!(!p.to_lowercase().contains("__manifest__"), "{p}");
+        assert!(p.contains("Do not invent version numbers"));
     }
 
     #[test]
