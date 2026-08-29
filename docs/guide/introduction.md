@@ -31,7 +31,7 @@ Beyond the [Mission Control](./mission-control) grid, RepoHarbor has grown a ful
 - **[Notifications & tray](./notifications)** — background polling for PRs, reviews, and CI, surfaced as desktop notifications and a tray glance.
 - **[Maintenance & tools](./maintenance)** — a branch janitor for merged/gone branches, and an offline developer utility belt.
 - **[Inbox, Feed & Explore](./inbox-feed-explore)** — what's waiting on you, a release radar, and a browser for your starred repos.
-- **[Local AI](./local-ai)** — summaries, commit messages, changelogs, briefings, and semantic search, on-device via Ollama or a bundled llama.cpp engine.
+- **[AI features](./local-ai)** — summaries, commit messages, changelogs, briefings, and semantic search, on-device via Ollama or a bundled llama.cpp engine (or an opt-in hosted endpoint when you want speed).
 
 ## Stack
 
@@ -42,7 +42,7 @@ Beyond the [Mission Control](./mission-control) grid, RepoHarbor has grown a ful
 | Git | `git2` (libgit2, vendored) |
 | Persistence | SQLite + TOML config (XDG dirs) |
 | Hosts | GitHub + GitLab REST/GraphQL (incl. self-hosted) |
-| Local AI | [Ollama](https://ollama.com) or a bundled [llama.cpp](https://github.com/ggml-org/llama.cpp) sidecar, over HTTP |
+| AI | [Ollama](https://ollama.com) or a bundled [llama.cpp](https://github.com/ggml-org/llama.cpp) sidecar, over HTTP; optionally any OpenAI-compatible endpoint |
 
 ## How it fits together
 

@@ -147,9 +147,15 @@ pub struct AppConfig {
     #[serde(default = "default_true")]
     pub ai_enabled: bool,
     /// Which inference backend serves AI features: "llamaCpp" (default, bundled
-    /// llama.cpp sidecar) or "ollama" (HTTP). See #21.
+    /// llama.cpp sidecar), "ollama" (HTTP), or "cloud" (an OpenAI-compatible
+    /// endpoint — opt-in, since diffs then leave the machine). See #21.
     #[serde(default = "default_ai_backend")]
     pub ai_backend: String,
+    /// Base URL of the OpenAI-compatible endpoint for the "cloud" backend
+    /// (e.g. `https://api.groq.com/openai/v1`). Empty until configured; the API
+    /// key lives in the data dir, never here — see `crate::cloud`.
+    #[serde(default)]
+    pub openai_base: String,
     /// Optional override path to the `llama-server` binary. Empty → auto-discover
     /// (app data `bin/`, then PATH).
     #[serde(default)]

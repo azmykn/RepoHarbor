@@ -1,6 +1,8 @@
 //! Local AI summaries (#23). A `Backend` seam selects the inference engine:
-//! the Ollama HTTP path (default, GPU-accelerated) or the bundled llama.cpp
-//! sidecar (#21). The public entry points (`available`, `installed_models`,
+//! the Ollama HTTP path (GPU-accelerated), the bundled llama.cpp sidecar (#21,
+//! the default), or an opt-in OpenAI-compatible endpoint (`crate::cloud`) for
+//! when a hosted model is wanted over a local one. The public entry points
+//! (`available`, `installed_models`,
 //! `generate`, `embed`, `pull`) dispatch on the configured backend; everything
 //! backend-agnostic (prompts, `pick_model`) stays free-standing; vector
 //! similarity lives in `crate::semantic`.
@@ -16,13 +18,23 @@ use crate::model::Repo;
 enum Backend {
     Ollama,
     LlamaCpp,
+    /// An OpenAI-compatible HTTP endpoint (`crate::cloud`) — opt-in, for when a
+    /// hosted model is wanted over a local one for speed.
+    Cloud,
+}
+
+/// Parse a configured backend name. Pure so the accepted spellings (and the
+/// local-by-default fallback for anything unknown) are unit-tested.
+fn parse_backend(name: &str) -> Backend {
+    match name {
+        "llamaCpp" | "llama_cpp" | "llamacpp" => Backend::LlamaCpp,
+        "cloud" | "openai" | "openaiCompat" | "openai_compat" => Backend::Cloud,
+        _ => Backend::Ollama,
+    }
 }
 
 fn active_backend() -> Backend {
-    match crate::config::load().ai_backend.as_str() {
-        "llamaCpp" | "llama_cpp" | "llamacpp" => Backend::LlamaCpp,
-        _ => Backend::Ollama,
-    }
+    parse_backend(crate::config::load().ai_backend.as_str())
 }
 
 // ── Backend-dispatching entry points ───────────────────────────────────────
@@ -36,14 +48,17 @@ pub async fn available() -> bool {
     match active_backend() {
         Backend::Ollama => ollama_available().await,
         Backend::LlamaCpp => crate::llama::available().await,
+        Backend::Cloud => crate::cloud::available().await,
     }
 }
 
 /// Installed/available models as (name, size_bytes) for the active backend.
+/// Cloud models are hosted, so they report a zero size.
 pub async fn installed_models() -> Vec<(String, u64)> {
     match active_backend() {
         Backend::Ollama => ollama_installed_models().await,
         Backend::LlamaCpp => crate::llama::installed_models(),
+        Backend::Cloud => crate::cloud::models().await,
     }
 }
 
@@ -64,6 +79,7 @@ async fn generate_limited(model: &str, prompt: &str, num_predict: u32) -> Result
     match active_backend() {
         Backend::Ollama => ollama_generate(model, prompt, num_predict).await,
         Backend::LlamaCpp => crate::llama::generate(prompt, num_predict).await,
+        Backend::Cloud => crate::cloud::generate(model, prompt, num_predict).await,
     }
 }
 
@@ -74,12 +90,21 @@ pub fn embeddings_supported() -> bool {
     matches!(active_backend(), Backend::Ollama)
 }
 
+/// True when the active backend sends prompts off the machine. The Settings
+/// panel warns on this so the egress is never a surprise.
+pub fn backend_is_remote() -> bool {
+    matches!(active_backend(), Backend::Cloud)
+}
+
 /// Embed `text` with `model` on the active backend. Embeddings are Ollama-only
 /// for now — semantic search stays hidden on the llama.cpp backend.
 pub async fn embed(model: &str, text: &str) -> Result<Vec<f32>, String> {
     match active_backend() {
         Backend::Ollama => ollama_embed(model, text).await,
         Backend::LlamaCpp => Err("embeddings are not supported on the llama.cpp backend".into()),
+        Backend::Cloud => {
+            Err("embeddings stay local — switch to the Ollama backend to index".into())
+        }
     }
 }
 
@@ -91,6 +116,7 @@ pub async fn pull(model: &str, on_progress: impl FnMut(&str, u64, u64)) -> Resul
         Backend::LlamaCpp => {
             Err("use the model download in Settings for the llama.cpp backend".into())
         }
+        Backend::Cloud => Err("cloud models are hosted — nothing to download".into()),
     }
 }
 
@@ -249,6 +275,11 @@ fn is_runner_crash(err: &str) -> bool {
     e.contains("runner process has terminated")
         || e.contains("llama runner")
         || (e.contains("500") && e.contains("terminated"))
+        // Other VRAM / GPU load failures Ollama surfaces without the runner phrase.
+        || e.contains("cuda error")
+        || e.contains("out of memory")
+        || e.contains("insufficient memory")
+        || e.contains("ggml_gallocr_reserve")
 }
 
 /// An empty final `response` is always an error — callers must not treat blank
@@ -457,29 +488,209 @@ fn is_odoo_manifest_path(path: &str) -> bool {
     base == "__manifest__.py" || base == "__openerp__.py"
 }
 
-/// Relative paths of Odoo manifests touched by a unified diff (`diff --git` /
-/// `+++ b/` headers).
-pub fn manifest_paths_in_diff(diff: &str) -> Vec<String> {
-    let mut paths = Vec::new();
+/// Repo-relative paths touched by a unified diff, in first-seen order, read
+/// from the `diff --git` / `+++ b/` headers. Deletions (`/dev/null`) are kept —
+/// the containing directory is still where a changelog would live.
+pub fn changed_paths_in_diff(diff: &str) -> Vec<String> {
+    let mut paths: Vec<String> = Vec::new();
+    let mut push = |p: &str| {
+        let p = p.trim();
+        if p.is_empty() || p == "/dev/null" || paths.iter().any(|x| x == p) {
+            return;
+        }
+        paths.push(p.to_string());
+    };
     for line in diff.lines() {
         if let Some(rest) = line.strip_prefix("diff --git ") {
             for part in rest.split_whitespace() {
-                let p = part
-                    .strip_prefix("a/")
-                    .or_else(|| part.strip_prefix("b/"))
-                    .unwrap_or(part);
-                if is_odoo_manifest_path(p) && !paths.iter().any(|x| x == p) {
-                    paths.push(p.to_string());
-                }
+                push(
+                    part.strip_prefix("a/")
+                        .or_else(|| part.strip_prefix("b/"))
+                        .unwrap_or(part),
+                );
             }
         } else if let Some(rest) = line.strip_prefix("+++ b/") {
-            let p = rest.split('\t').next().unwrap_or(rest).trim();
-            if is_odoo_manifest_path(p) && !paths.iter().any(|x| x == p) {
-                paths.push(p.to_string());
-            }
+            push(rest.split('\t').next().unwrap_or(rest));
         }
     }
     paths
+}
+
+/// Relative paths of Odoo manifests touched by a unified diff.
+pub fn manifest_paths_in_diff(diff: &str) -> Vec<String> {
+    changed_paths_in_diff(diff)
+        .into_iter()
+        .filter(|p| is_odoo_manifest_path(p))
+        .collect()
+}
+
+/// Filenames treated as a changelog, in preference order within one directory.
+const CHANGELOG_NAMES: &[&str] = &[
+    "CHANGELOG.md",
+    "CHANGELOG.rst",
+    "CHANGELOG.txt",
+    "CHANGELOG",
+    "changelog.md",
+    "CHANGES.md",
+    "HISTORY.md",
+    "NEWS.md",
+];
+
+/// How many distinct changelog files feed one commit prompt. A commit can span
+/// several modules; beyond a handful the notes crowd out the diff itself.
+const MAX_CHANGELOGS: usize = 3;
+/// Skip pathologically large changelogs rather than reading them to excerpt.
+const MAX_CHANGELOG_BYTES: u64 = 200 * 1024;
+/// Characters kept from each changelog.
+const CHANGELOG_EXCERPT_CHARS: usize = 2_000;
+/// Trailing lines used when a file has no `Unreleased` section.
+const CHANGELOG_TAIL_LINES: usize = 80;
+/// Recent commit subjects shown to the model for house style.
+const RECENT_SUBJECTS: usize = 5;
+
+/// True for a `## Unreleased` / `## [Unreleased]` heading (Keep a Changelog).
+fn is_unreleased_heading(line: &str) -> bool {
+    let l = line.trim();
+    if !l.starts_with("##") || l.starts_with("###") {
+        return false;
+    }
+    l.to_lowercase().contains("unreleased")
+}
+
+/// The most relevant slice of a changelog: its `Unreleased` section when there
+/// is one (that's where the change being committed belongs), otherwise the
+/// trailing lines — the newest entries, since these files grow at the top but
+/// are read bottom-up by nobody. Pure so it's unit-tested without a filesystem.
+pub fn changelog_excerpt(text: &str) -> String {
+    let lines: Vec<&str> = text.lines().collect();
+    if let Some(start) = lines.iter().position(|l| is_unreleased_heading(l)) {
+        let end = lines
+            .iter()
+            .enumerate()
+            .skip(start + 1)
+            .find(|(_, l)| {
+                let l = l.trim();
+                l.starts_with("##") && !l.starts_with("###")
+            })
+            .map(|(i, _)| i)
+            .unwrap_or(lines.len());
+        let section = lines[start..end].join("\n").trim().to_string();
+        // A bare heading with nothing under it says nothing — fall through.
+        if section.lines().filter(|l| !l.trim().is_empty()).count() > 1 {
+            return clamp_chars(&section, CHANGELOG_EXCERPT_CHARS);
+        }
+    }
+    let tail = lines
+        .iter()
+        .skip(lines.len().saturating_sub(CHANGELOG_TAIL_LINES))
+        .copied()
+        .collect::<Vec<_>>()
+        .join("\n")
+        .trim()
+        .to_string();
+    clamp_chars(&tail, CHANGELOG_EXCERPT_CHARS)
+}
+
+/// Walk up from `dir` to `root` (inclusive) and return the first changelog file
+/// found. `dir` must be inside `root`.
+fn changelog_near(root: &std::path::Path, dir: &std::path::Path) -> Option<std::path::PathBuf> {
+    let mut cur = Some(dir);
+    while let Some(d) = cur {
+        for name in CHANGELOG_NAMES {
+            let candidate = d.join(name);
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+        if d == root {
+            break;
+        }
+        cur = d.parent();
+    }
+    None
+}
+
+/// Changelog notes relevant to a diff, as (repo-relative path, excerpt).
+///
+/// Walks *up from each changed file* to the repo root rather than scanning the
+/// tree, so a monorepo of Odoo modules contributes the changelog of the module
+/// actually being touched — not dozens of unrelated ones.
+pub fn nearby_changelogs(diff: &str, repo_path: &str) -> Vec<(String, String)> {
+    let root = std::path::Path::new(repo_path);
+    if repo_path.is_empty() || !root.is_dir() {
+        return Vec::new();
+    }
+    let mut found: Vec<(String, String)> = Vec::new();
+    for rel in changed_paths_in_diff(diff) {
+        if found.len() >= MAX_CHANGELOGS {
+            break;
+        }
+        // Stay inside the repo: a header is always repo-relative, so anything
+        // absolute or with a parent component is not something to walk from.
+        let rel_path = std::path::Path::new(&rel);
+        if rel_path.components().any(|c| {
+            matches!(
+                c,
+                std::path::Component::ParentDir | std::path::Component::RootDir
+            )
+        }) {
+            continue;
+        }
+        let abs = root.join(rel_path);
+        let Some(dir) = abs.parent() else { continue };
+        let Some(file) = changelog_near(root, dir) else {
+            continue;
+        };
+        let label = file
+            .strip_prefix(root)
+            .unwrap_or(&file)
+            .to_string_lossy()
+            .into_owned();
+        if found.iter().any(|(p, _)| *p == label) {
+            continue;
+        }
+        if std::fs::metadata(&file)
+            .map(|m| m.len())
+            .unwrap_or(u64::MAX)
+            > MAX_CHANGELOG_BYTES
+        {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(&file) else {
+            continue;
+        };
+        let excerpt = changelog_excerpt(&text);
+        if !excerpt.trim().is_empty() {
+            found.push((label, excerpt));
+        }
+    }
+    found
+}
+
+/// Extra context beyond the diff itself, gathered by [`commit_message`].
+#[derive(Debug, Default, Clone)]
+pub struct CommitExtras {
+    /// Changelog notes near the changed files, as (repo-relative path, excerpt).
+    pub changelogs: Vec<(String, String)>,
+    /// Recent commit subjects (newest first) — house style, not content.
+    pub recent_subjects: Vec<String>,
+}
+
+impl CommitExtras {
+    /// Collect changelog notes + recent subjects for `repo_path`. Every source
+    /// is optional: a repo with no changelog and no history yields empty
+    /// extras and the prompt is unchanged.
+    pub fn gather(diff: &str, repo_path: &str) -> Self {
+        CommitExtras {
+            changelogs: nearby_changelogs(diff, repo_path),
+            recent_subjects: crate::git_ops::recent_log(repo_path, RECENT_SUBJECTS)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|c| c.summary)
+                .filter(|s| !s.trim().is_empty())
+                .collect(),
+        }
+    }
 }
 
 /// Parse an Odoo-style `version` assignment from a single line
@@ -580,9 +791,45 @@ pub fn commit_prompt(diff: &str) -> String {
 
 /// Like [`commit_prompt`], with an optional repo root for on-disk manifest reads.
 pub fn commit_prompt_with_context(diff: &str, repo_path: Option<&str>) -> String {
+    commit_prompt_with_extras(diff, repo_path, &CommitExtras::default())
+}
+
+/// Render the changelog notes / recent-subject blocks. Empty extras render
+/// nothing, so the prompt is byte-identical to the plain diff-only form.
+fn extras_block(extras: &CommitExtras) -> String {
+    let mut out = String::new();
+    for (path, excerpt) in &extras.changelogs {
+        out.push_str(&format!(
+            "\nExisting changelog notes from `{path}` — use them to explain WHAT changed and WHY. \
+Only rely on entries that match this diff; do not copy them verbatim:\n{excerpt}\n"
+        ));
+    }
+    if !extras.recent_subjects.is_empty() {
+        out.push_str(&format!(
+            "\nRecent commit subjects in this repo, for scope naming and style only — do not \
+describe their changes:\n{}\n",
+            extras
+                .recent_subjects
+                .iter()
+                .map(|s| format!("- {s}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        ));
+    }
+    out
+}
+
+/// The full commit prompt: the diff, the Odoo manifest version hint, and any
+/// [`CommitExtras`] gathered from the repo (changelog notes, recent subjects).
+pub fn commit_prompt_with_extras(
+    diff: &str,
+    repo_path: Option<&str>,
+    extras: &CommitExtras,
+) -> String {
     let hint = odoo_manifest_version_hint(diff, repo_path)
         .map(|h| format!("\n{h}\n"))
         .unwrap_or_default();
+    let hint = format!("{hint}{}", extras_block(extras));
     format!(
         "Write a Conventional Commit message for these staged changes.\n\n\
 Requirements:\n\
@@ -720,6 +967,11 @@ async fn generate_with_model(prompt: &str) -> Result<String, String> {
 
 async fn generate_with_budget(prompt: &str, num_predict: u32) -> Result<String, String> {
     let cfg = crate::config::load();
+    // Hosted models aren't "installed", and listing them on every call would
+    // add a round-trip to the very path we chose the cloud backend to speed up.
+    if matches!(active_backend(), Backend::Cloud) {
+        return generate_limited(&cfg.ai_model, prompt, num_predict).await;
+    }
     let models = installed_models().await;
     let model = pick_model(&cfg.ai_model, &models).ok_or("no AI model installed")?;
     generate_limited(&model, prompt, num_predict).await
@@ -735,8 +987,9 @@ async fn generate_with_budget(prompt: &str, num_predict: u32) -> Result<String, 
 /// so the UI can toast instead of blanking the composer.
 pub async fn commit_message(repo_path: &str, diff: &str) -> Result<String, String> {
     let path = (!repo_path.is_empty()).then_some(repo_path);
-    let raw =
-        generate_with_budget(&commit_prompt_with_context(diff, path), COMMIT_NUM_PREDICT).await?;
+    let extras = CommitExtras::gather(diff, repo_path);
+    let prompt = commit_prompt_with_extras(diff, path, &extras);
+    let raw = generate_with_budget(&prompt, COMMIT_NUM_PREDICT).await?;
     let (subject, body) = split_commit_message(&raw);
     if subject.is_empty() {
         return Err(
@@ -851,7 +1104,22 @@ mod tests {
             "Ollama API 500 Internal Server Error: llama runner process has terminated: %!w(<nil>)"
         ));
         assert!(is_runner_crash("runner process has terminated"));
+        assert!(is_runner_crash("CUDA error: out of memory"));
+        assert!(is_runner_crash("ggml_gallocr_reserve_n failed"));
         assert!(!is_runner_crash("model not found"));
+    }
+
+    #[test]
+    fn parse_backend_accepts_spellings_and_defaults_local() {
+        assert!(matches!(parse_backend("llamaCpp"), Backend::LlamaCpp));
+        assert!(matches!(parse_backend("llama_cpp"), Backend::LlamaCpp));
+        assert!(matches!(parse_backend("ollama"), Backend::Ollama));
+        assert!(matches!(parse_backend("cloud"), Backend::Cloud));
+        assert!(matches!(parse_backend("openai"), Backend::Cloud));
+        assert!(matches!(parse_backend("openaiCompat"), Backend::Cloud));
+        // Anything unrecognised must never silently become a remote backend.
+        assert!(matches!(parse_backend(""), Backend::Ollama));
+        assert!(matches!(parse_backend("groq"), Backend::Ollama));
     }
 
     #[test]
@@ -1001,6 +1269,96 @@ diff --git a/addons/foo/__manifest__.py b/addons/foo/__manifest__.py
         let prompt = commit_prompt_with_context(diff, None);
         assert!(prompt.contains("19.0.1.2.0"));
         assert!(prompt.contains("__manifest__.py"));
+    }
+
+    #[test]
+    fn changed_paths_in_diff_lists_files_and_skips_dev_null() {
+        let diff = "\
+diff --git a/mod/views/foo.xml b/mod/views/foo.xml
+--- a/mod/views/foo.xml
++++ b/mod/views/foo.xml
+diff --git a/old.py b/old.py
+--- a/old.py
++++ /dev/null
+";
+        let paths = changed_paths_in_diff(diff);
+        assert_eq!(paths, vec!["mod/views/foo.xml", "old.py"]);
+    }
+
+    #[test]
+    fn changelog_excerpt_prefers_unreleased_section() {
+        let text = "\
+# Changelog
+
+## [Unreleased]
+### Added
+- Penalty bridge for absences.
+
+## [19.0.1.1.0] - 2026-01-01
+- Older entry nobody asked about.
+";
+        let ex = changelog_excerpt(text);
+        assert!(ex.contains("Penalty bridge"), "{ex}");
+        assert!(!ex.contains("Older entry"), "{ex}");
+
+        // An empty Unreleased heading falls through to the trailing entries.
+        let empty = "# Changelog\n\n## Unreleased\n\n## [1.0.0]\n- First release.\n";
+        assert!(changelog_excerpt(empty).contains("First release"));
+
+        // No Keep-a-Changelog structure at all: still yields the tail.
+        assert!(changelog_excerpt("just some notes\nand more\n").contains("just some notes"));
+        assert!(changelog_excerpt("").is_empty());
+    }
+
+    #[test]
+    fn nearby_changelogs_walks_up_from_changed_files_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let touched = root.join("addons/touched");
+        let other = root.join("addons/other");
+        std::fs::create_dir_all(&touched).unwrap();
+        std::fs::create_dir_all(&other).unwrap();
+        std::fs::write(
+            touched.join("CHANGELOG.md"),
+            "## Unreleased\n- Adds the penalty bridge.\n",
+        )
+        .unwrap();
+        std::fs::write(other.join("CHANGELOG.md"), "## Unreleased\n- Unrelated.\n").unwrap();
+
+        let diff = "diff --git a/addons/touched/models/x.py b/addons/touched/models/x.py\n+pass\n";
+        let found = nearby_changelogs(diff, root.to_str().unwrap());
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].0, "addons/touched/CHANGELOG.md");
+        assert!(found[0].1.contains("penalty bridge"));
+
+        // A module with no changelog of its own finds nothing (no repo-root file).
+        let diff_other = "diff --git a/addons/empty/x.py b/addons/empty/x.py\n+pass\n";
+        assert!(nearby_changelogs(diff_other, root.to_str().unwrap()).is_empty());
+        // A missing repo path is not an error.
+        assert!(nearby_changelogs(diff, "").is_empty());
+    }
+
+    #[test]
+    fn commit_prompt_with_extras_injects_notes_and_style() {
+        let extras = CommitExtras {
+            changelogs: vec![(
+                "addons/foo/CHANGELOG.md".to_string(),
+                "## Unreleased\n- Adds a bridge.".to_string(),
+            )],
+            recent_subjects: vec!["feat(foo): earlier work".to_string()],
+        };
+        let p = commit_prompt_with_extras("diff --git a/x b/x\n+hi", None, &extras);
+        assert!(p.contains("addons/foo/CHANGELOG.md"));
+        assert!(p.contains("Adds a bridge"));
+        assert!(p.contains("feat(foo): earlier work"));
+        assert!(p.contains("do not copy them verbatim"));
+        assert!(p.contains("+hi"));
+
+        // Empty extras leave the prompt exactly as the diff-only form.
+        assert_eq!(
+            commit_prompt_with_extras("diff --git a/x b/x\n+hi", None, &CommitExtras::default()),
+            commit_prompt("diff --git a/x b/x\n+hi")
+        );
     }
 
     #[test]

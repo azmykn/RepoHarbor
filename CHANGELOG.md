@@ -25,6 +25,26 @@ versioned trees, including nested submodule parents).
 
 ### Added
 
+- **Cloud AI backend (opt-in)** — a third choice in **Settings → AI & search**
+  next to Ollama and llama.cpp: any OpenAI-compatible endpoint (Ollama Cloud,
+  Groq, OpenAI, OpenRouter, Gemini, LM Studio, …) via `POST /chat/completions`.
+  Hosted models draft a full commit message in ~1.5 s where a tiny local model
+  needs tens of seconds. Reasoning models get `reasoning_effort: "low"` so
+  hidden thinking can't eat the whole token budget and return an empty answer,
+  with a retry for providers that reject the field.
+  Local stays the default; the panel warns that prompts leave
+  the machine on this backend. The API key lives owner-only in
+  `~/.local/share/repoharbor/openai_api_key` (or `$REPOHARBOR_OPENAI_API_KEY`),
+  never in `config.toml`, is only ever sent to the configured base URL, and that
+  URL must be `https` unless it's loopback. Embeddings — and therefore semantic
+  search — remain local on every backend.
+- **Changelog-aware commit messages** — **Generate commit** now walks up from
+  each changed file to the repo root, takes the nearest `CHANGELOG.md` (also
+  `.rst`/`.txt`, `CHANGES.md`, `HISTORY.md`, `NEWS.md`) up to three across a
+  multi-module commit, prefers its `## [Unreleased]` section, and feeds that
+  plus the last five commit subjects into the prompt. In a monorepo this picks
+  the touched module's changelog rather than every changelog in the tree.
+
 - **Empty commit** — Mission Control selection primary + Actions menu item
   creates `git commit --allow-empty` with message `Empty commit` on pushable
   paths (hidden/blocked for pull-only selections, same gating as Push).

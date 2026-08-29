@@ -1710,6 +1710,19 @@ impl RepoHarborApp {
         self.services.github_authed = repoharbor_core::oauth::github_authed();
     }
 
+    /// Forget the live AI status because the *pending* backend no longer matches
+    /// the saved one. Re-probing here would be worse than useless: `ai::*` reads
+    /// the saved config, so it would re-report the old engine's models under the
+    /// newly picked backend.
+    pub fn invalidate_ai_status(&mut self, cx: &mut Context<Self>) {
+        use crate::views::settings::AiStatus;
+        self.services.ai_status = AiStatus::Unknown;
+        if let Some(s) = &mut self.settings {
+            s.ai_note = "Backend changed — Save & rescan to apply, then Test.".into();
+        }
+        cx.notify();
+    }
+
     /// Re-check AI-backend reachability and list installed models.
     pub fn ai_refresh(&mut self, cx: &mut Context<Self>) {
         use crate::views::settings::AiStatus;
@@ -1773,6 +1786,19 @@ impl RepoHarborApp {
             });
         })
         .detach();
+    }
+
+    /// Forget the stored cloud API key (the field is masked and never shows it,
+    /// so removal needs its own action). Reports in the Settings AI note.
+    pub fn ai_clear_cloud_key(&mut self, cx: &mut Context<Self>) {
+        let note = match repoharbor_core::cloud::store_api_key("") {
+            Ok(()) => "Cloud API key removed.".to_string(),
+            Err(e) => format!("Could not remove the key: {e}"),
+        };
+        if let Some(s) = &mut self.settings {
+            s.ai_note = note.into();
+        }
+        cx.notify();
     }
 
     /// Clear cached AI summaries + embeddings, reporting the counts in the
@@ -1951,6 +1977,12 @@ impl RepoHarborApp {
             return;
         }
         if repos.is_empty() {
+            self.push_toast(
+                ToastKind::Info,
+                "Nothing to generate",
+                Some("Select dirty repos first.".into()),
+                cx,
+            );
             return;
         }
         self.generate_commit_prompt =
@@ -2061,7 +2093,7 @@ impl RepoHarborApp {
                     } else {
                         self.ensure_drawer_changes_inputs(window, cx);
                     }
-                    self.drawer_generate_commit(cx);
+                    self.drawer_generate_commit(window, cx);
                 } else {
                     self.run_fleet_repos(
                         crate::fleet::FleetOp::GenerateMessageOnly,
@@ -2118,7 +2150,11 @@ impl RepoHarborApp {
     /// `aiReady`. The (subject, body) suggestion lands in
     /// `drawer.commit_suggestion` and, on success, pre-fills the composer's
     /// subject + body fields so it's editable before committing.
-    pub fn drawer_generate_commit(&mut self, cx: &mut Context<Self>) {
+    ///
+    /// Uses [`Context::spawn_in`] so the completion path always has a `Window`
+    /// for `InputState::set_value` — plain `spawn` + `update_in` can fail with
+    /// "entity has no current window" and silently leave "Generating…" stuck.
+    pub fn drawer_generate_commit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if !self.services.ai_ready {
             self.push_toast(
                 ToastKind::Error,
@@ -2131,7 +2167,7 @@ impl RepoHarborApp {
         let repo = self.drawer.repo.clone();
         self.drawer.commit_suggestion = Some(("Generating…".into(), "".into()));
         cx.notify();
-        cx.spawn(async move |this, cx| {
+        cx.spawn_in(window, async move |this, cx| {
             let id = repo.to_string();
             let id_for_diff = id.clone();
             let diff = cx
@@ -2168,9 +2204,7 @@ impl RepoHarborApp {
                     }
                 })
             };
-            // `update_in` (not `update`): populating the input fields needs the
-            // window InputState::set_value requires.
-            let _ = this.update_in(cx, |this, window, cx| {
+            let applied = this.update_in(cx, |this, window, cx| {
                 if this.drawer.repo != repo {
                     return;
                 }
@@ -2208,6 +2242,24 @@ impl RepoHarborApp {
                 }
                 cx.notify();
             });
+            if let Err(err) = applied {
+                eprintln!("[ai] drawer generate commit UI update failed: {err}");
+                // Fall back without InputState fill so the user still gets a
+                // toast / clears the stuck "Generating…" card.
+                let _ = this.update(cx, |this, cx| {
+                    if this.drawer.repo != repo {
+                        return;
+                    }
+                    this.drawer.commit_suggestion = None;
+                    this.push_toast(
+                        ToastKind::Error,
+                        "Generate message failed",
+                        Some("Could not update the commit fields — try again.".into()),
+                        cx,
+                    );
+                    cx.notify();
+                });
+            }
         })
         .detach();
     }
@@ -2883,6 +2935,18 @@ impl RepoHarborApp {
         draft.ai_model = s.ai_model.read(cx).value().to_string();
         draft.embed_model = s.embed_model.read(cx).value().to_string();
         draft.llama_server_path = s.llama_server.read(cx).value().to_string();
+        draft.openai_base = s.openai_base.read(cx).value().to_string();
+        // The key never round-trips through the draft or config.toml: a typed
+        // value replaces the stored file, an empty field keeps what's there.
+        let typed_key = s.openai_key.read(cx).value().to_string();
+        let key_note = if typed_key.trim().is_empty() {
+            None
+        } else {
+            Some(match repoharbor_core::cloud::store_api_key(&typed_key) {
+                Ok(()) => "Cloud API key saved.".to_string(),
+                Err(e) => format!("Could not save the API key: {e}"),
+            })
+        };
         draft.github_client_id = s.client_id.read(cx).value().to_string();
         draft.ignore = s
             .ignore
@@ -2911,6 +2975,9 @@ impl RepoHarborApp {
         if let Some(s) = &mut self.settings {
             s.draft = draft;
             s.saved = true;
+            if let Some(note) = key_note {
+                s.ai_note = note.into();
+            }
         }
         self.rescan(cx);
         cx.notify();
@@ -4244,9 +4311,10 @@ impl RepoHarborApp {
             .filter(|r| r.parent_id.is_none())
             .filter(|r| {
                 let self_chip = self.row_matches_chips(r);
-                let child_chip = self.rows.iter().any(|c| {
-                    c.parent_id.as_ref() == Some(&r.id) && self.row_matches_chips(c)
-                });
+                let child_chip = self
+                    .rows
+                    .iter()
+                    .any(|c| c.parent_id.as_ref() == Some(&r.id) && self.row_matches_chips(c));
                 if !(self_chip || child_chip) {
                     return false;
                 }
@@ -4400,9 +4468,11 @@ impl RepoHarborApp {
                 crate::card::fill_repo_context_menu(menu, app_ent.clone(), st, menu_id.clone())
             }));
             if has_children && expanded {
-                for c in self.rows.iter().filter(|r| {
-                    r.parent_id.as_ref() == Some(&p.id) && self.row_matches_chips(r)
-                }) {
+                for c in self
+                    .rows
+                    .iter()
+                    .filter(|r| r.parent_id.as_ref() == Some(&p.id) && self.row_matches_chips(r))
+                {
                     let cid = c.id.clone();
                     let cid_sel = c.id.clone();
                     let child_selected = self.selected.contains(&c.id);
@@ -5847,9 +5917,7 @@ impl RepoHarborApp {
         if let Some(search) = &self.repo_search {
             bar = bar.child(div().w(px(260.)).child(Input::new(search)));
         }
-        bar = bar
-            .child(div().flex_1())
-            .child(self.mode_segments(t, cx));
+        bar = bar.child(div().flex_1()).child(self.mode_segments(t, cx));
         // Always-visible filter chips in the upper toolbar (every work mode).
         for f in VISIBILITY_CHIPS {
             bar = bar.child(self.filter_chip(f, t, cx));
@@ -6290,8 +6358,9 @@ impl Render for RepoHarborApp {
                     ),
             );
 
-        // The shell, with any overlay (drawer/palette/dialog) layered on top.
-        // The root tracks focus + handles CloseOverlay so Esc dismisses overlays.
+        // The shell, with overlays (drawer/palette/dialog) then generate-commit
+        // choice, then toasts on top so AI/fleet errors stay visible above the
+        // drawer (toasts are content-sized bottom-right — they don't block UI).
         let mut root = div()
             .track_focus(&self.focus)
             .on_action(cx.listener(|this, _: &crate::CloseOverlay, window, cx| {
@@ -6367,11 +6436,6 @@ impl Render for RepoHarborApp {
             .relative()
             .size_full()
             .child(shell);
-        // Toasts layer over the active view; the modal overlay (drawer/palette/
-        // dialog) is added after so it stays in front of them.
-        if let Some(toasts) = self.toast_layer(&t, cx) {
-            root = root.child(toasts);
-        }
         if let Some(overlay) = self.overlay_element(&t, cx) {
             root = root.child(overlay);
         }
@@ -6379,6 +6443,9 @@ impl Render for RepoHarborApp {
             root = root.child(
                 crate::views::generate_commit::render(prompt, &t, &cx.entity()).into_any_element(),
             );
+        }
+        if let Some(toasts) = self.toast_layer(&t, cx) {
+            root = root.child(toasts);
         }
         root
     }

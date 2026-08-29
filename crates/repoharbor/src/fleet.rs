@@ -1196,14 +1196,32 @@ impl RepoHarborApp {
             }),
         ));
         if ai_ready {
-            row = row.child(bar_btn(
+            let gen_enabled = idle && caps.has_dirty;
+            row = row.child(bar_btn_explain(
                 "mc-fleet-gen",
                 "sparkles",
                 "Gen commit",
-                idle && caps.has_dirty,
-                false,
+                gen_enabled,
                 t,
-                cx.listener(|this, _e, _w, cx| {
+                cx.listener(move |this, _e, _w, cx| {
+                    if !(this.fleet_actions_idle()
+                        && crate::menu_actions::fleet_menu_caps(
+                            this,
+                            &this.selected_repos_ordered(),
+                        )
+                        .has_dirty)
+                    {
+                        this.push_toast(
+                            crate::toast::ToastKind::Info,
+                            "Nothing to generate",
+                            Some(
+                                "Select dirty repos first (Gen commit dims when the selection is clean)."
+                                    .into(),
+                            ),
+                            cx,
+                        );
+                        return;
+                    }
                     let repos = this.selected_repos_ordered();
                     this.adopt_fleet_targets(&repos);
                     this.prompt_generate_commit_selected(cx);
@@ -1436,6 +1454,40 @@ fn bar_btn(
             .on_click(on);
     }
     b.into_any_element()
+}
+
+/// Like [`bar_btn`], but always clickable — dims when `active` is false so the
+/// handler can explain (toast) instead of a silent no-op.
+fn bar_btn_explain(
+    id: &'static str,
+    icon: &'static str,
+    label: &str,
+    active: bool,
+    t: &Theme,
+    on: impl Fn(&gpui::ClickEvent, &mut Window, &mut gpui::App) + 'static,
+) -> gpui::AnyElement {
+    let fg = if active { t.fg1 } else { t.fg3 };
+    let hov = t.border_strong;
+    div()
+        .id(id)
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(6.))
+        .px(px(10.))
+        .py(px(5.))
+        .rounded(px(t.r_sm))
+        .bg(rgb(t.button_bg))
+        .border_1()
+        .border_color(rgb(t.border))
+        .text_size(px(t.text_small))
+        .text_color(rgb(fg))
+        .cursor_pointer()
+        .hover(move |s| s.border_color(rgb(hov)))
+        .child(lucide(icon, 14., fg))
+        .child(SharedString::from(label.to_string()))
+        .on_click(on)
+        .into_any_element()
 }
 
 /// Kind + title + detail for the fleet resolution toast.
