@@ -1,0 +1,112 @@
+# repoharbor — the native GPUI desktop app. Depends on repoharbor-core for all logic;
+# carries the UI (theme, cards, shell, views). This is the whole product now
+# that the legacy Tauri shell (src-tauri/) and React frontend are gone.
+[package]
+name = "repoharbor"
+version = "2026.8.1"
+edition = "2024"
+publish = false
+authors = ["Azmy Karam <azmykn@gmail.com>"]
+description = "every repo at harbor — a Linux-native command center for your git fleet"
+license = "MIT"
+repository = "https://github.com/azmykn/RepoHarbor"
+homepage = "https://azmykn.github.io/RepoHarbor/"
+
+[[bin]]
+name = "repoharbor"
+path = "src/main.rs"
+
+[dependencies]
+# All logic lives here now — no more #[path] includes of the core.
+repoharbor-core = { path = "../repoharbor-core" }
+# Desktop integration (system accent / appearance, …).
+repoharbor-platform = { path = "../repoharbor-platform" }
+
+# GPU-native UI toolkit. Pinned to the exact Zed rev that gpui-component tracks,
+# so both resolve to one gpui (git deps unify by url + rev). Not on crates.io.
+gpui = { git = "https://github.com/zed-industries/zed", rev = "1d217ee39d381ac101b7cf49d3d22451ac1093fe" }
+# Platform/window factory; features match gpui-component's so its components and
+# our window construction agree. A compositor feature is REQUIRED on Linux.
+gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "1d217ee39d381ac101b7cf49d3d22451ac1093fe", features = ["font-kit", "x11", "wayland", "runtime_shaders"] }
+# Component library: multiline input, markdown, switches/dropdowns/lists, etc.
+gpui-component = { git = "https://github.com/longbridge/gpui-component" }
+# SVG pack for gpui-component IconName (TitleBar window controls, Button icons).
+# Must be registered alongside our lucide/brand assets — see `assets.rs`.
+gpui-component-assets = { git = "https://github.com/longbridge/gpui-component" }
+
+# Embed the SVG icon assets into the binary (no runtime file deps), served to
+# GPUI through an AssetSource. Icons are generated/committed under assets/icons/.
+rust-embed = "8"
+
+# Send desktop signals (filesystem watch / attention poll / appearance change)
+# from their background threads onto the GPUI foreground. async-channel's
+# Receiver is awaitable inside a gpui task; its Sender is Send + Clone.
+async-channel = "2"
+
+# The shared runtime that drives async (reqwest-backed) core calls — forge/inbox/
+# ai/oauth — whose results marshal onto the GPUI foreground (see task.rs). gpui
+# has no tokio reactor, so network UI data needs an in-app runtime.
+tokio = { version = "1", features = ["rt-multi-thread", "time"] }
+
+# Dev Tools view — offline utility belt (UUID, hash, base64/url, JSON, JWT,
+# timestamp, colour, regex, …).
+uuid = { version = "1", features = ["v4", "v7"] }
+base64 = "0.22"
+sha1 = "0.10"
+sha2 = "0.10"
+regex = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+urlencoding = "2"
+# Month-label date math for the contribution heatmap (core supplies the data).
+chrono = "0.4"
+image = { version = "0.25.10", default-features = false, features = ["png"] }
+
+[lints.rust]
+unsafe_code = "warn"
+
+[lints.clippy]
+all = "warn"
+
+# ── Linux packaging ──────────────────────────────────────────────────────────
+# `.deb` via cargo-deb. Asset source paths are relative to this manifest dir;
+# `target/release/` is special-cased to the workspace target dir.
+[package.metadata.deb]
+maintainer = "Azmy Karam <azmykn@gmail.com>"
+copyright = "2026, Azmy Karam / DigitsCode"
+license-file = ["../../LICENSE", "0"]
+extended-description = "RepoHarbor is a Linux-native command center for your git fleet: a fast GPU-rendered desktop dashboard that scans your workspace, surfaces status/PRs/CI at a glance, and launches your IDE or agent. Includes software originally published as Orrery by Seb Burrell (MIT)."
+section = "devel"
+priority = "optional"
+depends = "$auto"
+assets = [
+    ["target/release/repoharbor", "usr/bin/", "755"],
+    ["../../packaging/repoharbor.desktop", "usr/share/applications/", "644"],
+    ["../../packaging/icons/32x32.png", "usr/share/icons/hicolor/32x32/apps/repoharbor.png", "644"],
+    ["../../packaging/icons/64x64.png", "usr/share/icons/hicolor/64x64/apps/repoharbor.png", "644"],
+    ["../../packaging/icons/128x128.png", "usr/share/icons/hicolor/128x128/apps/repoharbor.png", "644"],
+    ["../../packaging/icons/icon.png", "usr/share/icons/hicolor/512x512/apps/repoharbor.png", "644"],
+    ["../../LICENSE", "usr/share/licenses/repoharbor/LICENSE", "644"],
+    ["../../NOTICE", "usr/share/licenses/repoharbor/NOTICE", "644"],
+    ["../../COPYRIGHT.md", "usr/share/licenses/repoharbor/COPYRIGHT.md", "644"],
+]
+
+# `.rpm` via cargo-generate-rpm. Run from the workspace root, so source paths are
+# relative to it.
+[package.metadata.generate-rpm]
+summary = "every repo at harbor — a Linux-native command center for your git fleet"
+license = "MIT"
+assets = [
+    { source = "target/release/repoharbor", dest = "/usr/bin/repoharbor", mode = "755" },
+    { source = "packaging/repoharbor.desktop", dest = "/usr/share/applications/repoharbor.desktop", mode = "644" },
+    { source = "packaging/icons/32x32.png", dest = "/usr/share/icons/hicolor/32x32/apps/repoharbor.png", mode = "644" },
+    { source = "packaging/icons/64x64.png", dest = "/usr/share/icons/hicolor/64x64/apps/repoharbor.png", mode = "644" },
+    { source = "packaging/icons/128x128.png", dest = "/usr/share/icons/hicolor/128x128/apps/repoharbor.png", mode = "644" },
+    { source = "packaging/icons/icon.png", dest = "/usr/share/icons/hicolor/512x512/apps/repoharbor.png", mode = "644" },
+    { source = "LICENSE", dest = "/usr/share/licenses/repoharbor/LICENSE", mode = "644" },
+    { source = "NOTICE", dest = "/usr/share/licenses/repoharbor/NOTICE", mode = "644" },
+    { source = "COPYRIGHT.md", dest = "/usr/share/licenses/repoharbor/COPYRIGHT.md", mode = "644" },
+]
+
+[package.metadata.generate-rpm.requires]
+fontconfig = "*"

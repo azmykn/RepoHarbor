@@ -1,0 +1,51 @@
+# Maintainer: Azmy Karam <azmykn@gmail.com>
+pkgname=repoharbor-git
+_pkgname=repoharbor
+pkgver=0.2.0.r0.g0000000
+pkgrel=1
+pkgdesc="every repo at harbor — a Linux-native command center for your git fleet"
+arch=('x86_64' 'aarch64')
+url="https://github.com/azmykn/RepoHarbor"
+license=('MIT')
+# Native GPUI app: GPU (Vulkan) rendering + Wayland/X11 + fontconfig. No webview.
+depends=('vulkan-icd-loader' 'fontconfig' 'libxkbcommon' 'hicolor-icon-theme')
+makedepends=('git' 'rust' 'cargo' 'cmake' 'pkgconf' 'vulkan-headers')
+provides=('repoharbor')
+conflicts=('repoharbor')
+options=('!lto')
+source=("$_pkgname::git+https://github.com/azmykn/RepoHarbor.git")
+sha256sums=('SKIP')
+
+pkgver() {
+	cd "$srcdir/$_pkgname"
+	local ver
+	ver="$(grep -m1 '^version' crates/repoharbor/Cargo.toml | sed 's/.*"\(.*\)".*/\1/')"
+	printf "%s.r%s.g%s" "$ver" "$(git rev-list --count HEAD)" "$(git rev-parse --short HEAD)"
+}
+
+build() {
+	cd "$srcdir/$_pkgname"
+	cargo build --release --locked -p repoharbor
+}
+
+package() {
+	cd "$srcdir/$_pkgname"
+	install -Dm755 "target/release/$_pkgname" "$pkgdir/usr/bin/$_pkgname"
+
+	# Desktop entry (shipped in-repo so the AUR package needs only PKGBUILD).
+	install -Dm644 "packaging/$_pkgname.desktop" \
+		"$pkgdir/usr/share/applications/$_pkgname.desktop"
+
+	# Icons.
+	local s
+	for s in 32 64 128; do
+		install -Dm644 "packaging/icons/${s}x${s}.png" \
+			"$pkgdir/usr/share/icons/hicolor/${s}x${s}/apps/$_pkgname.png"
+	done
+	install -Dm644 "packaging/icons/icon.png" \
+		"$pkgdir/usr/share/icons/hicolor/512x512/apps/$_pkgname.png"
+
+	install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+	install -Dm644 NOTICE "$pkgdir/usr/share/licenses/$pkgname/NOTICE"
+	install -Dm644 COPYRIGHT.md "$pkgdir/usr/share/licenses/$pkgname/COPYRIGHT.md"
+}
