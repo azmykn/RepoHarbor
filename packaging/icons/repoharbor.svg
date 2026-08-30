@@ -1,0 +1,29 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 1024 1024" fill="none">
+  <!-- Scalable packaging source; PNG sizes generated from docs/design-system/assets/app-icon.svg -->
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1024" y2="1024" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#0F2A32"/>
+      <stop offset="1" stop-color="#071418"/>
+    </linearGradient>
+    <linearGradient id="stack" x1="320" y1="280" x2="704" y2="620" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#5EEAD4"/>
+      <stop offset="1" stop-color="#14B8A6"/>
+    </linearGradient>
+  </defs>
+  <rect width="1024" height="1024" rx="232" fill="url(#bg)"/>
+  <rect x="2" y="2" width="1020" height="1020" rx="230" fill="none"
+        stroke="#FFFFFF" stroke-opacity="0.06" stroke-width="2"/>
+  <path d="M160 720C280 640 420 610 512 610C604 610 744 640 864 720"
+        stroke="#1DD3C4" stroke-opacity="0.22" stroke-width="28" stroke-linecap="round"/>
+  <path d="M200 780C310 720 420 695 512 695C604 695 714 720 824 780"
+        stroke="#1DD3C4" stroke-opacity="0.12" stroke-width="20" stroke-linecap="round"/>
+  <rect x="248" y="668" width="528" height="56" rx="18" fill="#0D9488"/>
+  <rect x="292" y="724" width="36" height="96" rx="12" fill="#0F766E"/>
+  <rect x="494" y="724" width="36" height="96" rx="12" fill="#0F766E"/>
+  <rect x="696" y="724" width="36" height="96" rx="12" fill="#0F766E"/>
+  <rect x="300" y="290" width="424" height="96" rx="22" fill="url(#stack)" opacity="0.45"/>
+  <rect x="332" y="370" width="360" height="100" rx="22" fill="url(#stack)" opacity="0.72"/>
+  <rect x="360" y="454" width="304" height="112" rx="24" fill="url(#stack)"/>
+  <rect x="400" y="490" width="160" height="14" rx="7" fill="#042F2E" fill-opacity="0.35"/>
+  <rect x="400" y="520" width="112" height="14" rx="7" fill="#042F2E" fill-opacity="0.28"/>
+</svg>

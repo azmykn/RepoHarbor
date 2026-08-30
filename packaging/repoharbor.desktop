@@ -1,0 +1,15 @@
+[Desktop Entry]
+Type=Application
+Name=RepoHarbor
+GenericName=Repo Dashboard
+Comment=every repo at harbor — a Linux-native command center for your git fleet
+# Exec is rewritten by scripts/install-desktop.sh for local/dev installs.
+Exec=repoharbor
+Icon=repoharbor
+Terminal=false
+Categories=Development;RevisionControl;
+Keywords=git;repos;dashboard;developer;repoharbor;
+StartupNotify=true
+# Must match WindowOptions.app_id so the shell can pin / show the right icon.
+StartupWMClass=com.digitscode.repoharbor
+X-GNOME-UsesNotifications=true

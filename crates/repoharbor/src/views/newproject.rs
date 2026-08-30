@@ -1,0 +1,337 @@
+//! Add dialog — the header "+" action. A centered modal to add a local path
+//! (single git repo or folder of repos), clone a remote (GitHub/GitLab), or
+//! initialise a fresh repo into a chosen workspace root. On success it rescans
+//! so the new path or repo appears in the grid. Sync git (clone/init) runs off
+//! the UI thread.
+
+use gpui::{
+    Entity, FontWeight, InteractiveElement, IntoElement, ParentElement, SharedString,
+    StatefulInteractiveElement, Styled, Subscription, div, px, rgb, rgba,
+};
+use gpui_component::input::{Input, InputState};
+
+use crate::shell::RepoHarborApp;
+use crate::theme::Theme;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum NewMode {
+    /// Append a directory to `config.roots` and rescan.
+    AddRoot,
+    /// `git clone` into an existing root.
+    Clone,
+    /// `git init` (+ optional template) into an existing root.
+    Create,
+}
+
+/// State for the add dialog: the text fields, the chosen mode and destination
+/// root, plus a status line for validation / progress.
+pub struct NewProjectData {
+    pub mode: NewMode,
+    pub url: Entity<InputState>,
+    pub name: Entity<InputState>,
+    /// Create-mode: optional `origin` remote to set on the new repo.
+    pub remote: Entity<InputState>,
+    /// Create-mode: optional template directory to copy in.
+    pub template: Entity<InputState>,
+    /// AddRoot-mode: absolute or `~/…` path (single repo or folder of repos).
+    pub root_path: Entity<InputState>,
+    /// Create-mode: whether to make an initial commit (vs an empty repo).
+    pub first_commit: bool,
+    /// Index into `config.roots` — the destination root (Clone/Create).
+    pub root: usize,
+    pub status: SharedString,
+    pub busy: bool,
+    pub _subs: Vec<Subscription>,
+}
+
+pub fn render(
+    d: &NewProjectData,
+    roots: &[String],
+    t: &Theme,
+    app: &Entity<RepoHarborApp>,
+) -> impl IntoElement {
+    let dest_root = roots.get(d.root).cloned().unwrap_or_default();
+
+    let mut panel = div()
+        .id("np-panel")
+        .occlude()
+        .w(px(520.))
+        .flex()
+        .flex_col()
+        .gap(px(14.))
+        .p(px(20.))
+        .rounded(px(t.r_lg))
+        .bg(rgb(t.surface))
+        .border_1()
+        .border_color(rgb(t.border))
+        // Swallow clicks so the backdrop doesn't close the dialog.
+        .on_click(|_ev, _win, _cx| {})
+        .child(
+            div()
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_size(px(t.text_h3))
+                .text_color(rgb(t.fg0))
+                .child("Add"),
+        )
+        // One tab per task — local path | clone | blank repo.
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .w_full()
+                .p(px(3.))
+                .gap(px(2.))
+                .rounded(px(t.r_sm))
+                .bg(rgb(t.button_bg))
+                .border_1()
+                .border_color(rgb(t.border))
+                .child(mode_tab("Add local path", NewMode::AddRoot, d.mode, t, app))
+                .child(mode_tab(
+                    "Clone from GitHub",
+                    NewMode::Clone,
+                    d.mode,
+                    t,
+                    app,
+                ))
+                .child(mode_tab("New repository", NewMode::Create, d.mode, t, app)),
+        );
+
+    match d.mode {
+        NewMode::AddRoot => {
+            panel = panel.child(field("Local path", &d.root_path, t)).child(
+                div()
+                    .text_size(px(t.text_data_sm))
+                    .text_color(rgb(t.fg3))
+                    .child("A single git repo or a folder of repos."),
+            );
+        }
+        NewMode::Clone => {
+            panel = panel.child(field("Repository URL", &d.url, t));
+            panel = panel.child(field("Folder name", &d.name, t));
+        }
+        NewMode::Create => {
+            panel = panel
+                .child(field("Folder name", &d.name, t))
+                .child(field("Remote URL (optional)", &d.remote, t))
+                .child(field("Template directory (optional)", &d.template, t))
+                .child(first_commit_toggle(d.first_commit, t, app));
+        }
+    }
+
+    // Destination root (clone / create only).
+    if d.mode != NewMode::AddRoot {
+        if roots.is_empty() {
+            panel = panel.child(
+                div()
+                    .text_size(px(t.text_data_sm))
+                    .text_color(rgb(t.behind))
+                    .child("Add a local path first (Local path tab), or set one in Settings."),
+            );
+        } else {
+            let mut row = div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(8.))
+                .child(field_label("Destination", t))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w(px(0.))
+                        .truncate()
+                        .font_family("monospace")
+                        .text_size(px(t.text_data_sm))
+                        .text_color(rgb(t.fg1))
+                        .child(SharedString::from(dest_root)),
+                );
+            if roots.len() > 1 {
+                row = row.child(small_btn("Change root", t, app, |this, cx| {
+                    this.new_project_cycle_root(cx)
+                }));
+            }
+            panel = panel.child(row);
+        }
+    }
+
+    if !d.status.is_empty() {
+        panel = panel.child(
+            div()
+                .text_size(px(t.text_data_sm))
+                .text_color(rgb(if d.busy { t.fg3 } else { t.behind }))
+                .child(d.status.clone()),
+        );
+    }
+
+    let submit_label = match d.mode {
+        NewMode::AddRoot => "Add",
+        NewMode::Clone => "Clone",
+        NewMode::Create => "Create",
+    };
+    panel = panel.child(
+        div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(8.))
+            .child(div().flex_1())
+            .child(small_btn("Cancel", t, app, |this, _cx| {
+                this.close_overlay();
+            }))
+            .child(primary_btn(submit_label, d.busy, t, app)),
+    );
+
+    let app = app.clone();
+    div()
+        .id("np-backdrop")
+        .absolute()
+        .inset_0()
+        .flex()
+        .items_center()
+        .justify_center()
+        .bg(rgba(0x00000088))
+        .on_click(move |_ev, _win, cx| {
+            app.update(cx, |this, _cx| this.close_overlay());
+        })
+        .child(panel)
+}
+
+// ── building blocks ─────────────────────────────────────────────────────────
+
+fn mode_tab(
+    label: &str,
+    mode: NewMode,
+    active: NewMode,
+    t: &Theme,
+    app: &Entity<RepoHarborApp>,
+) -> impl IntoElement {
+    let app = app.clone();
+    let on = mode == active;
+    let mut tab = div()
+        .id(SharedString::from(format!("npmode-{label}")))
+        .flex_1()
+        .px(px(10.))
+        .py(px(7.))
+        .rounded(px(t.r_xs))
+        .text_size(px(t.text_data_sm))
+        .font_weight(if on {
+            FontWeight::MEDIUM
+        } else {
+            FontWeight::NORMAL
+        })
+        .text_color(rgb(if on { t.fg0 } else { t.fg2 }))
+        .cursor_pointer()
+        .flex()
+        .items_center()
+        .justify_center()
+        .child(SharedString::from(label.to_string()));
+    if on {
+        tab = tab
+            .bg(rgb(t.surface))
+            .border_1()
+            .border_color(rgb(t.border));
+    } else {
+        let hov = t.surface_hover;
+        let fg = t.fg1;
+        tab = tab.hover(move |s| s.bg(rgb(hov)).text_color(rgb(fg)));
+    }
+    tab.on_click(move |_ev, _win, cx| {
+        app.update(cx, |this, cx| this.new_project_set_mode(mode, cx));
+    })
+}
+
+/// A checkbox-style row toggling whether `init` makes an initial commit.
+fn first_commit_toggle(on: bool, t: &Theme, app: &Entity<RepoHarborApp>) -> impl IntoElement {
+    let app = app.clone();
+    div()
+        .id("np-first-commit")
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(8.))
+        .cursor_pointer()
+        .child(crate::icon::lucide(
+            if on { "circle-check" } else { "circle-dot" },
+            15.,
+            if on { t.clean } else { t.fg3 },
+        ))
+        .child(
+            div()
+                .text_size(px(t.text_data_sm))
+                .text_color(rgb(t.fg1))
+                .child("Make initial commit"),
+        )
+        .on_click(move |_ev, _win, cx| {
+            app.update(cx, |this, cx| {
+                this.new_project_toggle_first_commit(cx);
+            });
+        })
+}
+
+fn field(label: &str, input: &Entity<InputState>, t: &Theme) -> impl IntoElement {
+    div()
+        .flex()
+        .flex_col()
+        .gap(px(4.))
+        .child(field_label(label, t))
+        .child(Input::new(input))
+}
+
+fn field_label(label: &str, t: &Theme) -> impl IntoElement {
+    div()
+        .text_size(px(t.text_data_sm))
+        .text_color(rgb(t.fg3))
+        .child(SharedString::from(label.to_string()))
+}
+
+fn small_btn(
+    label: &str,
+    t: &Theme,
+    app: &Entity<RepoHarborApp>,
+    on: impl Fn(&mut RepoHarborApp, &mut gpui::Context<RepoHarborApp>) + 'static,
+) -> impl IntoElement {
+    let app = app.clone();
+    let (hb, hf) = (t.border_strong, t.fg0);
+    div()
+        .id(SharedString::from(format!("npbtn-{label}")))
+        .px(px(14.))
+        .py(px(7.))
+        .rounded(px(t.r_sm))
+        .bg(rgb(t.button_bg))
+        .border_1()
+        .border_color(rgb(t.border))
+        .text_size(px(t.text_data_sm))
+        .text_color(rgb(t.fg1))
+        .cursor_pointer()
+        .hover(move |s| s.border_color(rgb(hb)).text_color(rgb(hf)))
+        .child(SharedString::from(label.to_string()))
+        .on_click(move |_ev, _win, cx| {
+            app.update(cx, |this, cx| {
+                on(this, cx);
+                cx.notify();
+            });
+        })
+}
+
+fn primary_btn(
+    label: &str,
+    busy: bool,
+    t: &Theme,
+    app: &Entity<RepoHarborApp>,
+) -> impl IntoElement {
+    let app = app.clone();
+    let mut btn = div()
+        .id("np-submit")
+        .px(px(16.))
+        .py(px(7.))
+        .rounded(px(t.r_sm))
+        .bg(rgb(if busy { t.button_bg } else { t.primary }))
+        .text_size(px(t.text_data_sm))
+        .text_color(rgb(if busy { t.fg3 } else { t.page }))
+        .child(SharedString::from(if busy { "Working…" } else { label }));
+    if !busy {
+        btn = btn.cursor_pointer().on_click(move |_ev, _win, cx| {
+            app.update(cx, |this, cx| this.submit_new_project(cx));
+        });
+    }
+    btn
+}

@@ -1,0 +1,294 @@
+//! Shared serde domain types used across the workspace (the UI crate flattens
+//! them into render-ready rows in `crates/repoharbor/src/data.rs`). Serialized
+//! camelCase for the SQLite cache and forge APIs; `AppConfig` mirrors the
+//! TOML on disk.
+
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum Activity {
+    Active,
+    Idle,
+    Stale,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum Host {
+    Github,
+    Gitlab,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct GitStatus {
+    pub branch: String,
+    pub ahead: u32,
+    pub behind: u32,
+    /// Count of paths with any uncommitted change (staged and/or unstaged).
+    pub dirty: u32,
+    /// Paths with index (staged) changes vs HEAD.
+    #[serde(default)]
+    pub staged: u32,
+    /// Paths with working-tree changes vs the index (incl. untracked).
+    #[serde(default)]
+    pub unstaged: u32,
+    /// Paths currently in an unresolved merge/rebase conflict.
+    #[serde(default)]
+    pub conflicts: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Repo {
+    /// Stable id — absolute path on disk.
+    pub id: String,
+    /// Human display name: short README H1 (when name-like) → remote repo → directory.
+    pub display_name: String,
+    /// owner/repo slug parsed from the origin remote, if any.
+    pub slug: Option<String>,
+    /// Absolute path, abbreviated with ~ for display.
+    pub path: String,
+    /// First line/paragraph of the README, if present.
+    pub description: Option<String>,
+    /// Detected primary language (heuristic).
+    pub language: Option<String>,
+    pub git: GitStatus,
+    /// Seconds since the Unix epoch (UTC) of the last commit.
+    pub last_commit_unix: i64,
+    pub activity: Activity,
+    /// The scanned root this repo was found under (abbreviated).
+    pub root: String,
+    /// Origin host, if the repo has a recognized remote.
+    pub host: Option<Host>,
+    /// Remote host domain (e.g. "github.com", "gitlab.acme.io") for routing
+    /// host-API calls, including self-hosted GitLab.
+    #[serde(default)]
+    pub remote_host: Option<String>,
+    /// Host star count (enrichment; 0 until fetched).
+    pub stars: u32,
+    /// Host topics/labels (enrichment).
+    #[serde(default)]
+    pub topics: Vec<String>,
+    /// Open issues on the host (enrichment).
+    #[serde(default)]
+    pub open_issues: u32,
+    /// Latest release tag on the host (enrichment).
+    #[serde(default)]
+    pub latest_release: Option<String>,
+    /// Whether the host remote is private (enrichment; false until fetched, and
+    /// for public or remote-less repos).
+    #[serde(default)]
+    pub private: bool,
+    /// User-favorited (persisted locally).
+    pub favorite: bool,
+    /// Local-AI summary (Phase 3).
+    pub ai_summary: Option<String>,
+    /// Absolute path of the parent repo when this checkout is a git submodule.
+    #[serde(default)]
+    pub parent_id: Option<String>,
+    /// Path relative to the parent as listed in `.gitmodules`, if a submodule.
+    #[serde(default)]
+    pub submodule_path: Option<String>,
+}
+
+/// Host-side enrichment for a repo, fetched from GitHub/GitLab.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HostInfo {
+    pub stars: u32,
+    pub topics: Vec<String>,
+    pub open_issues: u32,
+    pub latest_release: Option<String>,
+    #[serde(default)]
+    pub private: bool,
+}
+
+/// User configuration, persisted as TOML.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AppConfig {
+    /// Directories scanned for git repos.
+    pub roots: Vec<String>,
+    /// How deep to descend into each root looking for `.git`.
+    pub scan_depth: usize,
+    /// Directory names/globs skipped while scanning.
+    pub ignore: Vec<String>,
+    /// Command template to open a repo in the IDE. `{path}` is substituted.
+    pub ide_command: String,
+    /// Command template to open a terminal (or optional local coding agent) in
+    /// the repo. `{path}` is substituted. Default is a plain shell at `{path}`
+    /// — not a paid CLI like Claude Code.
+    pub agent_command: String,
+    /// Extra argv appended to `agent_command` when dispatching an agent with a
+    /// task (drawer "Dispatch"). `{prompt}` is substituted as a single argument
+    /// — the default passes the task as the agent CLI's trailing prompt arg,
+    /// which is what `aider`/`opencode`/`codex` (and similar) expect.
+    #[serde(default = "default_agent_dispatch_args")]
+    pub agent_dispatch_args: String,
+    /// GitHub OAuth app client id for the device-flow login (optional).
+    #[serde(default)]
+    pub github_client_id: String,
+    /// When true (default), RepoHarbor may use `$REPOHARBOR_GITHUB_TOKEN` or `gh auth
+    /// token` if no RepoHarbor OAuth token is stored. Sign out still blocks these
+    /// until Connect or the user turns this back on (clears the signed-out
+    /// marker). Never runs `gh auth logout`.
+    #[serde(default = "default_true")]
+    pub github_allow_cli_token: bool,
+    /// Trusted self-hosted GitLab domains. A token is only ever sent to
+    /// gitlab.com or a domain on this list, so a malicious repo remote can't
+    /// exfiltrate it to an arbitrary host.
+    #[serde(default)]
+    pub gitlab_hosts: Vec<String>,
+    /// Preferred Ollama model for summaries (falls back to smallest installed).
+    #[serde(default = "default_ai_model")]
+    pub ai_model: String,
+    /// Whether to generate local AI summaries.
+    #[serde(default = "default_true")]
+    pub ai_enabled: bool,
+    /// Which inference backend serves AI features: "llamaCpp" (default, bundled
+    /// llama.cpp sidecar), "ollama" (HTTP), or "cloud" (an OpenAI-compatible
+    /// endpoint — opt-in, since diffs then leave the machine). See #21.
+    #[serde(default = "default_ai_backend")]
+    pub ai_backend: String,
+    /// Base URL of the OpenAI-compatible endpoint for the "cloud" backend
+    /// (e.g. `https://api.groq.com/openai/v1`). Empty until configured; the API
+    /// key lives in the data dir, never here — see `crate::cloud`.
+    #[serde(default)]
+    pub openai_base: String,
+    /// Optional override path to the `llama-server` binary. Empty → auto-discover
+    /// (app data `bin/`, then PATH).
+    #[serde(default)]
+    pub llama_server_path: String,
+    /// Path to the GGUF model the llama.cpp backend serves. Set by the download
+    /// flow; empty until a model is fetched.
+    #[serde(default)]
+    pub llama_model_path: String,
+    /// Ollama embedding model for semantic search.
+    #[serde(default = "default_embed_model")]
+    pub embed_model: String,
+    /// Base URL of the Ollama server (supports a remote/non-default host).
+    #[serde(default = "default_ollama_host")]
+    pub ollama_host: String,
+    /// Master switch for background attention notifications (#70).
+    #[serde(default = "default_true")]
+    pub notify_enabled: bool,
+    /// Notify when a new PR appears in your inbox.
+    #[serde(default = "default_true")]
+    pub notify_new_pr: bool,
+    /// Notify when a review is requested from you.
+    #[serde(default = "default_true")]
+    pub notify_review_requested: bool,
+    /// Notify on a CI/check-suite alert for one of your repos.
+    #[serde(default = "default_true")]
+    pub notify_ci_failure: bool,
+    /// Notify when a new *urgent* item appears in the attention model (#183) —
+    /// e.g. a review request. Layered under `notify_enabled`.
+    #[serde(default = "default_true")]
+    pub notify_attention: bool,
+    /// Notify when a dispatched agent session finishes with commits to review
+    /// (#185). Attention-tier rather than urgent, but the finish is the whole
+    /// point of a dispatch, so it defaults on; layered under `notify_enabled`
+    /// + `notify_attention` like the urgent model kinds.
+    #[serde(default = "default_true")]
+    pub notify_agent_finished: bool,
+    /// Left-rail width in px when expanded (Mission Control chrome).
+    #[serde(default = "default_sidebar_width")]
+    pub sidebar_width: f32,
+    /// Icon-only left rail when true.
+    #[serde(default)]
+    pub sidebar_collapsed: bool,
+    /// Named repo groups (path prefixes) for bulk Fetch/Pull.
+    #[serde(default)]
+    pub workspace_groups: Vec<WorkspaceGroup>,
+    /// Active workspace group name, if any (filters Mission Control).
+    #[serde(default)]
+    pub active_workspace_group: Option<String>,
+    /// Absolute path prefixes for upstream / vendor checkouts you Pull but
+    /// do not Push (e.g. Odoo `core/` + `custom/`). Repos under these paths
+    /// demote upstream CI to Info and hide Push; Behind still prompts Pull.
+    #[serde(default)]
+    pub pull_only_prefixes: Vec<String>,
+    /// External diff/merge tool for the Changes drawer. `{path}` = repo dir;
+    /// `{file}` = selected relative path when available. Empty → detect `meld`
+    /// / `code` / `xdg-open`.
+    #[serde(default = "default_diff_command")]
+    pub diff_command: String,
+}
+
+/// A named set of repos matched by absolute path prefixes (e.g. odoo19/core).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspaceGroup {
+    pub name: String,
+    /// Repo path matches if it starts with any of these prefixes.
+    pub prefixes: Vec<String>,
+}
+
+/// True when `path` is under any configured pull-only prefix (upstream /
+/// vendor trees you update with Pull and never Push).
+pub fn path_is_pull_only(path: &str, prefixes: &[String]) -> bool {
+    if prefixes.is_empty() {
+        return false;
+    }
+    let path = path.trim_end_matches('/');
+    prefixes.iter().any(|p| {
+        let p = p.trim_end_matches('/');
+        !p.is_empty() && (path == p || path.starts_with(&format!("{p}/")))
+    })
+}
+
+pub(crate) fn default_sidebar_width() -> f32 {
+    236.0
+}
+
+pub(crate) fn default_agent_dispatch_args() -> String {
+    "{prompt}".to_string()
+}
+
+pub(crate) fn default_ai_backend() -> String {
+    "llamaCpp".to_string()
+}
+
+pub(crate) fn default_ai_model() -> String {
+    // Tiny + efficient for basic summaries: qwen3 0.6b (q4) is ~523MB and
+    // instruction-tuned — smaller and better-quantized than granite 3b-q2_K.
+    "qwen3:0.6b".to_string()
+}
+
+pub(crate) fn default_ollama_host() -> String {
+    "http://localhost:11434".to_string()
+}
+
+pub(crate) fn default_embed_model() -> String {
+    "nomic-embed-text:latest".to_string()
+}
+
+pub(crate) fn default_true() -> bool {
+    true
+}
+
+pub fn default_diff_command() -> String {
+    // Prefer a real folder diff tool; fall back to opening the path.
+    if which::which("meld").is_ok() {
+        "meld {path}".into()
+    } else if which::which("code").is_ok() {
+        "code --diff {path}".into()
+    } else {
+        "xdg-open {path}".into()
+    }
+}
+
+#[cfg(test)]
+mod pull_only_tests {
+    use super::path_is_pull_only;
+
+    #[test]
+    fn path_is_pull_only_matches_prefix() {
+        let prefixes = vec!["/home/u/odoo/core".into()];
+        assert!(path_is_pull_only("/home/u/odoo/core/enterprise", &prefixes));
+        assert!(path_is_pull_only("/home/u/odoo/core", &prefixes));
+        assert!(!path_is_pull_only("/home/u/odoo/digits/myapp", &prefixes));
+        assert!(!path_is_pull_only("/home/u/odoo/corex", &prefixes));
+    }
+}

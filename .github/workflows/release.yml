@@ -1,0 +1,99 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build & release (Linux x86_64)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # GPUI build deps (Vulkan/Wayland/xkbcommon/fontconfig) + tools the
+      # packagers need (file for cargo-deb, desktop-file-utils + fuse for the
+      # AppImage).
+      - name: Install build & packaging deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libvulkan-dev libwayland-dev libxkbcommon-dev libxkbcommon-x11-dev \
+            libxcb1-dev libfontconfig1-dev libssl-dev \
+            build-essential cmake pkg-config \
+            file desktop-file-utils libfuse2
+
+      - uses: dtolnay/rust-toolchain@1.95.0
+      - uses: Swatinem/rust-cache@v2
+
+      # Don't ship from a commit that fails the suite, even if the tag was
+      # pushed by hand.
+      - name: Test
+        run: cargo test --workspace
+
+      - name: Build release binary
+        run: cargo build --release -p repoharbor
+
+      - name: Install packaging tools
+        run: cargo install cargo-deb cargo-generate-rpm
+
+      - name: Build .deb
+        run: cargo deb -p repoharbor --no-build
+
+      - name: Build .rpm
+        run: cargo generate-rpm -p crates/repoharbor
+
+      # Fetch a pinned llama.cpp build so the bundled AI backend works out of the
+      # box in the AppImage. Bump LLAMA_TAG to update the shipped engine. Only the
+      # AppImage bundles it; deb/rpm stay lean (Ollama / user-installed llama).
+      - name: Fetch llama-server runtime (AppImage only)
+        env:
+          LLAMA_TAG: b9551
+        run: |
+          set -euo pipefail
+          work="$(mktemp -d)"
+          asset="llama-${LLAMA_TAG}-bin-ubuntu-x64.tar.gz"
+          curl -fsSL -o "$work/llama.tar.gz" \
+            "https://github.com/ggml-org/llama.cpp/releases/download/${LLAMA_TAG}/${asset}"
+          tar xzf "$work/llama.tar.gz" -C "$work"
+          mkdir -p packaging/llama-runtime
+          # Archive layout varies by tag; flatten llama-server + its shared libs.
+          # Keep symlinks (-type l, cp -P): the sonames (libllama.so.0 → …) are
+          # same-directory relative links, and linuxdeploy fails without them.
+          find "$work" \( -type f -o -type l \) -name 'llama-server' -exec cp -P {} packaging/llama-runtime/ \;
+          find "$work" \( -type f -o -type l \) -name '*.so*' -exec cp -P {} packaging/llama-runtime/ \;
+          chmod +x packaging/llama-runtime/llama-server
+          rm -rf "$work"
+          ls -la packaging/llama-runtime
+
+      - name: Build AppImage
+        run: bash packaging/appimage.sh
+
+      - name: Collect artifacts
+        run: |
+          mkdir -p dist
+          cp target/debian/*.deb dist/
+          cp target/generate-rpm/*.rpm dist/
+          # RepoHarbor-* only: appimage.sh also downloads linuxdeploy into dist-appimage.
+          cp dist-appimage/RepoHarbor-*.AppImage dist/
+          ls -la dist
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          draft: true
+          generate_release_notes: true
+          body: |
+            Linux builds of RepoHarbor (native GPUI). See the
+            [documentation](https://azmykn.github.io/RepoHarbor/) for setup.
+
+            - `.deb` — Debian/Ubuntu
+            - `.rpm` — Fedora/openSUSE
+            - `.AppImage` — portable (any distro)
+
+            > Early development — expect rough edges. Built from the source at this tag.

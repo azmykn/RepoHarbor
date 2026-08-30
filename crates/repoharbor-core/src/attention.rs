@@ -1,0 +1,961 @@
+//! The attention engine's pure core (#183): fold everything RepoHarbor already
+//! knows — local git state, the host inbox, CI, branch hygiene, agent
+//! sessions — into one prioritized "needs you now" list.
+//!
+//! No I/O and no UI live here. Callers gather the facts (the scan snapshot,
+//! an inbox fetch, CI polls, `git_ops::prunable`, the platform crate's agent
+//! detection) and hand them to [`compute`]; every surface — sidebar badges,
+//! the grid's Attention filter, the tray icon, toasts, notifications —
+//! consumes the same ranked output, so urgency is decided in exactly one
+//! place.
+
+use serde::{Deserialize, Serialize};
+
+use crate::inbox::InboxItem;
+use crate::model::{Host, Repo};
+
+/// What kind of thing needs attention. Extensible: append new variants (the
+/// declaration order is the within-severity sort order, so append where the
+/// new kind should rank among its severity peers).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum AttentionKind {
+    /// Unresolved merge/rebase conflict paths in the index.
+    MergeConflict,
+    /// The latest default-branch CI run failed.
+    CiFailing,
+    /// Upstream CI on a pull-only checkout. Kept for serde / label tables;
+    /// [`apply_pull_only_policy`] drops these (and `CiFailing`) so cards stay quiet.
+    UpstreamCi,
+    /// A PR is waiting on your review.
+    ReviewRequested,
+    /// A coding-agent session finished and its output awaits you.
+    AgentFinished,
+    /// Uncommitted changes in the working tree.
+    DirtyWorktree,
+    /// Local commits not pushed to the upstream.
+    Ahead,
+    /// Upstream commits not pulled yet.
+    Behind,
+    /// A PR you authored is open (waiting on reviewers/CI, not on you).
+    PrAssigned,
+    /// Merged or upstream-gone branches that can be pruned.
+    PrunableBranches,
+    /// A coding-agent session is currently running.
+    AgentRunning,
+}
+
+/// How urgently a kind needs the user. Variant order is the sort order
+/// (ascending sort puts `Urgent` first).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Severity {
+    /// Someone or something *external* is blocked on you right now.
+    Urgent,
+    /// Your own work is parked or at risk; deal with it today.
+    Attention,
+    /// Ambient state / hygiene; act at leisure.
+    Info,
+}
+
+impl AttentionKind {
+    /// The severity tier for this kind. The rationale is a three-way split on
+    /// *who is waiting*:
+    ///
+    /// - **Urgent — others are blocked on you.** `CiFailing`: a red default
+    ///   branch blocks everyone building on it, and the longer it sits the
+    ///   harder the bisect. `ReviewRequested`: a human asked for you by name
+    ///   and cannot merge until you act.
+    /// - **Attention — your own work is parked or at risk.** `AgentFinished`:
+    ///   results are ready and idle; the session was the point, so look soon.
+    ///   `DirtyWorktree`: uncommitted changes exist only in that working tree.
+    ///   `Ahead`: unpushed commits exist only on this disk — invisible to the
+    ///   team and unbacked-up.
+    /// - **Info — ambient state, no deadline.** `Behind`: upstream moved but
+    ///   nothing of yours is at risk; you'll fast-forward on the next pull.
+    ///   `PrAssigned`: your open PR is waiting on reviewers/CI, not on you.
+    ///   `PrunableBranches`: hygiene. `AgentRunning`: working as intended —
+    ///   a passive readout, not a call to action.
+    pub fn severity(self) -> Severity {
+        match self {
+            AttentionKind::MergeConflict
+            | AttentionKind::CiFailing
+            | AttentionKind::ReviewRequested => Severity::Urgent,
+            AttentionKind::AgentFinished | AttentionKind::DirtyWorktree | AttentionKind::Ahead => {
+                Severity::Attention
+            }
+            AttentionKind::UpstreamCi
+            | AttentionKind::Behind
+            | AttentionKind::PrAssigned
+            | AttentionKind::PrunableBranches
+            | AttentionKind::AgentRunning => Severity::Info,
+        }
+    }
+
+    /// Short chip label for Mission Control / cards. Stable English vocabulary
+    /// shared with drawer CI copy ("CI failing") and Settings notification
+    /// toggles ("Review requested", "Agent finished").
+    pub fn label(self) -> &'static str {
+        match self {
+            AttentionKind::MergeConflict => "Merge conflict",
+            AttentionKind::CiFailing => "CI failing",
+            AttentionKind::UpstreamCi => "Upstream CI",
+            AttentionKind::ReviewRequested => "Review requested",
+            AttentionKind::AgentFinished => "Agent finished",
+            AttentionKind::DirtyWorktree => "Uncommitted changes",
+            AttentionKind::Ahead => "Not pushed",
+            AttentionKind::Behind => "Behind remote",
+            AttentionKind::PrAssigned => "Open PR",
+            AttentionKind::PrunableBranches => "Prunable branches",
+            AttentionKind::AgentRunning => "Agent running",
+        }
+    }
+
+    /// What the user should do — shown in Mission Control subtitles.
+    pub fn action_hint(self) -> &'static str {
+        match self {
+            AttentionKind::MergeConflict => "Open in IDE to resolve",
+            AttentionKind::CiFailing => "Open CI on the host",
+            AttentionKind::UpstreamCi => "Ignore (pull-only)",
+            AttentionKind::ReviewRequested => "Review the PR",
+            AttentionKind::AgentFinished => "Review agent output",
+            AttentionKind::DirtyWorktree => "Discard or commit",
+            AttentionKind::Ahead => "Push when ready",
+            AttentionKind::Behind => "Pull to update",
+            AttentionKind::PrAssigned => "Wait on reviewers / CI",
+            AttentionKind::PrunableBranches => "Prune in Cleanup",
+            AttentionKind::AgentRunning => "Let it finish",
+        }
+    }
+}
+
+/// How an attention item points back at a repo. Local facts carry the stable
+/// repo id (the absolute path, `Repo::id`); host facts carry the slug and —
+/// where the source knows it — the remote host domain, the same compound key
+/// as the enrichment cache (#159), and gain the local id when a scanned repo
+/// matches. `name` is always set (display name, slug, or path basename) so
+/// every surface has something to render.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RepoRef {
+    /// Local repo id (absolute path) when the repo is in the scanned fleet.
+    pub id: Option<String>,
+    /// Remote host domain (e.g. "github.com", "gitlab.acme.io"), when known.
+    pub remote_host: Option<String>,
+    /// owner/name slug, when the repo has a recognized remote.
+    pub slug: Option<String>,
+    /// Human display name — never empty.
+    pub name: String,
+}
+
+/// One prioritized "needs you" item.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AttentionItem {
+    pub repo: RepoRef,
+    pub kind: AttentionKind,
+    /// Denormalized from `kind.severity()` so surfaces never re-derive it (and
+    /// so per-kind user tuning can override it later without changing shape).
+    pub severity: Severity,
+    /// One glanceable line.
+    pub summary: String,
+    /// Optional second line / routing hint (branch, PR URL, …).
+    pub detail: Option<String>,
+}
+
+/// A repo's latest default-branch CI state, as polled by the caller.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CiFact {
+    /// Remote host domain (e.g. "github.com") — with `slug` this is the same
+    /// compound key as the enrichment cache (#159), so the same "owner/repo"
+    /// slug on two hosts can't cross-link.
+    pub remote_host: String,
+    pub slug: String,
+    /// The shared four-state CI vocabulary from `inbox`:
+    /// "success" | "failure" | "pending" | "none". Only "failure" raises
+    /// attention.
+    pub state: String,
+    /// The run's web page, when the CI source offered one — becomes the
+    /// item's `detail` so surfaces can route to the failing run.
+    pub url: Option<String>,
+}
+
+/// Prunable-branch count for a local repo (from `git_ops::prunable`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PrunableFact {
+    /// Matches `Repo::id` (absolute path).
+    pub repo_id: String,
+    pub count: u32,
+}
+
+/// A coding-agent session fact. The platform crate detects sessions via
+/// /proc, but core must not depend on it, so the input shape lives here and
+/// the caller maps into it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentFact {
+    /// Matches `Repo::id` (absolute path) — agent sessions are a local fact.
+    pub repo_id: String,
+    /// Display label for the agent program (e.g. "claude").
+    pub program: String,
+    /// True while the session is alive; false for a session the caller
+    /// observed finishing (dispatched-worktree outcome detection, #185).
+    pub running: bool,
+    /// The `agent/…` branch a dispatched session works on, when the fact
+    /// comes from a dispatched worktree (None for plain detected sessions).
+    pub branch: Option<String>,
+    /// Commits ahead of the origin's default branch — the "work to review"
+    /// size for a finished dispatched session (0 for running sessions; the
+    /// caller only raises finished facts when there is work, so this is
+    /// nonzero whenever `running` is false).
+    pub commits: u32,
+}
+
+/// Score everything into one prioritized list. Pure: same inputs, same
+/// output. Sorted by severity (`Urgent` first), then kind (declaration
+/// order), then repo name (case-insensitive), then summary — a total, stable
+/// order so surfaces render identically for identical fleets.
+pub fn compute(
+    repos: &[Repo],
+    inbox: &[InboxItem],
+    ci: &[CiFact],
+    prunable: &[PrunableFact],
+    agents: &[AgentFact],
+) -> Vec<AttentionItem> {
+    let mut items: Vec<AttentionItem> = Vec::new();
+
+    // Local git state, straight off the scan snapshot.
+    for repo in repos {
+        let on_branch = || Some(format!("on {}", repo.git.branch));
+        if repo.git.conflicts > 0 {
+            items.push(item(
+                local_ref(repo),
+                AttentionKind::MergeConflict,
+                count(repo.git.conflicts, "merge conflict", "merge conflicts"),
+                on_branch(),
+            ));
+        }
+        if repo.git.dirty > 0 {
+            items.push(item(
+                local_ref(repo),
+                AttentionKind::DirtyWorktree,
+                count(repo.git.dirty, "uncommitted change", "uncommitted changes"),
+                on_branch(),
+            ));
+        }
+        if repo.git.ahead > 0 {
+            items.push(item(
+                local_ref(repo),
+                AttentionKind::Ahead,
+                format!("{} not pushed", count(repo.git.ahead, "commit", "commits")),
+                on_branch(),
+            ));
+        }
+        if repo.git.behind > 0 {
+            items.push(item(
+                local_ref(repo),
+                AttentionKind::Behind,
+                format!(
+                    "{} behind upstream",
+                    count(repo.git.behind, "commit", "commits")
+                ),
+                on_branch(),
+            ));
+        }
+    }
+
+    // Host inbox: review requests + your open PRs. Assigned issues aren't an
+    // attention type (same rule as the platform notifier); drafts can't be
+    // acted on (no merge, review not yet requested "for real"), so a draft
+    // never raises a review item.
+    for it in inbox {
+        match it.kind.as_str() {
+            "review" if !it.draft => items.push(item(
+                host_ref(repos, it.host, &it.repo),
+                AttentionKind::ReviewRequested,
+                format!("Review requested: {} (#{})", it.title, it.number),
+                Some(it.url.clone()),
+            )),
+            "pr" => items.push(item(
+                host_ref(repos, it.host, &it.repo),
+                AttentionKind::PrAssigned,
+                format!("Open PR #{}: {}", it.number, it.title),
+                Some(it.url.clone()),
+            )),
+            _ => {}
+        }
+    }
+
+    // CI: only a definitive failure raises attention — "pending" and "none"
+    // are ambient, and "success" is the goal state.
+    for c in ci {
+        if c.state == "failure" {
+            items.push(item(
+                remote_ref(repos, &c.remote_host, &c.slug),
+                AttentionKind::CiFailing,
+                "CI failing on the default branch".to_string(),
+                c.url.clone(),
+            ));
+        }
+    }
+
+    for p in prunable {
+        if p.count > 0 {
+            items.push(item(
+                id_ref(repos, &p.repo_id),
+                AttentionKind::PrunableBranches,
+                count(p.count, "prunable branch", "prunable branches"),
+                None,
+            ));
+        }
+    }
+
+    for a in agents {
+        let (kind, verb) = if a.running {
+            (AttentionKind::AgentRunning, "running")
+        } else {
+            (AttentionKind::AgentFinished, "finished")
+        };
+        // A finished dispatched session carries its review size + branch so
+        // the item reads as a call to action ("review this"), not a log line.
+        let detail = a.branch.as_ref().map(|b| {
+            if a.commits > 0 {
+                format!("{} on {b}", count(a.commits, "commit", "commits"))
+            } else {
+                format!("on {b}")
+            }
+        });
+        items.push(item(
+            id_ref(repos, &a.repo_id),
+            kind,
+            format!("Agent {verb}: {}", a.program),
+            detail,
+        ));
+    }
+
+    items.sort_by_cached_key(|i| {
+        (
+            i.severity,
+            i.kind,
+            i.repo.name.to_lowercase(),
+            i.summary.clone(),
+        )
+    });
+    items
+}
+
+/// Apply pull-only / upstream policy: silence CI you can't fix (no card chip),
+/// rewrite Ahead copy so Push isn't implied, and reinforce Behind → Pull.
+pub fn apply_pull_only_policy(
+    items: Vec<AttentionItem>,
+    pull_only_prefixes: &[String],
+) -> Vec<AttentionItem> {
+    use crate::model::path_is_pull_only;
+    items
+        .into_iter()
+        .filter_map(|mut item| {
+            let path = item.repo.id.as_deref().unwrap_or("");
+            let pull_only = path_is_pull_only(path, pull_only_prefixes);
+            match item.kind {
+                // Pull-only trees: drop CI entirely — don't demote to UpstreamCi
+                // chips / subtitles. Surface push problems only when a push fails.
+                AttentionKind::CiFailing | AttentionKind::UpstreamCi if pull_only => None,
+                AttentionKind::Ahead if pull_only => {
+                    item.summary = item
+                        .summary
+                        .replace("not pushed", "local only — don't push");
+                    if item.detail.is_none() {
+                        item.detail = Some("upstream / pull-only checkout".into());
+                    }
+                    Some(item)
+                }
+                AttentionKind::Behind => {
+                    if !item.summary.to_lowercase().contains("pull") {
+                        item.summary = format!("{} — Pull to update", item.summary);
+                    }
+                    Some(item)
+                }
+                _ => Some(item),
+            }
+        })
+        .collect()
+}
+
+fn item(
+    repo: RepoRef,
+    kind: AttentionKind,
+    summary: String,
+    detail: Option<String>,
+) -> AttentionItem {
+    AttentionItem {
+        repo,
+        kind,
+        severity: kind.severity(),
+        summary,
+        detail,
+    }
+}
+
+/// "1 uncommitted change" / "3 uncommitted changes" — the plural form is
+/// explicit so irregular nouns ("branches") read right.
+fn count(n: u32, one: &str, many: &str) -> String {
+    if n == 1 {
+        format!("1 {one}")
+    } else {
+        format!("{n} {many}")
+    }
+}
+
+fn local_ref(repo: &Repo) -> RepoRef {
+    RepoRef {
+        id: Some(repo.id.clone()),
+        remote_host: repo.remote_host.clone(),
+        slug: repo.slug.clone(),
+        name: repo.display_name.clone(),
+    }
+}
+
+/// Link a (host, slug) inbox fact to the local fleet. The inbox only knows
+/// the host *kind* (GitHub/GitLab), not the domain, so this is the finest
+/// key it can offer — still host-qualified, so "o/r" on GitHub never links
+/// to a local "o/r" cloned from GitLab.
+fn host_ref(repos: &[Repo], host: Host, slug: &str) -> RepoRef {
+    repos
+        .iter()
+        .find(|r| r.host == Some(host) && r.slug.as_deref() == Some(slug))
+        .map(local_ref)
+        .unwrap_or_else(|| RepoRef {
+            id: None,
+            remote_host: None,
+            slug: Some(slug.to_string()),
+            name: slug.to_string(),
+        })
+}
+
+/// Link a (remote_host domain, slug) fact — the full enrichment-cache key —
+/// to the local fleet.
+fn remote_ref(repos: &[Repo], remote_host: &str, slug: &str) -> RepoRef {
+    repos
+        .iter()
+        .find(|r| r.remote_host.as_deref() == Some(remote_host) && r.slug.as_deref() == Some(slug))
+        .map(local_ref)
+        .unwrap_or_else(|| RepoRef {
+            id: None,
+            remote_host: Some(remote_host.to_string()),
+            slug: Some(slug.to_string()),
+            name: slug.to_string(),
+        })
+}
+
+/// Link a local-repo-id fact to the fleet; falls back to the path basename
+/// as the display name if the id isn't in the snapshot (e.g. mid-rescan).
+fn id_ref(repos: &[Repo], repo_id: &str) -> RepoRef {
+    repos
+        .iter()
+        .find(|r| r.id == repo_id)
+        .map(local_ref)
+        .unwrap_or_else(|| RepoRef {
+            id: Some(repo_id.to_string()),
+            remote_host: None,
+            slug: None,
+            name: repo_id
+                .rsplit('/')
+                .next()
+                .filter(|s| !s.is_empty())
+                .unwrap_or(repo_id)
+                .to_string(),
+        })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{Activity, GitStatus};
+
+    fn repo(id: &str) -> Repo {
+        Repo {
+            id: id.to_string(),
+            display_name: "Test".into(),
+            slug: Some("o/test".into()),
+            path: "~/dev/test".into(),
+            description: None,
+            language: Some("Rust".into()),
+            git: GitStatus {
+                branch: "main".into(),
+                ahead: 0,
+                behind: 0,
+                dirty: 0,
+                ..Default::default()
+            },
+            last_commit_unix: 0,
+            activity: Activity::Active,
+            root: "~/dev".into(),
+            host: Some(Host::Github),
+            remote_host: Some("github.com".into()),
+            stars: 0,
+            topics: Vec::new(),
+            open_issues: 0,
+            latest_release: None,
+            private: false,
+            favorite: false,
+            ai_summary: None,
+            parent_id: None,
+            submodule_path: None,
+        }
+    }
+
+    fn inbox_item(kind: &str, slug: &str, draft: bool) -> InboxItem {
+        InboxItem {
+            kind: kind.to_string(),
+            title: "Fix the thing".into(),
+            repo: slug.to_string(),
+            url: format!("https://github.com/{slug}/pull/7"),
+            number: 7,
+            draft,
+            host: Host::Github,
+        }
+    }
+
+    fn compute_repos(repos: &[Repo]) -> Vec<AttentionItem> {
+        compute(repos, &[], &[], &[], &[])
+    }
+
+    #[test]
+    fn quiet_fleet_produces_empty() {
+        // Clean repos, empty inbox, green CI, no prunables, no agents.
+        let repos = vec![repo("/a"), repo("/b")];
+        let ci = vec![CiFact {
+            remote_host: "github.com".into(),
+            slug: "o/test".into(),
+            state: "success".into(),
+            url: None,
+        }];
+        assert!(compute(&repos, &[], &ci, &[], &[]).is_empty());
+    }
+
+    #[test]
+    fn dirty_worktree_triggers_attention() {
+        let mut r = repo("/a");
+        r.git.dirty = 3;
+        let items = compute_repos(&[r]);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].kind, AttentionKind::DirtyWorktree);
+        assert_eq!(items[0].severity, Severity::Attention);
+        assert_eq!(items[0].summary, "3 uncommitted changes");
+        assert_eq!(items[0].detail.as_deref(), Some("on main"));
+        assert_eq!(items[0].repo.id.as_deref(), Some("/a"));
+    }
+
+    #[test]
+    fn merge_conflict_triggers_urgent() {
+        let mut r = repo("/a");
+        r.git.conflicts = 2;
+        r.git.dirty = 2;
+        let items = compute_repos(&[r]);
+        assert!(items
+            .iter()
+            .any(|i| i.kind == AttentionKind::MergeConflict && i.severity == Severity::Urgent));
+        let conflict = items
+            .iter()
+            .find(|i| i.kind == AttentionKind::MergeConflict)
+            .expect("merge conflict item");
+        assert_eq!(conflict.summary, "2 merge conflicts");
+        assert_eq!(conflict.kind.action_hint(), "Open in IDE to resolve");
+    }
+
+    #[test]
+    fn ahead_triggers_attention() {
+        let mut r = repo("/a");
+        r.git.ahead = 1;
+        let items = compute_repos(&[r]);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].kind, AttentionKind::Ahead);
+        assert_eq!(items[0].severity, Severity::Attention);
+        assert_eq!(items[0].summary, "1 commit not pushed");
+    }
+
+    #[test]
+    fn behind_triggers_info() {
+        let mut r = repo("/a");
+        r.git.behind = 2;
+        let items = compute_repos(&[r]);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].kind, AttentionKind::Behind);
+        assert_eq!(items[0].severity, Severity::Info);
+        assert_eq!(items[0].summary, "2 commits behind upstream");
+    }
+
+    #[test]
+    fn ci_failure_triggers_urgent_but_other_states_do_not() {
+        let repos = vec![repo("/a")];
+        let fact = |state: &str| CiFact {
+            remote_host: "github.com".into(),
+            slug: "o/test".into(),
+            state: state.into(),
+            url: Some("https://github.com/o/test/actions/runs/9".into()),
+        };
+        for quiet in ["success", "pending", "none"] {
+            assert!(
+                compute(&repos, &[], &[fact(quiet)], &[], &[]).is_empty(),
+                "{quiet} must not raise attention"
+            );
+        }
+        let items = compute(&repos, &[], &[fact("failure")], &[], &[]);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].kind, AttentionKind::CiFailing);
+        assert_eq!(items[0].severity, Severity::Urgent);
+        // Linked to the local repo via the (host, slug) compound key, with
+        // the failing run's URL carried as the routing detail.
+        assert_eq!(items[0].repo.id.as_deref(), Some("/a"));
+        assert_eq!(
+            items[0].detail.as_deref(),
+            Some("https://github.com/o/test/actions/runs/9")
+        );
+    }
+
+    #[test]
+    fn ci_failure_keys_by_host_and_slug() {
+        // Same slug, different host domain → must not link to the local repo
+        // (the #159 enrichment-cache lesson).
+        let repos = vec![repo("/a")]; // github.com / o/test
+        let items = compute(
+            &repos,
+            &[],
+            &[CiFact {
+                remote_host: "gitlab.acme.io".into(),
+                slug: "o/test".into(),
+                state: "failure".into(),
+                url: None,
+            }],
+            &[],
+            &[],
+        );
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].repo.id, None, "must not cross-link across hosts");
+        assert_eq!(items[0].repo.remote_host.as_deref(), Some("gitlab.acme.io"));
+    }
+
+    #[test]
+    fn review_request_triggers_urgent_and_drafts_are_skipped() {
+        let items = compute(&[], &[inbox_item("review", "o/test", false)], &[], &[], &[]);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].kind, AttentionKind::ReviewRequested);
+        assert_eq!(items[0].severity, Severity::Urgent);
+        assert_eq!(items[0].summary, "Review requested: Fix the thing (#7)");
+        assert_eq!(
+            items[0].detail.as_deref(),
+            Some("https://github.com/o/test/pull/7")
+        );
+
+        // A draft PR can't be merged; review isn't actionable yet.
+        let drafts = compute(&[], &[inbox_item("review", "o/test", true)], &[], &[], &[]);
+        assert!(drafts.is_empty());
+    }
+
+    #[test]
+    fn own_pr_triggers_info_and_issues_are_ignored() {
+        let items = compute(
+            &[],
+            &[
+                inbox_item("pr", "o/test", false),
+                inbox_item("issue", "o/test", false),
+            ],
+            &[],
+            &[],
+            &[],
+        );
+        assert_eq!(items.len(), 1, "assigned issues aren't an attention type");
+        assert_eq!(items[0].kind, AttentionKind::PrAssigned);
+        assert_eq!(items[0].severity, Severity::Info);
+        assert_eq!(items[0].summary, "Open PR #7: Fix the thing");
+    }
+
+    #[test]
+    fn inbox_links_to_local_repo_by_host_and_slug() {
+        // A GitHub inbox item matches the GitHub clone, not a GitLab repo
+        // that happens to share the slug.
+        let mut gitlab_twin = repo("/b");
+        gitlab_twin.host = Some(Host::Gitlab);
+        gitlab_twin.remote_host = Some("gitlab.com".into());
+        let repos = vec![gitlab_twin, repo("/a")];
+        let items = compute(
+            &repos,
+            &[inbox_item("review", "o/test", false)],
+            &[],
+            &[],
+            &[],
+        );
+        assert_eq!(items[0].repo.id.as_deref(), Some("/a"));
+        assert_eq!(items[0].repo.name, "Test");
+
+        // No local match → slug-only ref, still renderable.
+        let items = compute(&[], &[inbox_item("review", "o/x", false)], &[], &[], &[]);
+        assert_eq!(items[0].repo.id, None);
+        assert_eq!(items[0].repo.name, "o/x");
+    }
+
+    #[test]
+    fn prunable_branches_trigger_info_only_when_nonzero() {
+        let repos = vec![repo("/a")];
+        let none = PrunableFact {
+            repo_id: "/a".into(),
+            count: 0,
+        };
+        assert!(compute(&repos, &[], &[], &[none], &[]).is_empty());
+
+        let some = PrunableFact {
+            repo_id: "/a".into(),
+            count: 2,
+        };
+        let items = compute(&repos, &[], &[], &[some], &[]);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].kind, AttentionKind::PrunableBranches);
+        assert_eq!(items[0].severity, Severity::Info);
+        assert_eq!(items[0].summary, "2 prunable branches");
+    }
+
+    #[test]
+    fn agent_running_is_info_and_finished_is_attention() {
+        let repos = vec![repo("/a")];
+        let fact = |running: bool| AgentFact {
+            repo_id: "/a".into(),
+            program: "claude".into(),
+            running,
+            branch: None,
+            commits: 0,
+        };
+        let items = compute(&repos, &[], &[], &[], &[fact(true), fact(false)]);
+        assert_eq!(items.len(), 2);
+        // Finished sorts first (Attention < Info).
+        assert_eq!(items[0].kind, AttentionKind::AgentFinished);
+        assert_eq!(items[0].severity, Severity::Attention);
+        assert_eq!(items[0].summary, "Agent finished: claude");
+        assert_eq!(items[0].detail, None);
+        assert_eq!(items[1].kind, AttentionKind::AgentRunning);
+        assert_eq!(items[1].severity, Severity::Info);
+        assert_eq!(items[1].summary, "Agent running: claude");
+    }
+
+    #[test]
+    fn finished_dispatch_carries_branch_and_commit_detail() {
+        let items = compute(
+            &[repo("/a")],
+            &[],
+            &[],
+            &[],
+            &[AgentFact {
+                repo_id: "/a".into(),
+                program: "claude".into(),
+                running: false,
+                branch: Some("agent/fix-x-ab12".into()),
+                commits: 3,
+            }],
+        );
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].kind, AttentionKind::AgentFinished);
+        assert_eq!(
+            items[0].detail.as_deref(),
+            Some("3 commits on agent/fix-x-ab12")
+        );
+
+        // A running dispatched session shows just the branch.
+        let items = compute(
+            &[repo("/a")],
+            &[],
+            &[],
+            &[],
+            &[AgentFact {
+                repo_id: "/a".into(),
+                program: "claude".into(),
+                running: true,
+                branch: Some("agent/fix-x-ab12".into()),
+                commits: 0,
+            }],
+        );
+        assert_eq!(items[0].detail.as_deref(), Some("on agent/fix-x-ab12"));
+    }
+
+    #[test]
+    fn unknown_agent_repo_falls_back_to_path_basename() {
+        let items = compute(
+            &[],
+            &[],
+            &[],
+            &[],
+            &[AgentFact {
+                repo_id: "/home/dev/mystery".into(),
+                program: "claude".into(),
+                running: true,
+                branch: None,
+                commits: 0,
+            }],
+        );
+        assert_eq!(items[0].repo.name, "mystery");
+        assert_eq!(items[0].repo.id.as_deref(), Some("/home/dev/mystery"));
+    }
+
+    #[test]
+    fn every_kind_maps_to_its_documented_severity() {
+        use AttentionKind::*;
+        for (kind, severity) in [
+            (MergeConflict, Severity::Urgent),
+            (CiFailing, Severity::Urgent),
+            (ReviewRequested, Severity::Urgent),
+            (AgentFinished, Severity::Attention),
+            (DirtyWorktree, Severity::Attention),
+            (Ahead, Severity::Attention),
+            (UpstreamCi, Severity::Info),
+            (Behind, Severity::Info),
+            (PrAssigned, Severity::Info),
+            (PrunableBranches, Severity::Info),
+            (AgentRunning, Severity::Info),
+        ] {
+            assert_eq!(kind.severity(), severity, "{kind:?}");
+        }
+    }
+
+    #[test]
+    fn every_kind_has_a_chip_label() {
+        use AttentionKind::*;
+        for (kind, label) in [
+            (MergeConflict, "Merge conflict"),
+            (CiFailing, "CI failing"),
+            (UpstreamCi, "Upstream CI"),
+            (ReviewRequested, "Review requested"),
+            (AgentFinished, "Agent finished"),
+            (DirtyWorktree, "Uncommitted changes"),
+            (Ahead, "Not pushed"),
+            (Behind, "Behind remote"),
+            (PrAssigned, "Open PR"),
+            (PrunableBranches, "Prunable branches"),
+            (AgentRunning, "Agent running"),
+        ] {
+            assert_eq!(kind.label(), label, "{kind:?}");
+        }
+    }
+
+    #[test]
+    fn every_kind_has_an_action_hint() {
+        use AttentionKind::*;
+        assert_eq!(Behind.action_hint(), "Pull to update");
+        assert_eq!(DirtyWorktree.action_hint(), "Discard or commit");
+        assert_eq!(UpstreamCi.action_hint(), "Ignore (pull-only)");
+        assert_eq!(MergeConflict.action_hint(), "Open in IDE to resolve");
+        for kind in [
+            MergeConflict,
+            CiFailing,
+            UpstreamCi,
+            ReviewRequested,
+            AgentFinished,
+            DirtyWorktree,
+            Ahead,
+            Behind,
+            PrAssigned,
+            PrunableBranches,
+            AgentRunning,
+        ] {
+            assert!(!kind.action_hint().is_empty(), "{kind:?}");
+        }
+    }
+
+    #[test]
+    fn pull_only_policy_drops_ci_and_rewrites_ahead_behind() {
+        let items = vec![
+            item(
+                local_ref(&repo("/work/core/enterprise")),
+                AttentionKind::CiFailing,
+                "CI failing on the default branch".into(),
+                None,
+            ),
+            item(
+                local_ref(&repo("/work/core/enterprise")),
+                AttentionKind::UpstreamCi,
+                "Upstream CI failing — ignore (pull-only)".into(),
+                Some("CI on upstream remotes is not your fix".into()),
+            ),
+            item(
+                local_ref(&repo("/work/core/enterprise")),
+                AttentionKind::Ahead,
+                "2 commits not pushed".into(),
+                None,
+            ),
+            item(
+                local_ref(&repo("/work/core/enterprise")),
+                AttentionKind::Behind,
+                "3 commits behind upstream".into(),
+                None,
+            ),
+            item(
+                local_ref(&repo("/work/digits/mine")),
+                AttentionKind::CiFailing,
+                "CI failing on the default branch".into(),
+                None,
+            ),
+        ];
+        let prefixes = vec!["/work/core".into()];
+        let out = apply_pull_only_policy(items, &prefixes);
+        assert_eq!(out.len(), 3, "pull-only CI items dropped");
+        assert!(!out.iter().any(|i| {
+            matches!(i.kind, AttentionKind::CiFailing | AttentionKind::UpstreamCi)
+                && i.repo.id.as_deref() == Some("/work/core/enterprise")
+        }));
+        let ahead = out
+            .iter()
+            .find(|i| i.kind == AttentionKind::Ahead)
+            .expect("ahead kept");
+        assert!(ahead.summary.contains("don't push"));
+        let behind = out
+            .iter()
+            .find(|i| i.kind == AttentionKind::Behind)
+            .expect("behind");
+        assert!(behind.summary.contains("Pull to update"));
+        assert!(out.iter().any(|i| i.kind == AttentionKind::CiFailing
+            && i.repo.id.as_deref() == Some("/work/digits/mine")));
+    }
+
+    #[test]
+    fn output_sorts_by_severity_then_kind_then_repo_name() {
+        // Repo "b" is only dirty (Attention); repo "a" is behind (Info) and has
+        // failing CI (Urgent). Expect: Urgent(a) → Attention(b) → Info(a).
+        let mut a = repo("/a");
+        a.display_name = "alpha".into();
+        a.slug = Some("o/alpha".into());
+        a.git.behind = 1;
+        let mut b = repo("/b");
+        b.display_name = "beta".into();
+        b.slug = Some("o/beta".into());
+        b.git.dirty = 1;
+        let ci = vec![CiFact {
+            remote_host: "github.com".into(),
+            slug: "o/alpha".into(),
+            state: "failure".into(),
+            url: None,
+        }];
+        let items = compute(&[a, b], &[], &ci, &[], &[]);
+        let got: Vec<(AttentionKind, &str)> = items
+            .iter()
+            .map(|i| (i.kind, i.repo.name.as_str()))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                (AttentionKind::CiFailing, "alpha"),
+                (AttentionKind::DirtyWorktree, "beta"),
+                (AttentionKind::Behind, "alpha"),
+            ]
+        );
+
+        // Same severity + kind → repo name breaks the tie, case-insensitively.
+        let mut x = repo("/x");
+        x.display_name = "Zed".into();
+        x.git.dirty = 1;
+        let mut y = repo("/y");
+        y.display_name = "apricot".into();
+        y.git.dirty = 1;
+        let items = compute_repos(&[x, y]);
+        let names: Vec<&str> = items.iter().map(|i| i.repo.name.as_str()).collect();
+        assert_eq!(names, vec!["apricot", "Zed"]);
+    }
+}
