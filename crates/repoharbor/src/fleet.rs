@@ -506,7 +506,10 @@ impl RepoHarborApp {
                             workers,
                             &cancel,
                             progress,
-                            fleet::pull_op_collecting(Some(pull_files_for_op)),
+                            fleet::pull_op_collecting(
+                                Some(pull_files_for_op),
+                                pull_only_prefixes.clone(),
+                            ),
                         ),
                         FleetOp::StageAll => {
                             fleet::run(&repos, workers, &cancel, progress, fleet::stage_all_op())

@@ -13,10 +13,8 @@ use gpui::{
     StatefulInteractiveElement, Styled, Subscription, Window, div, prelude::FluentBuilder, px, rgb,
 };
 use gpui_component::TitleBar;
-use gpui_component::button::Button;
 use gpui_component::input::{Input, InputState};
-use gpui_component::menu::{ContextMenuExt as _, DropdownMenu, PopupMenuItem};
-use gpui_component::{IconName, Sizable};
+use gpui_component::menu::ContextMenuExt as _;
 
 /// Expanded sidebar width bounds (px). Collapsed mode uses [`SIDEBAR_COLLAPSED`].
 pub(crate) const SIDEBAR_DEFAULT: f32 = 236.;
@@ -25,7 +23,7 @@ pub(crate) const SIDEBAR_MAX: f32 = 420.;
 const SIDEBAR_COLLAPSED: f32 = 56.;
 
 use repoharbor_core::attention::{AttentionItem, AttentionKind, Severity};
-use repoharbor_core::model::AppConfig;
+use repoharbor_core::model::{AppConfig, MissionControlLayout};
 
 use crate::card::card;
 use crate::data::Row;
@@ -264,14 +262,9 @@ impl SortMode {
     }
 }
 
-/// Mission Control card layout: the multi-column card grid, or a compact
-/// single-column list.
-#[derive(Clone, Copy, PartialEq, Eq, Default)]
-pub enum Layout {
-    #[default]
-    Grid,
-    List,
-}
+/// Mission Control layout: multi-column cards, or a compact single-column list
+/// (the default). TREE lives in the sidebar, not here.
+pub type Layout = MissionControlLayout;
 
 /// A persisted Mission Control "quick view": a named snapshot of the active
 /// filter combo, restorable from the sidebar's VIEWS section.
@@ -539,7 +532,7 @@ pub struct GridState {
     pub language: Option<SharedString>,
     /// Card ordering.
     pub sort: SortMode,
-    /// Card layout (grid vs. compact list).
+    /// Repo layout (grid cards vs compact list).
     pub layout: Layout,
     /// Persisted quick views (sidebar VIEWS), loaded from the cache at launch.
     pub saved_views: Vec<SavedView>,
@@ -3137,6 +3130,7 @@ impl RepoHarborApp {
         // Chrome / groups are edited outside Settings — keep the live values.
         draft.sidebar_width = self.config.sidebar_width;
         draft.sidebar_collapsed = self.config.sidebar_collapsed;
+        draft.layout = self.config.layout;
         draft.workspace_groups = self.config.workspace_groups.clone();
         draft.active_workspace_group = self.config.active_workspace_group.clone();
 
@@ -4000,7 +3994,8 @@ impl RepoHarborApp {
     }
 
     /// Re-scan the roots from disk (off the UI thread) and reload the grid, then
-    /// refresh host enrichment.
+    /// refresh host enrichment. Header **Refresh**, Mission Control toolbar, and
+    /// the command palette all land here.
     pub(crate) fn rescan(&mut self, cx: &mut Context<Self>) {
         // Explicit rescans follow repo/root additions (Settings save, New
         // Project, header/palette refresh) — re-arm the fs watcher so the new
@@ -4011,6 +4006,13 @@ impl RepoHarborApp {
             crate::data::now_unix(),
             crate::activity_log::LogLevel::Info,
             "Scan started",
+        );
+        self.upsert_toast(
+            "rescan",
+            ToastKind::Progress,
+            "Scanning…",
+            Some("Re-reading workspace roots".into()),
+            cx,
         );
         cx.spawn(async move |this, cx| {
             let snap = cx
@@ -4035,6 +4037,13 @@ impl RepoHarborApp {
                     crate::data::now_unix(),
                     crate::activity_log::LogLevel::Info,
                     format!("Scan finished — {n} repos"),
+                );
+                this.upsert_toast(
+                    "rescan",
+                    ToastKind::Success,
+                    "Scan finished",
+                    Some(format!("{n} repos").into()),
+                    cx,
                 );
                 cx.notify();
             });
@@ -4136,9 +4145,11 @@ impl RepoHarborApp {
         cx.notify();
     }
 
-    /// Switch the Mission Control card layout (grid ↔ list).
+    /// Switch the Mission Control layout (grid ↔ list) and persist it.
     pub fn set_layout(&mut self, layout: Layout, cx: &mut Context<Self>) {
         self.grid.layout = layout;
+        self.config.layout = layout;
+        let _ = repoharbor_core::config::save(&self.config);
         cx.notify();
     }
 
@@ -4274,7 +4285,7 @@ impl RepoHarborApp {
     }
 
     /// Force-refresh host enrichment for every repo (ignores the TTL), then
-    /// reload the grid. The toolbar's "Fetch all".
+    /// reload the grid. The ops row's "Fetch all".
     pub fn fetch_all_hosts(&mut self, cx: &mut Context<Self>) {
         cx.spawn(async move |this, cx| {
             let now = crate::data::now_unix();
@@ -5103,20 +5114,25 @@ impl RepoHarborApp {
                 div()
                     .id("header-rescan")
                     .flex()
+                    .flex_row()
                     .items_center()
                     .justify_center()
-                    .w(px(30.))
+                    .gap(px(6.))
                     .h(px(30.))
+                    .px(px(10.))
                     .rounded(px(t.r_sm))
-                    .bg(rgb(t.button_bg))
+                    .bg(rgb(t.accent_wash))
                     .border_1()
-                    .border_color(rgb(t.border))
+                    .border_color(rgb(t.border_accent))
+                    .text_size(px(t.text_small))
+                    .text_color(rgb(t.fg0))
                     .cursor_pointer()
                     .hover(|s| {
                         s.bg(rgb(t.surface_hover))
                             .border_color(rgb(t.border_strong))
                     })
-                    .child(lucide("refresh-cw", 15., t.fg0))
+                    .child(lucide("refresh-cw", 15., t.accent_bright))
+                    .child("Refresh")
                     .on_click(cx.listener(|this, _ev, _window, cx| this.rescan(cx))),
             );
 
@@ -6016,8 +6032,8 @@ impl RepoHarborApp {
             _ => None,
         };
         let visible = self.visible_rows();
-        // Select-all + contextual chips sit above the list; Actions appears only
-        // when something is selected.
+        // Select-all + global/selection ops sit above the list; Actions appears
+        // only when something is selected.
         let fleet_bar = self.fleet_bar(t, cx);
         let list_area: gpui::AnyElement = if self.grid.filter == RepoFilter::Attention
             && visible.is_empty()
@@ -6066,13 +6082,14 @@ impl RepoHarborApp {
             .bg(rgb(t.page))
             .children(band)
             .child(self.toolbar(t, cx, visible.len()))
-            .child(self.filter_chips(t, cx))
+            .child(self.ops_row(t, cx))
             .child(list_area)
             .children(fleet_bar)
     }
 
-    /// Top Mission Control bar: title · count, search, work modes, always-on
-    /// visibility chips (Public / Private / Starred / Stale), then sort/layout.
+    /// Top Mission Control bar — filters only: title · count, search, work
+    /// modes, visibility chips, mode-scoped git chips, then sort/layout.
+    /// Execute ops live on [`Self::ops_row`].
     fn toolbar(&self, t: &Theme, cx: &mut Context<Self>, count: usize) -> impl IntoElement {
         let title = format!("{} · {count}", self.grid.mode.label());
         let mut bar = div()
@@ -6097,17 +6114,11 @@ impl RepoHarborApp {
         for f in VISIBILITY_CHIPS {
             bar = bar.child(self.filter_chip(f, t, cx));
         }
+        // Working-mode git chips (Dirty / Stageable / Pushable) — filters, not ops.
+        for f in self.grid.mode.chips() {
+            bar = bar.child(self.filter_chip(*f, t, cx));
+        }
         bar = bar
-            // One-click Pull for every repo behind its upstream (vendor trees).
-            .child(tool_btn(
-                "tb-pull-behind",
-                "cloud-download",
-                Some("Pull behind"),
-                false,
-                t,
-                cx.listener(|this, _ev, _w, cx| this.pull_behind_repos(cx)),
-            ))
-            .child(self.more_menu_button(cx))
             // Sort order (cycles Sort: recent ↔ Sort: name). Not the heatmap.
             .child(tool_btn(
                 "tb-sort",
@@ -6188,35 +6199,9 @@ impl RepoHarborApp {
         group
     }
 
-    /// Overflow menu for secondary toolbar actions (Fetch all / Summarize).
-    fn more_menu_button(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let app = cx.entity();
-        let ai_ready = self.services.ai_ready;
-        Button::new("mc-more")
-            .outline()
-            .small()
-            .compact()
-            .icon(IconName::EllipsisVertical)
-            .label("More")
-            .dropdown_caret(true)
-            .dropdown_menu(move |menu, _window, _cx| {
-                let a = app.clone();
-                let mut m = menu.item(PopupMenuItem::new("Fetch all").on_click(move |_, _, cx| {
-                    a.update(cx, |this, cx| this.fetch_all_hosts(cx));
-                }));
-                if ai_ready {
-                    let a = app.clone();
-                    m = m.item(PopupMenuItem::new("Summarize").on_click(move |_, _, cx| {
-                        a.update(cx, |this, cx| this.summarize_all(cx));
-                    }));
-                }
-                m
-            })
-    }
-
-    /// Secondary strip under the toolbar: select-all, Working git chips, and
-    /// selection fleet primaries. Visibility chips live in [`Self::toolbar`].
-    fn filter_chips(&self, t: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
+    /// Bottom Mission Control strip — execute ops only. Global verbs stay
+    /// visible with no selection so they are not mixed into the filter row.
+    fn ops_row(&self, t: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
         let mut row = div()
             .flex()
             .flex_row()
@@ -6226,13 +6211,44 @@ impl RepoHarborApp {
             .px(px(16.))
             .py(px(12.));
         row = row.child(self.select_all_checkbox(t, cx));
-        // Working-mode git chips only while that mode is active.
-        for f in self.grid.mode.chips() {
-            row = row.child(self.filter_chip(*f, t, cx));
+        // Disk/git rescan — labeled + accent so it isn’t a ghost icon.
+        row = row.child(tool_btn_primary(
+            "tb-refresh",
+            "refresh-cw",
+            "Refresh",
+            t,
+            cx.listener(|this, _ev, _w, cx| this.rescan(cx)),
+        ));
+        // One-click Pull for every repo behind its upstream (vendor trees).
+        row = row.child(tool_btn(
+            "tb-pull-behind",
+            "cloud-download",
+            Some("Pull behind"),
+            false,
+            t,
+            cx.listener(|this, _ev, _w, cx| this.pull_behind_repos(cx)),
+        ));
+        // Host enrichment refresh (ignores TTL) — not a git fetch of the selection.
+        row = row.child(tool_btn(
+            "tb-fetch-all",
+            "globe",
+            Some("Fetch all"),
+            false,
+            t,
+            cx.listener(|this, _ev, _w, cx| this.fetch_all_hosts(cx)),
+        ));
+        if self.services.ai_ready {
+            row = row.child(tool_btn(
+                "tb-summarize",
+                "sparkles",
+                Some("Summarize"),
+                false,
+                t,
+                cx.listener(|this, _ev, _w, cx| this.summarize_all(cx)),
+            ));
         }
         // Selection-scoped primaries: Fetch / Pull / [Push] / Submodules /
-        // [Gen commit] / [Empty commit] beside Actions ▾. Hidden when nothing
-        // is selected so the chip row stays calm.
+        // [Gen commit] / [Empty commit] beside Actions ▾.
         if !self.selected.is_empty() {
             row = row
                 .child(self.fleet_primary_sync_buttons(t, cx))
@@ -6454,6 +6470,36 @@ fn tool_btn(
         b = b.child(SharedString::from(label.to_string()));
     }
     b
+}
+
+/// Always-on primary toolbar control (icon + label, accent wash, `fg0` text).
+fn tool_btn_primary(
+    id: &'static str,
+    icon: &'static str,
+    label: &'static str,
+    t: &Theme,
+    on: impl Fn(&gpui::ClickEvent, &mut Window, &mut gpui::App) + 'static,
+) -> impl IntoElement {
+    let hov = t.border_strong;
+    div()
+        .id(id)
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(6.))
+        .px(px(12.))
+        .py(px(6.))
+        .rounded(px(t.r_sm))
+        .bg(rgb(t.accent_wash))
+        .border_1()
+        .border_color(rgb(t.border_accent))
+        .text_size(px(t.text_small))
+        .text_color(rgb(t.fg0))
+        .cursor_pointer()
+        .hover(move |s| s.border_color(rgb(hov)))
+        .on_click(on)
+        .child(lucide(icon, 15., t.accent_bright))
+        .child(SharedString::from(label))
 }
 
 /// Responsive column count from the window width: aim for ~340px-wide cards
@@ -7002,5 +7048,11 @@ mod tests {
         assert!(!urgent_kind_enabled(&cfg, AttentionKind::ReviewRequested));
         cfg.notify_ci_failure = false;
         assert!(!urgent_kind_enabled(&cfg, AttentionKind::CiFailing));
+    }
+
+    #[test]
+    fn mission_control_layout_defaults_to_list() {
+        assert_eq!(Layout::default(), Layout::List);
+        assert_eq!(AppConfig::default().layout, Layout::List);
     }
 }

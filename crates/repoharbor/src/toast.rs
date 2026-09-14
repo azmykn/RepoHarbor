@@ -14,7 +14,7 @@
 use std::time::Duration;
 
 use gpui::{
-    Context, FontWeight, InteractiveElement, IntoElement, ParentElement, SharedString,
+    Context, FontWeight, InteractiveElement, IntoElement, MouseButton, ParentElement, SharedString,
     StatefulInteractiveElement, Styled, div, px, rgb,
 };
 
@@ -263,9 +263,16 @@ impl RepoHarborApp {
     }
 }
 
+/// Right or middle mouse button dismisses without opening the notice panel.
+/// Left stays on `on_click` (open + dismiss).
+#[cfg(test)]
+fn dismiss_only_button(button: MouseButton) -> bool {
+    matches!(button, MouseButton::Right | MouseButton::Middle)
+}
+
 /// One flat toast card: leading semantic icon, title + optional detail, on the
-/// surface token with an elevation border. Clicking opens the notice detail
-/// panel (full repo / branch / commit facts) and dismisses the toast.
+/// surface token with an elevation border. Left-click opens the notice detail
+/// panel and dismisses; right- or middle-click dismisses only.
 fn toast_card(toast: &Toast, t: &Theme, cx: &mut Context<RepoHarborApp>) -> impl IntoElement {
     let (icon, color) = toast.kind.style(t);
     let id = toast.id;
@@ -308,6 +315,14 @@ fn toast_card(toast: &Toast, t: &Theme, cx: &mut Context<RepoHarborApp>) -> impl
             this.open_notice_from_toast(id, cx);
             this.dismiss_toast(id, cx);
         }))
+        .on_mouse_down(
+            MouseButton::Right,
+            cx.listener(move |this, _ev, _w, cx| this.dismiss_toast(id, cx)),
+        )
+        .on_mouse_down(
+            MouseButton::Middle,
+            cx.listener(move |this, _ev, _w, cx| this.dismiss_toast(id, cx)),
+        )
         .child(lucide(icon, 16., color))
         .child(text);
     if toast.url.is_some() {
@@ -370,5 +385,12 @@ mod tests {
             Some(&SharedString::from("fleet:1")),
             &existing
         ));
+    }
+
+    #[test]
+    fn right_and_middle_dismiss_without_open() {
+        assert!(dismiss_only_button(MouseButton::Right));
+        assert!(dismiss_only_button(MouseButton::Middle));
+        assert!(!dismiss_only_button(MouseButton::Left));
     }
 }

@@ -4,6 +4,7 @@
 
 use git2::{
     BranchType, Cred, CredentialType, DiffOptions, FetchOptions, RemoteCallbacks, Repository,
+    RepositoryState,
 };
 use serde::Serialize;
 
@@ -284,16 +285,25 @@ pub const SKIP_DIRTY: &str = "uncommitted changes";
 /// Fast-forward-only pull: fetch `origin`, then advance HEAD to its upstream
 /// iff that's a clean fast-forward on a clean tree. Diverged/dirty/no-upstream
 /// are reported as skips, not errors, so a fleet pull is safe by default.
+/// Vendor / pull-only trees should keep this path (no rebase).
 ///
 /// On a real fast-forward, `files` lists relative paths that changed between
 /// the old and new tip (capped) so the UI can show what landed locally.
 pub fn pull(path: &str) -> Result<OpOutcome, String> {
-    Ok(pull_with_files(path)?.0)
+    Ok(pull_with_files(path, false)?.0)
 }
 
 /// Like [`pull`], but also returns the changed file paths on a fast-forward
-/// (empty for up-to-date / skip).
-pub fn pull_with_files(path: &str) -> Result<(OpOutcome, Vec<String>), String> {
+/// or successful rebase (empty for up-to-date / skip).
+///
+/// When `rebase_if_diverged` is true (pushable / digits trees), a clean
+/// ahead+behind history is recovered with `git rebase --empty=keep` onto
+/// upstream instead of [`SKIP_DIVERGED`]. Never force-pushes. Conflicts
+/// abort the rebase and return a hard error so the fleet can Fail.
+pub fn pull_with_files(
+    path: &str,
+    rebase_if_diverged: bool,
+) -> Result<(OpOutcome, Vec<String>), String> {
     let repo = Repository::open(path).map_err(|e| e.to_string())?;
     if let Ok(mut remote) = repo.find_remote("origin") {
         let mut opts = FetchOptions::new();
@@ -334,7 +344,20 @@ pub fn pull_with_files(path: &str) -> Result<(OpOutcome, Vec<String>), String> {
     let (ahead, behind) = repo
         .graph_ahead_behind(local_oid, up_oid)
         .map_err(|e| e.to_string())?;
-    if ahead > 0 {
+    if ahead > 0 && behind > 0 {
+        if rebase_if_diverged {
+            if status_of(&repo).dirty > 0 {
+                return Ok((OpOutcome::Skipped(SKIP_DIRTY.into()), Vec::new()));
+            }
+            if repo.state() != RepositoryState::Clean {
+                return Err(
+                    "merge or rebase already in progress — open in IDE to finish or abort".into(),
+                );
+            }
+            drop(upstream);
+            drop(repo);
+            return rebase_onto_upstream(path, local_oid, ahead, behind);
+        }
         return Ok((OpOutcome::Skipped(SKIP_DIVERGED.into()), Vec::new()));
     }
     if behind == 0 {
@@ -356,6 +379,46 @@ pub fn pull_with_files(path: &str) -> Result<(OpOutcome, Vec<String>), String> {
         format!("fast-forwarded {behind}")
     } else {
         format!("fast-forwarded {behind} ({n} files)")
+    };
+    Ok((OpOutcome::Done(detail), files))
+}
+
+/// Replay local commits onto the already-fetched upstream. Keeps empty commits
+/// (`--empty=keep`) so a CI-trigger empty commit still sits on the new tip.
+/// On conflict, abort so the tree is not left mid-rebase.
+fn rebase_onto_upstream(
+    path: &str,
+    old_oid: git2::Oid,
+    ahead: usize,
+    behind: usize,
+) -> Result<(OpOutcome, Vec<String>), String> {
+    let mut result = run_command(path, "git rebase --empty=keep @{upstream}")?;
+    if !result.ok
+        && (result.output_tail.contains("unknown option")
+            || result.output_tail.contains("invalid option"))
+    {
+        result = run_command(path, "git rebase @{upstream}")?;
+    }
+    if !result.ok {
+        let _ = run_command(path, "git rebase --abort");
+        let tail = result.output_tail.trim();
+        let extra = if tail.is_empty() {
+            String::new()
+        } else {
+            format!(" — {tail}")
+        };
+        return Err(format!(
+            "rebase conflict — open in IDE ({ahead} ahead, {behind} behind){extra}"
+        ));
+    }
+    let repo = Repository::open(path).map_err(|e| e.to_string())?;
+    let new_oid = repo.head().ok().and_then(|h| h.target()).unwrap_or(old_oid);
+    let files = tree_diff_paths(&repo, old_oid, new_oid);
+    let n = files.len();
+    let detail = if n == 0 {
+        format!("rebased {ahead} onto {behind}")
+    } else {
+        format!("rebased {ahead} onto {behind} ({n} files)")
     };
     Ok((OpOutcome::Done(detail), files))
 }
@@ -2269,6 +2332,56 @@ mod tests {
             .peel_to_commit()
             .unwrap();
         assert_eq!(tip.summary(), Some("add a"));
+    }
+
+    fn clone_workdir(bare: &std::path::Path) -> (tempfile::TempDir, String) {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("wt");
+        let dest_s = dest.to_string_lossy().into_owned();
+        clone(&bare.to_string_lossy(), &dest_s).unwrap();
+        let repo = Repository::open(&dest_s).unwrap();
+        let mut cfg = repo.config().unwrap();
+        cfg.set_str("user.name", "t").unwrap();
+        cfg.set_str("user.email", "t@t").unwrap();
+        (dir, dest_s)
+    }
+
+    #[test]
+    fn pull_rebases_diverged_empty_commit_when_allowed() {
+        let (_dir, path) = init_repo();
+        let bare = add_bare_origin(&path);
+        push(&path).unwrap();
+
+        let (_other_dir, other) = clone_workdir(bare.path());
+        commit_file(&other, "up1.txt", "1", "upstream 1");
+        commit_file(&other, "up2.txt", "2", "upstream 2");
+        push(&other).unwrap();
+
+        commit_empty(&path, "Empty commit").unwrap();
+
+        assert!(
+            matches!(pull(&path), Ok(OpOutcome::Skipped(r)) if r == SKIP_DIVERGED),
+            "fast-forward pull must still refuse diverged history"
+        );
+
+        let (out, files) = pull_with_files(&path, true).unwrap();
+        let OpOutcome::Done(s) = out else {
+            panic!("expected rebased Done");
+        };
+        assert!(s.contains("rebased"), "got: {s}");
+        assert!(
+            files.iter().any(|f| f == "up1.txt" || f == "up2.txt"),
+            "rebase should report upstream files, got {files:?}"
+        );
+
+        let st = status_of(&Repository::open(&path).unwrap());
+        assert_eq!(st.behind, 0, "should sit on upstream after rebase");
+        assert_eq!(st.dirty, 0);
+        assert!(
+            st.ahead <= 1,
+            "empty commit kept (1) or dropped (0), got ahead {}",
+            st.ahead
+        );
     }
 
     #[test]

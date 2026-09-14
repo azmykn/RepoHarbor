@@ -192,6 +192,7 @@ impl Default for AppConfig {
             notify_agent_finished: true,
             sidebar_width: crate::model::default_sidebar_width(),
             sidebar_collapsed: false,
+            layout: crate::model::MissionControlLayout::List,
             workspace_groups: Vec::new(),
             active_workspace_group: None,
             pull_only_prefixes: Vec::new(),
@@ -352,6 +353,37 @@ mod tests {
             || cfg.agent_command == "xterm"
             || cfg.agent_command.starts_with("xdg-terminal-exec");
         assert!(ok, "unexpected agent command: {}", cfg.agent_command);
+        assert_eq!(
+            cfg.layout,
+            crate::model::MissionControlLayout::List,
+            "Mission Control defaults to compact list, not cards"
+        );
+    }
+
+    #[test]
+    fn missing_layout_field_deserializes_to_list() {
+        let text = toml::to_string(&AppConfig::default()).expect("serialize");
+        let stripped: String = text
+            .lines()
+            .filter(|line| !line.starts_with("layout"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !stripped.contains("layout"),
+            "fixture must omit the layout key"
+        );
+        let parsed: AppConfig = toml::from_str(&stripped).expect("deserialize without layout");
+        assert_eq!(parsed.layout, crate::model::MissionControlLayout::List);
+    }
+
+    #[test]
+    fn explicit_grid_layout_is_kept() {
+        let mut cfg = AppConfig::default();
+        cfg.layout = crate::model::MissionControlLayout::Grid;
+        let text = toml::to_string(&cfg).expect("serialize");
+        assert!(text.contains("layout = \"grid\"") || text.contains("layout=\"grid\""));
+        let parsed: AppConfig = toml::from_str(&text).expect("deserialize");
+        assert_eq!(parsed.layout, crate::model::MissionControlLayout::Grid);
     }
 
     #[test]

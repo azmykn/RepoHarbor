@@ -101,6 +101,12 @@ weak signal for render-path changes — reason about layout/`shape_line` careful
 - **InputState needs a `Window`.** gpui-component text inputs are created in
   click/nav handlers that have a `&mut Window` (drawer/palette/settings/dialog
   open paths), not in render.
+- **Fleet Pull rebases pushable trees.** Diverged history (`ahead` and `behind`)
+  on repos *outside* `pull_only_prefixes` is recovered with
+  `git rebase --empty=keep @{upstream}` (never force-push). Pull-only
+  `core`/`custom` vendor trees stay fast-forward-only and still fail with
+  `diverged`. Rebase conflicts abort and Fail (“open in IDE”). Dirty trees
+  are not rewritten.
 - **Security in `forge.rs`:** a GitLab token is only ever sent to `gitlab.com` or an
   explicitly trusted self-hosted host — never to an arbitrary domain from a repo
   remote. Don't loosen this.

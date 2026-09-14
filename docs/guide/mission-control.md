@@ -1,6 +1,6 @@
 # Mission Control
 
-Mission Control is the home view: a windowed grid of every repo RepoHarbor found across your workspace roots. It's built to scale to hundreds of repos — the grid is virtualized, so only what's on screen is rendered.
+Mission Control is the home view: every repo RepoHarbor found across your workspace roots. It opens in **List** (compact rows) by default; **Grid** is the optional card layout. The list is virtualized, so only what's on screen is rendered.
 
 > **Screenshots:** re-capture from the native app after the RepoHarbor rebrand.
 > Avoid private remotes and machine-specific home paths in published images
@@ -24,19 +24,23 @@ The toolbar uses **work modes** instead of a dense all-filters chip strip:
 | Mode | Shows |
 |------|--------|
 | **Needs me** | Attention filter — repos that need action (reviews, dirty/unpushed work, behind, finished agents, …). A live **Agent running** session is not a Needs-me hit (the card keeps a terminal icon; it does not replace the git/commit line). Segment shows the count when &gt; 0. Empty state: **All clear**. |
-| **Behind** | Repos behind upstream. **Pull behind** stays on the toolbar to fleet-pull them. |
+| **Behind** | Repos behind upstream. **Pull behind** on the ops row fleet-pulls them. |
 | **Working** | Contextual chips: Dirty / Stageable / Pushable (no Commitable / Ahead duplicates). |
 | **All** | No git filter; optional Public / Private / Starred / Stale chips. |
 
-Also on the toolbar:
+Filter row (top):
 
 - **Filter…** — substring search over name / slug / path.
-- **Pull behind** — fleet-pulls every repo currently behind upstream.
-- **More ⋮** — Fetch all (host enrichment refresh) and Summarize (when local AI is ready).
 - **Sort: recent** / **Sort: name** — card ordering (not a heatmap toggle).
-- **Grid | List** — layout switch.
+- **Grid | List** — layout switch (List is the default; persisted in `config.toml` as `layout`).
 
-Row two holds select-all, **Actions ▾** (only when something is selected), and the mode's contextual chips.
+Ops row (bottom) — verbs that execute work, visible even with no selection:
+
+- **Refresh** — labeled accent control that re-scans workspace roots (git status, attention, grid). The same action is on the chrome bar next to **+**. A toast reports **Scanning…** then **Scan finished**.
+- **Pull behind** — fleet-pulls every repo currently behind upstream.
+- **Fetch all** — host enrichment refresh (ignores TTL).
+- **Summarize** — one-line AI summaries for every repo (when AI is ready).
+- Select-all plus **Fetch / Pull / Push / Submodules / Gen commit / Empty commit** and **Actions ▾** when something is selected.
 
 ### Projects & saved views
 
@@ -51,16 +55,16 @@ Roots & Languages in the sidebar still filter by workspace root and detected lan
 
 Each card has a checkbox; select one or more (or use the toolbar's select-all) to bring up the **fleet bar** for batch git operations across the selection. See [Fleet operations](./fleet).
 
-**Actions ▾** appears next to select-all only when there is a selection; it runs the same fleet ops (Fetch, Pull, Stage, Commit, Discard, Submodule Update, …). Keyboard shortcuts on the current selection:
+**Actions ▾** appears on the ops row only when there is a selection; it runs the same fleet ops (Fetch, Pull, Stage, Commit, Discard, Submodule Update, …). Keyboard shortcuts on the current selection:
 
 - <kbd>Ctrl/Cmd+Shift+F</kbd> — Fetch selected
 - <kbd>Ctrl/Cmd+Shift+P</kbd> — Pull selected
 
-**Pull behind** (toolbar / command palette) selects every repo with `behind > 0` and fleet-pulls them — useful for upstream Odoo/core trees you keep current without hunting the Behind mode. Pair with **pull-only prefixes** in Settings so those trees never offer Push and upstream CI / local-only Ahead stay off Needs me (silence — you'll only hear about a push if one is attempted and fails).
+**Pull behind** (ops row / command palette) selects every repo with `behind > 0` and fleet-pulls them — useful for upstream Odoo/core trees you keep current without hunting the Behind mode. Pair with **pull-only prefixes** in Settings so those trees never offer Push and upstream CI / local-only Ahead stay off Needs me (silence — you'll only hear about a push if one is attempted and fails).
 
 ## List view
 
-Switch to a compact, single-line view from the Grid | List control — useful when you're scanning a lot of repos at once.
+List is the default home layout: compact single-line rows. Switch to **Grid** for cards. The choice is saved in `~/.config/repoharbor/config.toml` (`layout = "list"` or `"grid"`). Parent → submodule browsing is the sidebar **TREE** section, not this switch.
 
 ## The repo drawer
 

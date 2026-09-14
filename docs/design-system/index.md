@@ -200,8 +200,10 @@ no starfield, no glow.
 There are **no CSS classes** — every surface is a GPUI element styled inline from
 the `Theme` tokens. The catalog by source file:
 
-- **Shell** (`shell.rs`) — the 52px header (brand, roots·repos, search, +/rescan),
-  the left nav rail, the main column + view switch.
+- **Shell** (`shell.rs`) — the 52px header (brand, roots·repos, search, + / labeled Refresh),
+  the left nav rail, the main column + view switch. Mission Control splits a
+  **filter row** (search, work modes, visibility chips, sort, layout) from an
+  **ops row** (Refresh, Pull behind, Fetch all, Summarize, selection fleet).
 - **Repo card** (`card.rs`) — name/host/slug/description, git status row,
   language mark, the four launch actions, favourite + AI accents.
 - **Repo drawer** (`drawer.rs`) — the right sheet: Overview / Changes / PR / Notes

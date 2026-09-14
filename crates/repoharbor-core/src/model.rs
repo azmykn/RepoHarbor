@@ -198,6 +198,10 @@ pub struct AppConfig {
     /// Icon-only left rail when true.
     #[serde(default)]
     pub sidebar_collapsed: bool,
+    /// Mission Control home layout: compact list (default) or card grid.
+    /// TREE (parent → submodule) is a sidebar, not this switch.
+    #[serde(default)]
+    pub layout: MissionControlLayout,
     /// Named repo groups (path prefixes) for bulk Fetch/Pull.
     #[serde(default)]
     pub workspace_groups: Vec<WorkspaceGroup>,
@@ -214,6 +218,17 @@ pub struct AppConfig {
     /// / `code` / `xdg-open`.
     #[serde(default = "default_diff_command")]
     pub diff_command: String,
+}
+
+/// Mission Control repo layout (persisted in `config.toml` as `layout`).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum MissionControlLayout {
+    /// Multi-column cards.
+    Grid,
+    /// Compact single-column rows (the default home view).
+    #[default]
+    List,
 }
 
 /// A named set of repos matched by absolute path prefixes (e.g. odoo19/core).

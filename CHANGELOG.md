@@ -12,6 +12,23 @@ versioned trees, including nested submodule parents).
 
 ### Changed
 
+- **Fleet Pull rebases diverged pushable repos** — a clean tree that is both
+  ahead and behind (e.g. one local empty commit + upstream commits) is
+  recovered with `git rebase --empty=keep` onto upstream instead of failing
+  `diverged`. Pull-only vendor trees (`core` / `custom`) stay fast-forward
+  only. Conflicts abort the rebase and fail with an open-in-IDE message;
+  never force-push.
+- **Mission Control chrome** — top row is filters only (search, work modes,
+  Public / Private / Starred / Stale, Working chips, Sort, Grid | List). The
+  bottom row is execute ops: always-on **Refresh**, **Pull behind**, **Fetch
+  all**, and **Summarize** (when AI is ready); selection Fetch / Pull / Push /
+  Submodules / Gen commit / Empty commit / Actions when something is checked.
+  **More ⋮** is gone from the filter row.
+- **Mission Control Refresh** — labeled icon+text **Refresh** on the ops row
+  (accent wash / `fg0`) and chrome bar; click re-scans roots and toasts when
+  the grid is updated.
+- **Toast dismiss** — right-click or middle-click closes an in-app toast; left-click still opens the notice and dismisses.
+- **Mission Control defaults to List** — compact rows (not card Grid) on first launch and whenever `config.toml` has no `layout` key. The Grid | List control still persists an explicit choice (`layout = "list"` / `"grid"`). TREE stays a sidebar.
 - **Needs me ignores live agents** — a running `cursor-agent` / `claude` /
   … session no longer puts a repo on **Needs me** or replaces the card
   subtitle with “Let it finish”. The terminal icon still marks the session;
@@ -23,9 +40,9 @@ versioned trees, including nested submodule parents).
 - **Mission Control work modes** — toolbar segmented control **Needs me |
   Behind | Working | All** replaces the dense chip strip. Needs me shows the
   attention count; Working offers Dirty / Stageable / Pushable only; All offers
-  Public / Private / Starred / Stale. **Fetch all** / **Summarize** move under
-  **More ⋮**; **Actions** appears only with a selection; sort labels are
-  **Sort: recent** / **Sort: name** (heatmap stays hidden).
+  Public / Private / Starred / Stale. **Fetch all** / **Summarize** sit on the
+  ops row (not under **More**); **Actions** appears only with a selection; sort
+  labels are **Sort: recent** / **Sort: name** (heatmap stays hidden).
 - **Brand icon** — new harbor + repo-stack mark (SVG + packaging PNGs + tray
   glyphs); default accent aligned to harbor teal `#1dd3c4`.
 - **Docs shots** — removed Orrery-branded screenshots from `docs/public/shots/`

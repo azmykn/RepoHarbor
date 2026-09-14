@@ -683,6 +683,8 @@ mod tests {
         // Empty open: lean defaults — no toolbar-duplicate Fetch/Pull all.
         assert!(!listed("", false, PaletteAction::FetchAll));
         assert!(!listed("", false, PaletteAction::PullBehind));
+        assert!(listed("", false, PaletteAction::Rescan));
+        assert!(listed("refresh", false, PaletteAction::Rescan));
         assert!(listed("", false, PaletteAction::SelectDirty));
         assert!(listed("", false, PaletteAction::SelectBehind));
         assert!(!listed("", false, PaletteAction::FetchSelected));

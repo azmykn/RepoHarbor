@@ -13,6 +13,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Mutex;
 
 use crate::git_ops::{self, OpOutcome};
+use crate::model::path_is_pull_only;
 
 /// Per-repo outcome of a fleet operation.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -168,34 +169,41 @@ pub fn fetch_op() -> impl Fn(&str) -> Outcome + Sync {
 pub type PullFileSink = std::sync::Arc<std::sync::Mutex<Vec<(String, Vec<String>)>>>;
 
 /// Fleet pull via [`git_ops::pull_with_files`]. Safety refusals where a pull was
-/// wanted but couldn't happen (diverged / dirty) are `Failed`; not-applicable
-/// states stay skips. Optionally records changed paths into `file_sink` for the
-/// UI sidebar (worker-safe).
+/// wanted but couldn't happen (diverged / dirty / rebase conflict) are `Failed`;
+/// not-applicable states stay skips. Pushable trees rebase onto upstream when
+/// histories diverged; pull-only prefixes stay fast-forward-only. Optionally
+/// records changed paths into `file_sink` for the UI sidebar (worker-safe).
 pub fn pull_op() -> impl Fn(&str) -> Outcome + Sync {
-    pull_op_collecting(None)
+    pull_op_collecting(None, Vec::new())
 }
 
 /// Like [`pull_op`], appending `(repo_path, changed_files)` into `file_sink`
-/// whenever a fast-forward actually moved files.
-pub fn pull_op_collecting(file_sink: Option<PullFileSink>) -> impl Fn(&str) -> Outcome + Sync {
-    move |path| match git_ops::pull_with_files(path) {
-        Ok((OpOutcome::Done(s), files)) => {
-            if !files.is_empty() {
-                if let Some(sink) = &file_sink {
-                    if let Ok(mut guard) = sink.lock() {
-                        guard.push((path.to_string(), files));
+/// whenever a fast-forward or rebase actually moved files.
+pub fn pull_op_collecting(
+    file_sink: Option<PullFileSink>,
+    pull_only_prefixes: Vec<String>,
+) -> impl Fn(&str) -> Outcome + Sync {
+    move |path| {
+        let rebase = !path_is_pull_only(path, &pull_only_prefixes);
+        match git_ops::pull_with_files(path, rebase) {
+            Ok((OpOutcome::Done(s), files)) => {
+                if !files.is_empty() {
+                    if let Some(sink) = &file_sink {
+                        if let Ok(mut guard) = sink.lock() {
+                            guard.push((path.to_string(), files));
+                        }
                     }
                 }
+                Outcome::Ok(s)
             }
-            Outcome::Ok(s)
+            Ok((OpOutcome::Skipped(r), _))
+                if r == git_ops::SKIP_DIVERGED || r == git_ops::SKIP_DIRTY =>
+            {
+                Outcome::Failed(r)
+            }
+            Ok((OpOutcome::Skipped(r), _)) => Outcome::Skipped(r),
+            Err(e) => Outcome::Failed(e),
         }
-        Ok((OpOutcome::Skipped(r), _))
-            if r == git_ops::SKIP_DIVERGED || r == git_ops::SKIP_DIRTY =>
-        {
-            Outcome::Failed(r)
-        }
-        Ok((OpOutcome::Skipped(r), _)) => Outcome::Skipped(r),
-        Err(e) => Outcome::Failed(e),
     }
 }
 
@@ -612,6 +620,45 @@ mod tests {
             .results
             .iter()
             .all(|r| matches!(&r.outcome, Outcome::Ok(s) if s.starts_with("fetched"))));
+    }
+
+    #[test]
+    fn pull_op_rebases_diverged_pushable_and_fails_pull_only() {
+        use crate::git_ops::{self, OpOutcome, SKIP_DIVERGED};
+
+        let (_dir, path) = init_repo();
+        let bare = tempfile::tempdir().unwrap();
+        git2::Repository::init_bare(bare.path()).unwrap();
+        git2::Repository::open(&path)
+            .unwrap()
+            .remote("origin", &bare.path().to_string_lossy())
+            .unwrap();
+        git_ops::push(&path).unwrap();
+
+        let other_dir = tempfile::tempdir().unwrap();
+        let other = other_dir.path().join("wt");
+        let other_s = other.to_string_lossy().into_owned();
+        git_ops::clone(&bare.path().to_string_lossy(), &other_s).unwrap();
+        {
+            let repo = git2::Repository::open(&other_s).unwrap();
+            let mut cfg = repo.config().unwrap();
+            cfg.set_str("user.name", "t").unwrap();
+            cfg.set_str("user.email", "t@t").unwrap();
+        }
+        std::fs::write(other.join("up.txt"), "u").unwrap();
+        git_ops::stage_paths(&other_s, &["up.txt".into()]).unwrap();
+        git_ops::commit(&other_s, "upstream").unwrap();
+        git_ops::push(&other_s).unwrap();
+        git_ops::commit_empty(&path, "Empty commit").unwrap();
+
+        let pull_only = pull_op_collecting(None, vec![path.clone()]);
+        assert_eq!(pull_only(&path), Outcome::Failed(SKIP_DIVERGED.into()));
+
+        match pull_op()(&path) {
+            Outcome::Ok(s) => assert!(s.contains("rebased"), "got: {s}"),
+            other => panic!("pushable fleet pull should rebase, got {other:?}"),
+        }
+        assert!(matches!(git_ops::pull(&path), Ok(OpOutcome::Done(_))));
     }
 
     #[test]

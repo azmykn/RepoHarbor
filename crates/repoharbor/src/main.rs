@@ -149,6 +149,7 @@ fn main() {
                         // plus the watcher handle (re-armed when repos are
                         // added).
                         let (tray, watcher) = live::spawn(cx);
+                        let layout = config.layout;
                         RepoHarborApp {
                             view: View::Grid,
                             rows: snap.rows,
@@ -205,7 +206,10 @@ fn main() {
                             toasts: Vec::new(),
                             toast_seq: 0,
                             activity_log: Default::default(),
-                            grid: Default::default(),
+                            grid: crate::shell::GridState {
+                                layout,
+                                ..Default::default()
+                            },
                             view_filter: None,
                             focus: cx.focus_handle(),
                             sidebar_width,
