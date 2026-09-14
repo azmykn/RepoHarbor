@@ -23,7 +23,7 @@ The toolbar uses **work modes** instead of a dense all-filters chip strip:
 
 | Mode | Shows |
 |------|--------|
-| **Needs me** | Attention filter — repos that need action (reviews, dirty work, behind, …). Segment shows the count when &gt; 0. Empty state: **All clear**. |
+| **Needs me** | Attention filter — repos that need action (reviews, dirty/unpushed work, behind, finished agents, …). A live **Agent running** session is not a Needs-me hit (the card keeps a terminal icon; it does not replace the git/commit line). Segment shows the count when &gt; 0. Empty state: **All clear**. |
 | **Behind** | Repos behind upstream. **Pull behind** stays on the toolbar to fleet-pull them. |
 | **Working** | Contextual chips: Dirty / Stageable / Pushable (no Commitable / Ahead duplicates). |
 | **All** | No git filter; optional Public / Private / Starred / Stale chips. |

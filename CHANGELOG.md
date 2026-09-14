@@ -12,6 +12,11 @@ versioned trees, including nested submodule parents).
 
 ### Changed
 
+- **Needs me ignores live agents** — a running `cursor-agent` / `claude` /
+  … session no longer puts a repo on **Needs me** or replaces the card
+  subtitle with “Let it finish”. The terminal icon still marks the session;
+  dirty / ahead / commit status stay visible. **Agent finished** still needs
+  you.
 - **Mission Control work modes** — toolbar segmented control **Needs me |
   Behind | Working | All** replaces the dense chip strip. Needs me shows the
   attention count; Working offers Dirty / Stageable / Pushable only; All offers

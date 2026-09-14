@@ -127,6 +127,14 @@ impl AttentionKind {
             AttentionKind::AgentRunning => "Let it finish",
         }
     }
+
+    /// Whether this kind belongs on Mission Control's **Needs me** filter and
+    /// may replace the card subtitle. `AgentRunning` is a live readout (the
+    /// card already shows a terminal icon) — not a call to action, and it
+    /// must not hide dirty / ahead / commit status.
+    pub fn needs_me(self) -> bool {
+        !matches!(self, AttentionKind::AgentRunning)
+    }
 }
 
 /// How an attention item points back at a repo. Local facts carry the stable
@@ -813,6 +821,8 @@ mod tests {
             (AgentRunning, Severity::Info),
         ] {
             assert_eq!(kind.severity(), severity, "{kind:?}");
+            let expect_needs_me = kind != AgentRunning;
+            assert_eq!(kind.needs_me(), expect_needs_me, "{kind:?}");
         }
     }
 

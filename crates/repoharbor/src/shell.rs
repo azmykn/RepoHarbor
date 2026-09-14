@@ -76,9 +76,10 @@ pub enum RepoFilter {
     Behind,
     Starred,
     Stale,
-    /// Repos with at least one attention item (`repoharbor_core::attention`) —
-    /// dirty/unpushed, review requests, prunable branches, agent sessions, ….
-    /// Driven by the Needs me work mode.
+    /// Repos with at least one *actionable* attention item
+    /// (`AttentionKind::needs_me`) — dirty/unpushed, reviews, finished
+    /// agents, …. Live `AgentRunning` sessions stay off this filter (terminal
+    /// icon only). Driven by the Needs me work mode.
     Attention,
 }
 
@@ -656,6 +657,7 @@ fn attention_reason_chips(
     for item in items
         .iter()
         .filter(|i| i.repo.id.as_deref() == Some(repo_id.as_ref()))
+        .filter(|i| i.kind.needs_me())
     {
         if !seen.insert(item.kind) {
             continue;
@@ -684,6 +686,22 @@ fn attention_reason_chips(
         }
     }
     (chips, more, subtitle)
+}
+
+/// Per-repo highest Needs-me severity. Live `AgentRunning` items are omitted
+/// so they don't inflate the filter count or rank a quiet repo into Needs me.
+fn index_needs_me(items: &[AttentionItem]) -> std::collections::HashMap<SharedString, Severity> {
+    let mut map = std::collections::HashMap::new();
+    for item in items {
+        if !item.kind.needs_me() {
+            continue;
+        }
+        if let Some(id) = &item.repo.id {
+            map.entry(SharedString::from(id.clone()))
+                .or_insert(item.severity);
+        }
+    }
+    map
 }
 
 /// Fold the ranked attention list into the tray's compact summary: actionable
@@ -914,15 +932,9 @@ impl RepoHarborApp {
         self.attention_items =
             attention::apply_pull_only_policy(raw, &self.config.pull_only_prefixes);
         // Items are severity-sorted (Urgent first), so a repo's first
-        // occurrence is its highest severity.
-        self.attention_by_repo.clear();
-        for item in &self.attention_items {
-            if let Some(id) = &item.repo.id {
-                self.attention_by_repo
-                    .entry(SharedString::from(id.clone()))
-                    .or_insert(item.severity);
-            }
-        }
+        // Needs-me occurrence is its highest actionable severity. Live agent
+        // sessions are a readout, not a filter hit.
+        self.attention_by_repo = index_needs_me(&self.attention_items);
         self.push_tray_attention();
         self.notify_fresh_urgent();
     }
@@ -4130,7 +4142,7 @@ impl RepoHarborApp {
         cx.notify();
     }
 
-    /// How many repos currently have at least one attention item.
+    /// How many repos currently have at least one Needs-me attention item.
     fn attention_count(&self) -> usize {
         self.attention_by_repo.len()
     }
@@ -6883,6 +6895,44 @@ mod tests {
         let quiet = SharedString::from("/missing");
         let (chips, more, subtitle) = attention_reason_chips(&items, &quiet);
         assert!(chips.is_empty() && more == 0 && subtitle.is_none());
+    }
+
+    #[test]
+    fn live_agent_readout_skips_needs_me_index_and_subtitle() {
+        let running = item(AttentionKind::AgentRunning, "a", Some("/a"));
+        let dirty = item(AttentionKind::DirtyWorktree, "a", Some("/a"));
+        let only_running = vec![running.clone()];
+        let mixed = vec![running, dirty];
+
+        let map = index_needs_me(&only_running);
+        assert!(
+            map.is_empty(),
+            "AgentRunning alone must not land a repo on Needs me"
+        );
+        let map = index_needs_me(&mixed);
+        assert_eq!(
+            map.get(&SharedString::from("/a")).copied(),
+            Some(Severity::Attention)
+        );
+
+        let id = SharedString::from("/a");
+        let (chips, more, subtitle) = attention_reason_chips(&only_running, &id);
+        assert!(
+            chips.is_empty() && more == 0 && subtitle.is_none(),
+            "Agent running must not replace the git/commit line"
+        );
+        let (chips, more, subtitle) = attention_reason_chips(&mixed, &id);
+        assert_eq!(
+            chips.iter().map(|(l, _)| l.as_ref()).collect::<Vec<_>>(),
+            vec!["Uncommitted changes"]
+        );
+        assert_eq!(more, 0);
+        assert!(
+            subtitle
+                .as_ref()
+                .is_some_and(|s| s.as_ref().contains("DirtyWorktree")),
+            "next actionable kind becomes the subtitle"
+        );
     }
 
     #[test]
