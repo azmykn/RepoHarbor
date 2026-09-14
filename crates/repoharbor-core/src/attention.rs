@@ -355,7 +355,8 @@ pub fn compute(
 }
 
 /// Apply pull-only / upstream policy: silence CI you can't fix (no card chip),
-/// rewrite Ahead copy so Push isn't implied, and reinforce Behind → Pull.
+/// drop Ahead (local-only commits are not a call to push), and reinforce
+/// Behind → Pull.
 pub fn apply_pull_only_policy(
     items: Vec<AttentionItem>,
     pull_only_prefixes: &[String],
@@ -370,15 +371,10 @@ pub fn apply_pull_only_policy(
                 // Pull-only trees: drop CI entirely — don't demote to UpstreamCi
                 // chips / subtitles. Surface push problems only when a push fails.
                 AttentionKind::CiFailing | AttentionKind::UpstreamCi if pull_only => None,
-                AttentionKind::Ahead if pull_only => {
-                    item.summary = item
-                        .summary
-                        .replace("not pushed", "local only — don't push");
-                    if item.detail.is_none() {
-                        item.detail = Some("upstream / pull-only checkout".into());
-                    }
-                    Some(item)
-                }
+                // Same for Ahead: "don't push" is not Needs me. The git ↑ count
+                // on the card still shows local commits; they just aren't work
+                // waiting on you.
+                AttentionKind::Ahead if pull_only => None,
                 AttentionKind::Behind => {
                     if !item.summary.to_lowercase().contains("pull") {
                         item.summary = format!("{} — Pull to update", item.summary);
@@ -871,7 +867,7 @@ mod tests {
     }
 
     #[test]
-    fn pull_only_policy_drops_ci_and_rewrites_ahead_behind() {
+    fn pull_only_policy_drops_ci_and_ahead_rewrites_behind() {
         let items = vec![
             item(
                 local_ref(&repo("/work/core/enterprise")),
@@ -906,16 +902,13 @@ mod tests {
         ];
         let prefixes = vec!["/work/core".into()];
         let out = apply_pull_only_policy(items, &prefixes);
-        assert_eq!(out.len(), 3, "pull-only CI items dropped");
+        assert_eq!(out.len(), 2, "pull-only CI and Ahead items dropped");
         assert!(!out.iter().any(|i| {
-            matches!(i.kind, AttentionKind::CiFailing | AttentionKind::UpstreamCi)
-                && i.repo.id.as_deref() == Some("/work/core/enterprise")
+            matches!(
+                i.kind,
+                AttentionKind::CiFailing | AttentionKind::UpstreamCi | AttentionKind::Ahead
+            ) && i.repo.id.as_deref() == Some("/work/core/enterprise")
         }));
-        let ahead = out
-            .iter()
-            .find(|i| i.kind == AttentionKind::Ahead)
-            .expect("ahead kept");
-        assert!(ahead.summary.contains("don't push"));
         let behind = out
             .iter()
             .find(|i| i.kind == AttentionKind::Behind)

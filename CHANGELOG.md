@@ -17,6 +17,9 @@ versioned trees, including nested submodule parents).
   subtitle with “Let it finish”. The terminal icon still marks the session;
   dirty / ahead / commit status stay visible. **Agent finished** still needs
   you.
+- **Needs me ignores pull-only Ahead** — vendor / `core` / `custom` checkouts
+  with local-only commits (e.g. `odoopim`) no longer raise **Not pushed** /
+  “Push when ready”. The git ↑ count stays on the card; Push stays hidden.
 - **Mission Control work modes** — toolbar segmented control **Needs me |
   Behind | Working | All** replaces the dense chip strip. Needs me shows the
   attention count; Working offers Dirty / Stageable / Pushable only; All offers
