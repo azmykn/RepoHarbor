@@ -3014,13 +3014,13 @@ impl RepoHarborApp {
                 continue;
             }
             self.config.mute_attention_prefixes.push(store.clone());
-            if let Some(s) = &mut self.settings {
-                if !s.draft.mute_attention_prefixes.iter().any(|p| {
+            if let Some(s) = &mut self.settings
+                && !s.draft.mute_attention_prefixes.iter().any(|p| {
                     repoharbor_core::scan::expand(p) == repoharbor_core::scan::expand(&store)
-                }) {
-                    s.draft.mute_attention_prefixes.push(store);
-                    s.saved = false;
-                }
+                })
+            {
+                s.draft.mute_attention_prefixes.push(store);
+                s.saved = false;
             }
             added += 1;
         }

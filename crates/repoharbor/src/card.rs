@@ -649,6 +649,7 @@ pub fn card(
 
 /// A compact single-row repo entry for the list layout — the same data and
 /// launchers as the grid card, laid out horizontally in one fixed-height row.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn list_item(
     row: &Row,
     idx: usize,
