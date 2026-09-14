@@ -20,12 +20,17 @@ pub(crate) struct FleetMenuCaps {
     /// entirely vendor / upstream.
     pub has_pushable_path: bool,
     pub has_submodules: bool,
+    /// At least one target is not yet on `mute_attention_prefixes`.
+    pub has_unmuted: bool,
 }
 
 /// Compute menu enablement from the live grid rows for `targets`.
 pub(crate) fn fleet_menu_caps(app: &RepoHarborApp, targets: &[String]) -> FleetMenuCaps {
     let mut caps = FleetMenuCaps::default();
     for id in targets {
+        if !app.is_attention_muted(id) {
+            caps.has_unmuted = true;
+        }
         let Some(row) = app.rows.iter().find(|r| r.id.as_ref() == id.as_str()) else {
             continue;
         };
@@ -227,6 +232,24 @@ pub(crate) fn fill_fleet_actions_menu(
                     this.start_fleet_reset(cx);
                 });
             }),
+    );
+    m = m.separator();
+
+    // ── Attention mute ─────────────────────────────────────────────────────
+    let mute_on = on && opts.caps.has_unmuted;
+    let (a, r) = (app.clone(), repos.clone());
+    m = m.item(
+        PopupMenuItem::new(if opts.caps.has_unmuted {
+            "Mute attention"
+        } else {
+            "Mute attention (already muted)"
+        })
+        .disabled(!mute_on)
+        .on_click(move |_, _, cx| {
+            a.update(cx, |this, cx| {
+                this.mute_attention_for_repos(&r, cx);
+            });
+        }),
     );
     m = m.separator();
 

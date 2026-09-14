@@ -10,6 +10,15 @@ and this project (upstream) uses calendar versioning (`YYYY.M.P`).
 DigitsCode RepoHarbor — multi-repo workspaces (hundreds of checkouts across
 versioned trees, including nested submodule parents).
 
+### Added
+
+- **Mute attention paths** — Settings → Workspace lists `muteAttentionPrefixes`
+  (absolute or `~`-expandable). Repos under those prefixes are excluded from
+  Needs me, attention chips, and tray actionable items without editing anything
+  inside the repo. Right-click / Actions → **Mute attention** appends the
+  selected path(s). Pull-only still only silences Ahead + upstream CI; dirty
+  vendor trees (e.g. `odooplm` under `custom/`) need an explicit mute.
+
 ### Fixed
 
 - **Needs me no longer lies about an empty list** — submodule children that

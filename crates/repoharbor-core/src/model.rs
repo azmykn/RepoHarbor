@@ -213,6 +213,11 @@ pub struct AppConfig {
     /// demote upstream CI to Info and hide Push; Behind still prompts Pull.
     #[serde(default)]
     pub pull_only_prefixes: Vec<String>,
+    /// Absolute path prefixes (or `~`-expandable) whose repos are excluded
+    /// from Needs me / attention chips / tray actionable items entirely.
+    /// Does not edit files inside the repo — mute is local to RepoHarbor.
+    #[serde(default)]
+    pub mute_attention_prefixes: Vec<String>,
     /// External diff/merge tool for the Changes drawer. `{path}` = repo dir;
     /// `{file}` = selected relative path when available. Empty → detect `meld`
     /// / `code` / `xdg-open`.
@@ -240,9 +245,9 @@ pub struct WorkspaceGroup {
     pub prefixes: Vec<String>,
 }
 
-/// True when `path` is under any configured pull-only prefix (upstream /
-/// vendor trees you update with Pull and never Push).
-pub fn path_is_pull_only(path: &str, prefixes: &[String]) -> bool {
+/// True when `path` equals or is nested under any of `prefixes`
+/// (trailing `/` ignored; empty prefixes never match).
+pub fn path_under_prefixes(path: &str, prefixes: &[String]) -> bool {
     if prefixes.is_empty() {
         return false;
     }
@@ -251,6 +256,18 @@ pub fn path_is_pull_only(path: &str, prefixes: &[String]) -> bool {
         let p = p.trim_end_matches('/');
         !p.is_empty() && (path == p || path.starts_with(&format!("{p}/")))
     })
+}
+
+/// True when `path` is under any configured pull-only prefix (upstream /
+/// vendor trees you update with Pull and never Push).
+pub fn path_is_pull_only(path: &str, prefixes: &[String]) -> bool {
+    path_under_prefixes(path, prefixes)
+}
+
+/// True when `path` is under a mute-attention prefix (no Needs me / chips /
+/// tray items for that local checkout).
+pub fn path_is_attention_muted(path: &str, prefixes: &[String]) -> bool {
+    path_under_prefixes(path, prefixes)
 }
 
 pub(crate) fn default_sidebar_width() -> f32 {
@@ -295,15 +312,23 @@ pub fn default_diff_command() -> String {
 }
 
 #[cfg(test)]
-mod pull_only_tests {
-    use super::path_is_pull_only;
+mod path_prefix_tests {
+    use super::{path_is_attention_muted, path_is_pull_only, path_under_prefixes};
 
     #[test]
-    fn path_is_pull_only_matches_prefix() {
+    fn path_under_prefixes_matches_prefix() {
         let prefixes = vec!["/home/u/odoo/core".into()];
+        assert!(path_under_prefixes(
+            "/home/u/odoo/core/enterprise",
+            &prefixes
+        ));
+        assert!(path_under_prefixes("/home/u/odoo/core", &prefixes));
+        assert!(!path_under_prefixes("/home/u/odoo/digits/myapp", &prefixes));
+        assert!(!path_under_prefixes("/home/u/odoo/corex", &prefixes));
         assert!(path_is_pull_only("/home/u/odoo/core/enterprise", &prefixes));
-        assert!(path_is_pull_only("/home/u/odoo/core", &prefixes));
-        assert!(!path_is_pull_only("/home/u/odoo/digits/myapp", &prefixes));
-        assert!(!path_is_pull_only("/home/u/odoo/corex", &prefixes));
+        assert!(path_is_attention_muted(
+            "/home/u/odoo/custom/noisy",
+            &["/home/u/odoo/custom/noisy".into()]
+        ));
     }
 }

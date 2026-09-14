@@ -65,6 +65,8 @@ pub struct SettingsState {
     pub add_root: Entity<InputState>,
     /// Typed path to append to `draft.pull_only_prefixes`.
     pub add_pull_only: Entity<InputState>,
+    /// Typed path to append to `draft.mute_attention_prefixes`.
+    pub add_mute_attention: Entity<InputState>,
     /// External diff tool template (`{path}` / `{file}`).
     pub diff_command: Entity<InputState>,
     /// Scan depth as a NumberInput (integer 1–8).
@@ -126,6 +128,7 @@ impl SettingsState {
             ignore: field(window, cx, "node_modules, .cache", &cfg.ignore.join(", ")),
             add_root: field(window, cx, "~/Projects or ~/code/my-app", ""),
             add_pull_only: field(window, cx, "~/Projects/upstream/core", ""),
+            add_mute_attention: field(window, cx, "~/odoo/…/noisy-repo", ""),
             diff_command: field(window, cx, "meld {path}", &cfg.diff_command),
             scan_depth: cx.new(|cx| {
                 InputState::new(window, cx)
@@ -633,6 +636,99 @@ fn roots_section(s: &SettingsState, t: &Theme, app: &Entity<RepoHarborApp>) -> i
                     .child(Input::new(&s.add_pull_only)),
             )
             .child(add_po),
+    );
+
+    // Mute-attention prefixes — silence Needs me for selected trees.
+    col = col.child(
+        div()
+            .mt(px(14.))
+            .mb(px(4.))
+            .text_size(px(t.text_data_sm))
+            .font_weight(gpui::FontWeight::SEMIBOLD)
+            .text_color(rgb(t.fg1))
+            .child("Mute attention paths"),
+    );
+    col = col.child(
+        div()
+            .text_size(px(t.text_data_sm))
+            .text_color(rgb(t.fg3))
+            .child(
+                "Repos under these prefixes never raise Needs me, attention chips, or tray alerts. Does not edit files inside the repo — local to RepoHarbor only.",
+            ),
+    );
+    for (i, prefix) in s.draft.mute_attention_prefixes.iter().enumerate() {
+        let remove = {
+            let app = app.clone();
+            let (hb, _) = (t.surface_hover, t.fg3);
+            div()
+                .id(SharedString::from(format!("ib-x-mute-attn-{i}")))
+                .flex()
+                .items_center()
+                .justify_center()
+                .w(px(24.))
+                .h(px(24.))
+                .rounded(px(t.r_xs))
+                .cursor_pointer()
+                .hover(move |s| s.bg(rgb(hb)))
+                .child(lucide("x", 13., t.fg3))
+                .on_click(move |_ev, _win, cx| {
+                    app.update(cx, |this, cx| this.settings_remove_mute_attention(i, cx));
+                })
+        };
+        col = col.child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(8.))
+                .child(lucide("bell", 13., t.fg3))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w(px(0.))
+                        .truncate()
+                        .font_family("monospace")
+                        .text_size(px(t.text_data_sm))
+                        .text_color(rgb(t.fg1))
+                        .child(SharedString::from(prefix.clone())),
+                )
+                .child(remove),
+        );
+    }
+    let add_mute = {
+        let app = app.clone();
+        let (hb, hf) = (t.border_strong, t.fg0);
+        div()
+            .id("btn-Add-mute-attention")
+            .px(px(14.))
+            .py(px(7.))
+            .rounded(px(t.r_sm))
+            .bg(rgb(t.button_bg))
+            .border_1()
+            .border_color(rgb(t.border))
+            .text_size(px(t.text_data_sm))
+            .text_color(rgb(t.fg1))
+            .cursor_pointer()
+            .hover(move |s| s.border_color(rgb(hb)).text_color(rgb(hf)))
+            .child("Add")
+            .on_click(move |_ev, window, cx| {
+                app.update(cx, |this, cx| this.settings_add_mute_attention(window, cx));
+            })
+    };
+    col = col.child(
+        div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(8.))
+            .mt(px(4.))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.))
+                    .child(Input::new(&s.add_mute_attention)),
+            )
+            .child(add_mute),
     );
 
     // Scan depth stepper + ignore field.

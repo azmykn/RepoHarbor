@@ -7,7 +7,7 @@ remote.
 
 | Path | Contents |
 |------|----------|
-| `~/.config/repoharbor/config.toml` | Roots, pull-only prefixes, AI/host settings. May list personal absolute paths. |
+| `~/.config/repoharbor/config.toml` | Roots, pull-only / mute-attention prefixes, AI/host settings. May list personal absolute paths. |
 | `~/.local/share/repoharbor/cache.sqlite` | Repo snapshot, favorites, host enrichment, CI cache. |
 | `~/.local/share/repoharbor/github_token` (or similar) | Host tokens — never share or commit. |
 

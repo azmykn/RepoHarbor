@@ -25,7 +25,7 @@ pub enum AttentionKind {
     /// The latest default-branch CI run failed.
     CiFailing,
     /// Upstream CI on a pull-only checkout. Kept for serde / label tables;
-    /// [`apply_pull_only_policy`] drops these (and `CiFailing`) so cards stay quiet.
+    /// [`apply_attention_policy`] drops these (and `CiFailing`) so cards stay quiet.
     UpstreamCi,
     /// A PR is waiting on your review.
     ReviewRequested,
@@ -354,18 +354,28 @@ pub fn compute(
     items
 }
 
-/// Apply pull-only / upstream policy: silence CI you can't fix (no card chip),
-/// drop Ahead (local-only commits are not a call to push), and reinforce
-/// Behind → Pull.
-pub fn apply_pull_only_policy(
+/// Apply attention policy:
+///
+/// - **Mute prefixes** — drop every item whose local path is under
+///   `mute_attention_prefixes` (full silence for Needs me / chips / tray).
+/// - **Pull-only prefixes** — silence CI you can't fix, drop Ahead (local-only
+///   commits are not a call to push), and reinforce Behind → Pull.
+///
+/// Pull-only does **not** drop Dirty / Behind / conflicts — use mute when a
+/// noisy vendor tree (dirty + ahead) should leave Needs me entirely.
+pub fn apply_attention_policy(
     items: Vec<AttentionItem>,
     pull_only_prefixes: &[String],
+    mute_attention_prefixes: &[String],
 ) -> Vec<AttentionItem> {
-    use crate::model::path_is_pull_only;
+    use crate::model::{path_is_attention_muted, path_is_pull_only};
     items
         .into_iter()
         .filter_map(|mut item| {
             let path = item.repo.id.as_deref().unwrap_or("");
+            if path_is_attention_muted(path, mute_attention_prefixes) {
+                return None;
+            }
             let pull_only = path_is_pull_only(path, pull_only_prefixes);
             match item.kind {
                 // Pull-only trees: drop CI entirely — don't demote to UpstreamCi
@@ -385,6 +395,15 @@ pub fn apply_pull_only_policy(
             }
         })
         .collect()
+}
+
+/// Backward-compatible wrapper: pull-only policy with an empty mute list.
+#[cfg(test)]
+pub fn apply_pull_only_policy(
+    items: Vec<AttentionItem>,
+    pull_only_prefixes: &[String],
+) -> Vec<AttentionItem> {
+    apply_attention_policy(items, pull_only_prefixes, &[])
 }
 
 fn item(
@@ -916,6 +935,55 @@ mod tests {
         assert!(behind.summary.contains("Pull to update"));
         assert!(out.iter().any(|i| i.kind == AttentionKind::CiFailing
             && i.repo.id.as_deref() == Some("/work/digits/mine")));
+    }
+
+    #[test]
+    fn mute_attention_prefixes_drop_all_kinds() {
+        let muted = "/work/custom/odoopim";
+        let items = vec![
+            item(
+                local_ref(&repo(muted)),
+                AttentionKind::DirtyWorktree,
+                "1 uncommitted change".into(),
+                None,
+            ),
+            item(
+                local_ref(&repo(muted)),
+                AttentionKind::Ahead,
+                "2 commits not pushed".into(),
+                None,
+            ),
+            item(
+                local_ref(&repo(muted)),
+                AttentionKind::Behind,
+                "1 commit behind upstream".into(),
+                None,
+            ),
+            item(
+                local_ref(&repo("/work/digits/mine")),
+                AttentionKind::DirtyWorktree,
+                "1 uncommitted change".into(),
+                None,
+            ),
+        ];
+        let mute = vec!["/work/custom/odoopim".into()];
+        let out = apply_attention_policy(items, &[], &mute);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].repo.id.as_deref(), Some("/work/digits/mine"));
+    }
+
+    #[test]
+    fn mute_leaves_paths_outside_prefix_unchanged() {
+        let items = vec![item(
+            local_ref(&repo("/work/custom/other")),
+            AttentionKind::DirtyWorktree,
+            "1 uncommitted change".into(),
+            None,
+        )];
+        let mute = vec!["/work/custom/odoopim".into()];
+        let out = apply_attention_policy(items, &[], &mute);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].kind, AttentionKind::DirtyWorktree);
     }
 
     #[test]

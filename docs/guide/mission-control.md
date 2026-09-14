@@ -62,6 +62,8 @@ Each card has a checkbox; select one or more (or use the toolbar's select-all) t
 
 **Pull behind** (ops row / command palette) selects every repo with `behind > 0` and fleet-pulls them — useful for upstream Odoo/core trees you keep current without hunting the Behind mode. Pair with **pull-only prefixes** in Settings so those trees never offer Push and upstream CI / local-only Ahead stay off Needs me (silence — you'll only hear about a push if one is attempted and fails).
 
+For repos that keep reappearing for other reasons (dirty worktree, behind, …) — including under pull-only — use **Mute attention paths** in Settings (or right-click **Mute attention**). That drops the checkout from Needs me / chips / tray entirely without editing files inside the repo.
+
 ## List view
 
 List is the default home layout: compact single-line rows (AI summaries show as a truncated sparkles line when present). Switch to **Grid** for cards. The choice is saved in `~/.config/repoharbor/config.toml` (`layout = "list"` or `"grid"`). Parent → submodule browsing is the sidebar **TREE** section, not this switch.

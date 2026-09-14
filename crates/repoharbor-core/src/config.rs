@@ -196,6 +196,7 @@ impl Default for AppConfig {
             workspace_groups: Vec::new(),
             active_workspace_group: None,
             pull_only_prefixes: Vec::new(),
+            mute_attention_prefixes: Vec::new(),
             diff_command: crate::model::default_diff_command(),
         }
     }
@@ -378,8 +379,10 @@ mod tests {
 
     #[test]
     fn explicit_grid_layout_is_kept() {
-        let mut cfg = AppConfig::default();
-        cfg.layout = crate::model::MissionControlLayout::Grid;
+        let cfg = AppConfig {
+            layout: crate::model::MissionControlLayout::Grid,
+            ..AppConfig::default()
+        };
         let text = toml::to_string(&cfg).expect("serialize");
         assert!(text.contains("layout = \"grid\"") || text.contains("layout=\"grid\""));
         let parsed: AppConfig = toml::from_str(&text).expect("deserialize");

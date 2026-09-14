@@ -956,8 +956,11 @@ impl RepoHarborApp {
         };
         let ci = repoharbor_core::ci::facts(&self.ci_states, &self.repos);
         let raw = attention::compute(&self.repos, inbox, &ci, &prunable, &agents);
-        self.attention_items =
-            attention::apply_pull_only_policy(raw, &self.config.pull_only_prefixes);
+        self.attention_items = attention::apply_attention_policy(
+            raw,
+            &self.config.pull_only_prefixes,
+            &self.config.mute_attention_prefixes,
+        );
         // Items are severity-sorted (Urgent first), so a repo's first
         // Needs-me occurrence is its highest actionable severity. Live agent
         // sessions are a readout, not a filter hit.
@@ -2944,6 +2947,110 @@ impl RepoHarborApp {
         cx.notify();
     }
 
+    /// Append a mute-attention prefix from the Settings input (expand ~).
+    pub fn settings_add_mute_attention(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(s) = &self.settings else { return };
+        let raw = s.add_mute_attention.read(cx).value().trim().to_string();
+        if raw.is_empty() {
+            return;
+        }
+        let store = repoharbor_core::scan::expand(&raw)
+            .to_string_lossy()
+            .into_owned();
+        if let Some(s) = &mut self.settings {
+            if !s
+                .draft
+                .mute_attention_prefixes
+                .iter()
+                .any(|p| repoharbor_core::scan::expand(p) == repoharbor_core::scan::expand(&store))
+            {
+                s.draft.mute_attention_prefixes.push(store.clone());
+                s.saved = false;
+            }
+            let input = s.add_mute_attention.clone();
+            input.update(cx, |input, cx| {
+                input.set_value("", window, cx);
+            });
+        }
+        self.config.mute_attention_prefixes = self
+            .settings
+            .as_ref()
+            .map(|s| s.draft.mute_attention_prefixes.clone())
+            .unwrap_or_default();
+        let _ = repoharbor_core::config::save(&self.config);
+        self.recompute_attention();
+        cx.notify();
+    }
+
+    /// Remove a mute-attention prefix by index and persist.
+    pub fn settings_remove_mute_attention(&mut self, index: usize, cx: &mut Context<Self>) {
+        if let Some(s) = &mut self.settings {
+            if index < s.draft.mute_attention_prefixes.len() {
+                s.draft.mute_attention_prefixes.remove(index);
+                s.saved = false;
+            }
+            self.config.mute_attention_prefixes = s.draft.mute_attention_prefixes.clone();
+        }
+        let _ = repoharbor_core::config::save(&self.config);
+        self.recompute_attention();
+        cx.notify();
+    }
+
+    /// Append repo path(s) to `mute_attention_prefixes` and persist (context menu).
+    pub fn mute_attention_for_repos(&mut self, repos: &[String], cx: &mut Context<Self>) {
+        let mut added = 0usize;
+        for raw in repos {
+            let store = repoharbor_core::scan::expand(raw)
+                .to_string_lossy()
+                .into_owned();
+            if store.is_empty() {
+                continue;
+            }
+            let already =
+                self.config.mute_attention_prefixes.iter().any(|p| {
+                    repoharbor_core::scan::expand(p) == repoharbor_core::scan::expand(&store)
+                });
+            if already {
+                continue;
+            }
+            self.config.mute_attention_prefixes.push(store.clone());
+            if let Some(s) = &mut self.settings {
+                if !s.draft.mute_attention_prefixes.iter().any(|p| {
+                    repoharbor_core::scan::expand(p) == repoharbor_core::scan::expand(&store)
+                }) {
+                    s.draft.mute_attention_prefixes.push(store);
+                    s.saved = false;
+                }
+            }
+            added += 1;
+        }
+        if added == 0 {
+            self.push_toast(
+                ToastKind::Info,
+                "Already muted",
+                Some("Those paths are already on the mute-attention list.".into()),
+                cx,
+            );
+            cx.notify();
+            return;
+        }
+        let _ = repoharbor_core::config::save(&self.config);
+        self.recompute_attention();
+        self.push_toast(
+            ToastKind::Success,
+            "Muted attention",
+            Some(
+                format!(
+                    "Added {added} path{} — Needs me / chips / tray stay quiet for those repos.",
+                    if added == 1 { "" } else { "s" }
+                )
+                .into(),
+            ),
+            cx,
+        );
+        cx.notify();
+    }
+
     /// Open the external diff tool for a repo (and optional relative file).
     pub fn open_external_diff(&mut self, repo: &str, file: Option<&str>, cx: &mut Context<Self>) {
         let tmpl = if self.config.diff_command.trim().is_empty() {
@@ -4368,6 +4475,13 @@ impl RepoHarborApp {
     /// True when this checkout is under a configured pull-only (upstream) path.
     pub fn is_pull_only(&self, repo_id: &str) -> bool {
         repoharbor_core::model::path_is_pull_only(repo_id, &self.config.pull_only_prefixes)
+    }
+
+    pub fn is_attention_muted(&self, repo_id: &str) -> bool {
+        repoharbor_core::model::path_is_attention_muted(
+            repo_id,
+            &self.config.mute_attention_prefixes,
+        )
     }
 
     /// Force-refresh host enrichment for every repo (ignores the TTL), then
