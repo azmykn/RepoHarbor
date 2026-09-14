@@ -23,7 +23,7 @@ The toolbar uses **work modes** instead of a dense all-filters chip strip:
 
 | Mode | Shows |
 |------|--------|
-| **Needs me** | Attention filter — repos that need action (reviews, dirty/unpushed work, behind, finished agents, …). A live **Agent running** session is not a Needs-me hit (the card keeps a terminal icon; it does not replace the git/commit line). Segment shows the count when &gt; 0. Empty state: **All clear**. |
+| **Needs me** | Attention filter — repos that need action (reviews, dirty/unpushed work, behind, finished agents, …). Submodule children that need you stay listed even without a TREE focus; host-only review/CI (no local checkout) appears too. Badge / chip / header count only what the list can show. A live **Agent running** session is not a Needs-me hit (the card keeps a terminal icon; it does not replace the git/commit line). Segment shows the count when &gt; 0. Empty state: **All clear**. |
 | **Behind** | Repos behind upstream. **Pull behind** on the ops row fleet-pulls them. |
 | **Working** | Contextual chips: Dirty / Stageable / Pushable (no Commitable / Ahead duplicates). |
 | **All** | No git filter; optional Public / Private / Starred / Stale chips. |
@@ -39,7 +39,7 @@ Ops row (bottom) — verbs that execute work, visible even with no selection:
 - **Refresh** — labeled accent control that re-scans workspace roots (git status, attention, grid). The same action is on the chrome bar next to **+**. A toast reports **Scanning…** then **Scan finished**.
 - **Pull behind** — fleet-pulls every repo currently behind upstream.
 - **Fetch all** — host enrichment refresh (ignores TTL).
-- **Summarize** — one-line AI summaries for every repo (when AI is ready).
+- **Summarize** — one-line AI summaries for every repo (when AI is ready). A toast tracks **Summarizing…** then success / already up to date / error; summaries appear on List rows and Grid cards (cached by commit).
 - Select-all plus **Fetch / Pull / Push / Submodules / Gen commit / Empty commit** and **Actions ▾** when something is selected.
 
 ### Projects & saved views
@@ -64,7 +64,7 @@ Each card has a checkbox; select one or more (or use the toolbar's select-all) t
 
 ## List view
 
-List is the default home layout: compact single-line rows. Switch to **Grid** for cards. The choice is saved in `~/.config/repoharbor/config.toml` (`layout = "list"` or `"grid"`). Parent → submodule browsing is the sidebar **TREE** section, not this switch.
+List is the default home layout: compact single-line rows (AI summaries show as a truncated sparkles line when present). Switch to **Grid** for cards. The choice is saved in `~/.config/repoharbor/config.toml` (`layout = "list"` or `"grid"`). Parent → submodule browsing is the sidebar **TREE** section, not this switch.
 
 ## The repo drawer
 

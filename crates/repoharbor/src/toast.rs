@@ -33,7 +33,7 @@ const AUTO_DISMISS: Duration = Duration::from_secs(4);
 /// competes with an open overlay.
 const TOAST_W: f32 = 340.;
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ToastKind {
     Success,
     Error,

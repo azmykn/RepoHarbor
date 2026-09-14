@@ -657,6 +657,7 @@ pub(crate) fn list_item(
     ide_cmd: &str,
     agent_cmd: &str,
     state: CardState,
+    row_h: f32,
 ) -> impl IntoElement {
     // Hover group: reveals the (otherwise invisible) select checkbox.
     let group = SharedString::from(format!("listg-{idx}"));
@@ -719,6 +720,29 @@ pub(crate) fn list_item(
                     .text_size(px(t.text_data_sm))
                     .text_color(rgb(if state.urgent { t.behind } else { t.dirty }))
                     .child(sub.clone()),
+            );
+        }
+        // Same sparkles line as Grid cards — List is the default layout.
+        if !row.ai_summary.is_empty() {
+            col = col.child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(5.))
+                    .h(px(17.))
+                    .overflow_hidden()
+                    .font_family(MONO)
+                    .text_size(px(t.text_data_sm))
+                    .text_color(rgb(t.ai))
+                    .child(lucide("sparkles", 13., t.ai))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .truncate()
+                            .child(row.ai_summary.clone()),
+                    ),
             );
         }
         col
@@ -878,7 +902,7 @@ pub(crate) fn list_item(
         .items_center()
         .gap(px(14.))
         .w_full()
-        .h(px(72.))
+        .h(px(row_h))
         .px(px(16.))
         .border_b_1()
         .border_color(rgb(t.border))

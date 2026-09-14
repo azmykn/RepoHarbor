@@ -10,8 +10,21 @@ and this project (upstream) uses calendar versioning (`YYYY.M.P`).
 DigitsCode RepoHarbor — multi-repo workspaces (hundreds of checkouts across
 versioned trees, including nested submodule parents).
 
+### Fixed
+
+- **Needs me no longer lies about an empty list** — submodule children that
+  need you (e.g. unpushed `digits_hr` under TREE parents) stay visible on
+  **Needs me** even without a TREE focus, and the Mission Control badge /
+  work-mode chip / header count only listable work. Host-only review/CI
+  (no local checkout) still appears under Needs me instead of **All clear**
+  with a non-zero badge.
+
 ### Changed
 
+- **Summarize feedback** — ops-row **Summarize** toasts **Summarizing…** then
+  *N* new summaries / **Already up to date** / error (never silent). List rows
+  show the same truncated sparkles AI line as Grid cards; hover tooltip
+  explains one-line summaries cached by commit.
 - **Fleet Pull rebases diverged pushable repos** — a clean tree that is both
   ahead and behind (e.g. one local empty commit + upstream commits) is
   recovered with `git rebase --empty=keep` onto upstream instead of failing

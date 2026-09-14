@@ -35,6 +35,9 @@ use crate::toast::ToastKind;
 /// bottom of the card, so the row must be tall enough not to clip it).
 const ROW_H: f32 = 260.;
 const ROW_H_AI: f32 = 288.;
+/// Compact list row height without / with the truncated AI sparkles line.
+const LIST_H: f32 = 72.;
+const LIST_H_AI: f32 = 92.;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum View {
@@ -695,6 +698,37 @@ fn index_needs_me(items: &[AttentionItem]) -> std::collections::HashMap<SharedSt
         }
     }
     map
+}
+
+/// Actionable (Urgent / Attention) Needs-me facts with no local checkout id —
+/// review/CI that never linked to a scanned path. Mission Control must still
+/// list these; counting them into the badge while showing **All clear** lies.
+fn host_only_needs_me(items: &[AttentionItem]) -> Vec<&AttentionItem> {
+    items
+        .iter()
+        .filter(|i| {
+            i.kind.needs_me()
+                && i.repo.id.is_none()
+                && matches!(i.severity, Severity::Urgent | Severity::Attention)
+        })
+        .collect()
+}
+
+/// TREE / submodule visibility. By default submodule children stay off the
+/// flat grid; Needs me reveals children that are in the attention index so
+/// the chip/badge never claim work the list hides.
+fn tree_allows_row(
+    tree_focus: Option<&SharedString>,
+    parent_id: Option<&SharedString>,
+    row_id: &SharedString,
+    reveal_needs_me_child: bool,
+) -> bool {
+    match (tree_focus, parent_id) {
+        (None, Some(_)) => reveal_needs_me_child,
+        (None, None) => true,
+        (Some(focus), None) => row_id == focus,
+        (Some(focus), Some(parent)) => parent == focus || row_id == focus,
+    }
 }
 
 /// Fold the ranked attention list into the tray's compact summary: actionable
@@ -4153,9 +4187,61 @@ impl RepoHarborApp {
         cx.notify();
     }
 
-    /// How many repos currently have at least one Needs-me attention item.
+    /// How many Needs-me entries Mission Control can actually list: local
+    /// repos that pass sidebar facets (with submodule reveal) plus host-only
+    /// actionable facts. Matches the Needs me chip / empty-state invariant.
     fn attention_count(&self) -> usize {
-        self.attention_by_repo.len()
+        self.needs_me_listed_local_count() + host_only_needs_me(&self.attention_items).len()
+    }
+
+    /// Local rows that Needs me would show under the current root / language /
+    /// group / TREE facets (submodule children in the attention index are
+    /// revealed even without a TREE focus).
+    fn needs_me_listed_local_count(&self) -> usize {
+        self.rows
+            .iter()
+            .filter(|r| self.attention_by_repo.contains_key(&r.id))
+            .filter(|r| self.row_passes_needs_me_facets(r))
+            .count()
+    }
+
+    /// Sidebar facets for Needs me counting / listing (not the name query).
+    fn row_passes_needs_me_facets(&self, r: &crate::data::Row) -> bool {
+        if self
+            .grid
+            .visibility
+            .is_some_and(|v| !v.matches(r, &self.attention_by_repo))
+        {
+            return false;
+        }
+        if self.grid.root.as_ref().is_some_and(|root| &r.root != root) {
+            return false;
+        }
+        if self
+            .grid
+            .language
+            .as_ref()
+            .is_some_and(|lang| &r.language != lang)
+        {
+            return false;
+        }
+        if let Some(name) = self.config.active_workspace_group.as_deref() {
+            let in_group = self
+                .config
+                .workspace_groups
+                .iter()
+                .find(|g| g.name == name)
+                .is_some_and(|g| Self::group_matches_path(g, r.id.as_ref()));
+            if !in_group {
+                return false;
+            }
+        }
+        tree_allows_row(
+            self.grid.tree_focus.as_ref(),
+            r.parent_id.as_ref(),
+            &r.id,
+            self.attention_by_repo.contains_key(&r.id),
+        )
     }
 
     /// Collapse/expand the left rail (icon-only vs full labels + contextual panel).
@@ -4433,26 +4519,67 @@ impl RepoHarborApp {
     }
 
     /// Generate local-AI one-line summaries for every repo (cached by commit, so
-    /// repeats are cheap), then reload the grid so the cards show them. Gated on
-    /// `ai_ready` — a no-op when AI is unavailable.
+    /// repeats are cheap), then reload the grid/list so rows show them. Always
+    /// toasts progress then success / up-to-date / error — never silent.
     pub fn summarize_all(&mut self, cx: &mut Context<Self>) {
+        use repoharbor_core::summarize::SummarizeOutcome;
+
         if !self.services.ai_ready {
+            self.upsert_toast(
+                "summarize",
+                ToastKind::Error,
+                "Summarize failed",
+                Some("AI is not ready".into()),
+                cx,
+            );
             return;
         }
+        self.upsert_toast(
+            "summarize",
+            ToastKind::Progress,
+            "Summarizing…",
+            Some("One-line AI summaries (cached by commit)".into()),
+            cx,
+        );
         cx.spawn(async move |this, cx| {
-            let updated =
+            let outcome =
                 crate::task::run(async { repoharbor_core::summarize::run_cached().await }).await;
-            if updated == 0 {
-                return;
+            match outcome {
+                SummarizeOutcome::Updated(n) => {
+                    let snap = cx
+                        .background_executor()
+                        .spawn(async { crate::data::load(crate::data::now_unix()) })
+                        .await;
+                    let _ = this.update(cx, |this, cx| {
+                        this.apply_snapshot(snap);
+                        let (kind, title, detail) = summarize_finish_toast(n);
+                        this.upsert_toast("summarize", kind, title, detail, cx);
+                        cx.notify();
+                    });
+                }
+                SummarizeOutcome::UpToDate => {
+                    let _ = this.update(cx, |this, cx| {
+                        this.upsert_toast(
+                            "summarize",
+                            ToastKind::Info,
+                            "Already up to date",
+                            Some("Summaries are current for every repo".into()),
+                            cx,
+                        );
+                    });
+                }
+                SummarizeOutcome::Unavailable(msg) => {
+                    let _ = this.update(cx, |this, cx| {
+                        this.upsert_toast(
+                            "summarize",
+                            ToastKind::Error,
+                            "Summarize failed",
+                            Some(msg.into()),
+                            cx,
+                        );
+                    });
+                }
             }
-            let snap = cx
-                .background_executor()
-                .spawn(async { crate::data::load(crate::data::now_unix()) })
-                .await;
-            let _ = this.update(cx, |this, cx| {
-                this.apply_snapshot(snap);
-                cx.notify();
-            });
         })
         .detach();
     }
@@ -4774,13 +4901,16 @@ impl RepoHarborApp {
             })
             .filter(|(_, r)| {
                 // Default: hide submodule children. Focusing a parent in TREE
-                // shows that parent + its children only.
-                match (&self.grid.tree_focus, &r.parent_id) {
-                    (None, Some(_)) => false,
-                    (None, None) => true,
-                    (Some(focus), None) => &r.id == focus,
-                    (Some(focus), Some(parent)) => parent == focus || &r.id == focus,
-                }
+                // shows that parent + its children only. Needs me reveals
+                // attention-index children so chip/badge never outrun the list.
+                let reveal = self.grid.filter == RepoFilter::Attention
+                    && self.attention_by_repo.contains_key(&r.id);
+                tree_allows_row(
+                    self.grid.tree_focus.as_ref(),
+                    r.parent_id.as_ref(),
+                    &r.id,
+                    reveal,
+                )
             })
             .map(|(i, _)| i)
             .collect();
@@ -4927,20 +5057,33 @@ impl RepoHarborApp {
 }
 
 impl RepoHarborApp {
-    /// Mission Control's nav badge: (count, any-urgent) over the items that
-    /// need action — Urgent + Attention severities. Info items are ambient
-    /// state and don't badge.
+    /// Mission Control's nav badge: listable Needs-me work only (Urgent +
+    /// Attention). Counts local repos that pass the same facets as the Needs
+    /// me list (including submodule reveal) plus host-only actionable facts —
+    /// never host-only / hidden-submodule inflation against an empty grid.
     fn grid_badge(&self) -> (usize, bool) {
         let mut n = 0;
         let mut urgent = false;
-        for item in &self.attention_items {
-            match item.severity {
+        for r in &self.rows {
+            let Some(sev) = self.attention_by_repo.get(&r.id).copied() else {
+                continue;
+            };
+            if !self.row_passes_needs_me_facets(r) {
+                continue;
+            }
+            match sev {
                 Severity::Urgent => {
                     n += 1;
                     urgent = true;
                 }
                 Severity::Attention => n += 1,
                 Severity::Info => {}
+            }
+        }
+        for item in host_only_needs_me(&self.attention_items) {
+            n += 1;
+            if item.severity == Severity::Urgent {
+                urgent = true;
             }
         }
         (n, urgent)
@@ -6032,11 +6175,32 @@ impl RepoHarborApp {
             _ => None,
         };
         let visible = self.visible_rows();
+        let q = self.grid.query.trim().to_lowercase();
+        let host_only: Vec<&AttentionItem> = if self.grid.filter == RepoFilter::Attention {
+            host_only_needs_me(&self.attention_items)
+                .into_iter()
+                .filter(|i| {
+                    if q.is_empty() {
+                        return true;
+                    }
+                    i.repo.name.to_lowercase().contains(&q)
+                        || i.repo
+                            .slug
+                            .as_deref()
+                            .is_some_and(|s| s.to_lowercase().contains(&q))
+                        || i.summary.to_lowercase().contains(&q)
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let header_count = visible.len() + host_only.len();
         // Select-all + global/selection ops sit above the list; Actions appears
         // only when something is selected.
         let fleet_bar = self.fleet_bar(t, cx);
         let list_area: gpui::AnyElement = if self.grid.filter == RepoFilter::Attention
             && visible.is_empty()
+            && host_only.is_empty()
             && self.grid.query.trim().is_empty()
         {
             div()
@@ -6071,6 +6235,18 @@ impl RepoHarborApp {
                         ),
                 )
                 .into_any_element()
+        } else if visible.is_empty() && !host_only.is_empty() {
+            self.host_only_needs_me_list(t, &host_only, cx)
+                .into_any_element()
+        } else if !host_only.is_empty() {
+            div()
+                .flex()
+                .flex_col()
+                .flex_1()
+                .min_h(px(0.))
+                .child(self.host_only_needs_me_list(t, &host_only, cx))
+                .child(self.card_list(t, cx, cols, visible.clone()))
+                .into_any_element()
         } else {
             self.card_list(t, cx, cols, visible.clone())
                 .into_any_element()
@@ -6081,10 +6257,98 @@ impl RepoHarborApp {
             .size_full()
             .bg(rgb(t.page))
             .children(band)
-            .child(self.toolbar(t, cx, visible.len()))
+            .child(self.toolbar(t, cx, header_count))
             .child(self.ops_row(t, cx))
             .child(list_area)
             .children(fleet_bar)
+    }
+
+    /// Host-only Needs me facts (review / CI with no local checkout) as a
+    /// compact list so the badge never points at an empty Mission Control.
+    fn host_only_needs_me_list(
+        &self,
+        t: &Theme,
+        items: &[&AttentionItem],
+        _cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let mut col = div()
+            .flex()
+            .flex_col()
+            .gap(px(6.))
+            .px(px(16.))
+            .py(px(10.))
+            .flex_none();
+        col = col.child(
+            div()
+                .text_size(px(t.text_data_sm))
+                .text_color(rgb(t.fg2))
+                .child("On host (no local checkout)"),
+        );
+        for (i, item) in items.iter().enumerate() {
+            let url = item
+                .detail
+                .as_ref()
+                .filter(|d| d.starts_with("http://") || d.starts_with("https://"))
+                .cloned();
+            let name = item.repo.name.clone();
+            let summary = item.summary.clone();
+            let sev_color = match item.severity {
+                Severity::Urgent => t.behind,
+                Severity::Attention => t.dirty,
+                Severity::Info => t.fg2,
+            };
+            let mut row = div()
+                .id(SharedString::from(format!("host-needs-me-{i}")))
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(10.))
+                .px(px(12.))
+                .py(px(8.))
+                .rounded(px(t.r_sm))
+                .border_1()
+                .border_color(rgb(t.border))
+                .bg(rgb(t.surface))
+                .child(
+                    div()
+                        .w(px(8.))
+                        .h(px(8.))
+                        .rounded(px(4.))
+                        .bg(rgb(sev_color))
+                        .flex_none(),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap(px(2.))
+                        .flex_1()
+                        .min_w(px(0.))
+                        .child(
+                            div()
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_size(px(t.text_small))
+                                .text_color(rgb(t.fg0))
+                                .child(SharedString::from(name)),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(t.text_data_sm))
+                                .text_color(rgb(t.fg2))
+                                .child(SharedString::from(summary)),
+                        ),
+                );
+            if let Some(url) = url {
+                row = row
+                    .cursor_pointer()
+                    .hover(|s| s.bg(rgb(t.surface_hover)))
+                    .on_click(move |_ev, _w, _cx| {
+                        let _ = repoharbor_core::launch::open(&url);
+                    });
+            }
+            col = col.child(row);
+        }
+        col
     }
 
     /// Top Mission Control bar — filters only: title · count, search, work
@@ -6124,6 +6388,7 @@ impl RepoHarborApp {
                 "tb-sort",
                 "arrow-up-down",
                 Some(self.grid.sort.label()),
+                None,
                 false,
                 t,
                 cx.listener(|this, _ev, _w, cx| this.cycle_sort(cx)),
@@ -6133,6 +6398,7 @@ impl RepoHarborApp {
                 "tb-grid",
                 "layout-grid",
                 None,
+                None,
                 self.grid.layout == Layout::Grid,
                 t,
                 cx.listener(|this, _ev, _w, cx| this.set_layout(Layout::Grid, cx)),
@@ -6140,6 +6406,7 @@ impl RepoHarborApp {
             .child(tool_btn(
                 "tb-list",
                 "list",
+                None,
                 None,
                 self.grid.layout == Layout::List,
                 t,
@@ -6224,6 +6491,7 @@ impl RepoHarborApp {
             "tb-pull-behind",
             "cloud-download",
             Some("Pull behind"),
+            None,
             false,
             t,
             cx.listener(|this, _ev, _w, cx| this.pull_behind_repos(cx)),
@@ -6233,6 +6501,7 @@ impl RepoHarborApp {
             "tb-fetch-all",
             "globe",
             Some("Fetch all"),
+            None,
             false,
             t,
             cx.listener(|this, _ev, _w, cx| this.fetch_all_hosts(cx)),
@@ -6242,6 +6511,7 @@ impl RepoHarborApp {
                 "tb-summarize",
                 "sparkles",
                 Some("Summarize"),
+                Some("One-line AI summaries for each repo (cached by commit)"),
                 false,
                 t,
                 cx.listener(|this, _ev, _w, cx| this.summarize_all(cx)),
@@ -6359,6 +6629,10 @@ impl RepoHarborApp {
         let list = match self.grid.layout {
             // Compact single-column list: one repo per row.
             Layout::List => {
+                // Same all-or-nothing height as Grid: the AI sparkles line is
+                // uniform across the list so rows don't clip mid-viewport.
+                let has_ai = visible.iter().any(|&i| !self.rows[i].ai_summary.is_empty());
+                let row_h = if has_ai { LIST_H_AI } else { LIST_H };
                 gpui::uniform_list("repo-list", visible.len(), move |range, _win, cx| {
                     let app = entity.read(cx);
                     let selecting = !app.selected.is_empty();
@@ -6373,6 +6647,7 @@ impl RepoHarborApp {
                                 &ide,
                                 &agent,
                                 app.card_state(abs, selecting),
+                                row_h,
                             )
                             .into_any_element()
                         })
@@ -6432,12 +6707,23 @@ impl RepoHarborApp {
     }
 }
 
+/// Toast copy after a successful summarize pass that wrote `n` new summaries.
+fn summarize_finish_toast(n: usize) -> (ToastKind, SharedString, Option<SharedString>) {
+    let detail = if n == 1 {
+        "1 new summary".into()
+    } else {
+        format!("{n} new summaries").into()
+    };
+    (ToastKind::Success, "Summaries ready".into(), Some(detail))
+}
+
 /// A toolbar action button: a lucide icon with an optional label, highlighted
-/// when `active`. `on` fires on click.
+/// when `active`. `on` fires on click. Optional `tooltip` shows on hover.
 fn tool_btn(
     id: &'static str,
     icon: &'static str,
     label: Option<&str>,
+    tooltip: Option<&'static str>,
     active: bool,
     t: &Theme,
     on: impl Fn(&gpui::ClickEvent, &mut Window, &mut gpui::App) + 'static,
@@ -6468,6 +6754,12 @@ fn tool_btn(
         .child(lucide(icon, 15., fg));
     if let Some(label) = label {
         b = b.child(SharedString::from(label.to_string()));
+    }
+    if let Some(tip) = tooltip {
+        let tip = SharedString::from(tip);
+        b = b.tooltip(move |window, cx| {
+            gpui_component::tooltip::Tooltip::new(tip.clone()).build(window, cx)
+        });
     }
     b
 }
@@ -6916,6 +7208,88 @@ mod tests {
     }
 
     #[test]
+    fn tree_hides_submodules_unless_needs_me_reveals() {
+        let parent = SharedString::from("/p");
+        let child = SharedString::from("/p/child");
+        assert!(
+            !tree_allows_row(None, Some(&parent), &child, false),
+            "flat grid hides submodule children by default"
+        );
+        assert!(
+            tree_allows_row(None, Some(&parent), &child, true),
+            "Needs me reveals attention-index children"
+        );
+        assert!(tree_allows_row(None, None, &parent, false));
+        assert!(tree_allows_row(Some(&parent), Some(&parent), &child, false));
+        assert!(!tree_allows_row(
+            Some(&SharedString::from("/other")),
+            Some(&parent),
+            &child,
+            true
+        ));
+    }
+
+    #[test]
+    fn host_only_needs_me_skips_linked_and_info() {
+        let items = vec![
+            item(AttentionKind::ReviewRequested, "orphan", None),
+            item(AttentionKind::CiFailing, "linked", Some("/a")),
+            item(AttentionKind::PrAssigned, "open-pr", None), // Info
+            item(AttentionKind::AgentRunning, "run", None),   // not needs_me
+        ];
+        let host = host_only_needs_me(&items);
+        assert_eq!(host.len(), 1);
+        assert_eq!(host[0].repo.name, "orphan");
+    }
+
+    #[test]
+    fn needs_me_count_matches_listable_repos_not_hidden_children() {
+        // Two Ahead items on submodule children — without reveal the flat grid
+        // hides them (the reported bug); with Needs me reveal, listable == index.
+        let child_a = SharedString::from("/p/a");
+        let child_b = SharedString::from("/q/b");
+        let parent_a = SharedString::from("/p");
+        let parent_b = SharedString::from("/q");
+        let items = vec![
+            item(AttentionKind::Ahead, "a", Some(child_a.as_ref())),
+            item(AttentionKind::Ahead, "b", Some(child_b.as_ref())),
+        ];
+        let map = index_needs_me(&items);
+        assert_eq!(map.len(), 2);
+
+        let pairs = [(&child_a, &parent_a), (&child_b, &parent_b)];
+        let hidden = pairs
+            .iter()
+            .filter(|(id, parent)| {
+                tree_allows_row(None, Some(*parent), id, false) && map.contains_key(*id)
+            })
+            .count();
+        assert_eq!(
+            hidden, 0,
+            "submodule children stay off the flat grid by default"
+        );
+
+        let listed = pairs
+            .iter()
+            .filter(|(id, parent)| {
+                let reveal = map.contains_key(*id);
+                tree_allows_row(None, Some(*parent), id, reveal) && map.contains_key(*id)
+            })
+            .count();
+        assert_eq!(listed, map.len(), "Needs me count must equal listable rows");
+
+        // Host-only facts add to the surface without a local row.
+        let with_host = vec![
+            item(AttentionKind::Ahead, "a", Some(child_a.as_ref())),
+            item(AttentionKind::ReviewRequested, "ghost", None),
+        ];
+        assert_eq!(
+            index_needs_me(&with_host).len() + host_only_needs_me(&with_host).len(),
+            2
+        );
+    }
+
+    #[test]
     fn attention_reason_chips_dedupes_and_caps() {
         let items = vec![
             item(AttentionKind::CiFailing, "a", Some("/a")),
@@ -7054,5 +7428,18 @@ mod tests {
     fn mission_control_layout_defaults_to_list() {
         assert_eq!(Layout::default(), Layout::List);
         assert_eq!(AppConfig::default().layout, Layout::List);
+    }
+
+    #[test]
+    fn summarize_finish_toast_copy() {
+        let (kind, title, detail) = summarize_finish_toast(1);
+        assert_eq!(kind, ToastKind::Success);
+        assert_eq!(title.as_ref(), "Summaries ready");
+        assert_eq!(detail.as_deref(), Some("1 new summary"));
+
+        let (kind, title, detail) = summarize_finish_toast(3);
+        assert_eq!(kind, ToastKind::Success);
+        assert_eq!(title.as_ref(), "Summaries ready");
+        assert_eq!(detail.as_deref(), Some("3 new summaries"));
     }
 }
