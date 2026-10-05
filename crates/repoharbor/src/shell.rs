@@ -2537,19 +2537,6 @@ impl RepoHarborApp {
             return;
         }
         let repo = self.drawer.repo.clone();
-        if self.is_pull_only(&repo) {
-            self.push_toast(
-                ToastKind::Error,
-                "Push blocked",
-                Some(
-                    "This checkout is pull-only (upstream / vendor). Push is disabled — \
-                     clone or work under a digits path to push."
-                        .into(),
-                ),
-                cx,
-            );
-            return;
-        }
         let name = repo.rsplit('/').next().unwrap_or(&repo).to_string();
         self.drawer.push_busy = true;
         let key = format!("push:{repo}");
@@ -7109,7 +7096,6 @@ impl RepoHarborApp {
                         &cmds.1,
                         self.services.ai_ready,
                         self.services.github_authed,
-                        self.is_pull_only(repo.as_ref()),
                     )
                     .into_any_element(),
                 )

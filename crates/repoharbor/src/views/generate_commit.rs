@@ -16,7 +16,7 @@ use crate::theme::Theme;
 pub enum GenerateCommitChoice {
     /// Fill the commit composer (or report the message) without committing.
     MessageOnly,
-    /// AI message → `commit_all` → `push` (push skipped on pull-only).
+    /// AI message → `commit_all` → `push`.
     CommitAndPush,
 }
 
@@ -94,7 +94,7 @@ pub fn render(
         .child(choice_btn(
             "gen-push",
             "Generate, commit & push",
-            "Commit all changes with the AI message, then push (skipped on pull-only).",
+            "Commit all changes with the AI message, then push.",
             true,
             t,
             app,

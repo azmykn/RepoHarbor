@@ -76,7 +76,7 @@ pub enum FleetOp {
     EmptyCommit,
     /// Per-repo AI message only — no commit/push (toast + Log).
     GenerateMessageOnly,
-    /// Per-repo AI message → `commit_all` → `push` (push skipped on pull-only).
+    /// Per-repo AI message → `commit_all` → `push`.
     GenerateCommitAndPush,
     /// Only ever started through the confirm strip
     /// ([`RepoHarborApp::confirm_fleet_prune`]) — never directly from a button.
@@ -358,25 +358,18 @@ impl RepoHarborApp {
         if self.fleet_run.is_some() || repos.is_empty() {
             return;
         }
-        if matches!(op, FleetOp::Push | FleetOp::EmptyCommit) {
+        // Empty commit stays off vendor trees. Push does not: a selected repo
+        // that Needs me already marks "Not pushed" must be publishable.
+        if matches!(op, FleetOp::EmptyCommit) {
             let prefixes = &self.config.pull_only_prefixes;
             let before = repos.len();
             repos.retain(|r| !repoharbor_core::model::path_is_pull_only(r, prefixes));
             let blocked = before - repos.len();
-            let (blocked_title, blocked_detail, skip_detail) = if matches!(op, FleetOp::EmptyCommit)
-            {
-                (
-                    "Empty commit blocked",
-                    "Selected repos are pull-only (upstream / vendor). Empty commit is disabled.",
-                    "skipped — empty commit runs only on digits / pushable paths.",
-                )
-            } else {
-                (
-                    "Push blocked",
-                    "Selected repos are pull-only (upstream / vendor). Push is disabled.",
-                    "skipped — push runs only on digits / pushable paths.",
-                )
-            };
+            let (blocked_title, blocked_detail, skip_detail) = (
+                "Empty commit blocked",
+                "Selected repos are pull-only (upstream / vendor). Empty commit is disabled.",
+                "skipped — empty commit runs only on digits / pushable paths.",
+            );
             if repos.is_empty() {
                 self.push_toast(
                     ToastKind::Error,
@@ -553,16 +546,13 @@ impl RepoHarborApp {
                             progress,
                             generate_message_only_op(),
                         ),
-                        FleetOp::GenerateCommitAndPush => {
-                            let prefixes = pull_only_prefixes;
-                            fleet::run(
-                                &repos,
-                                workers,
-                                &cancel,
-                                progress,
-                                generate_commit_and_push_op(prefixes),
-                            )
-                        }
+                        FleetOp::GenerateCommitAndPush => fleet::run(
+                            &repos,
+                            workers,
+                            &cancel,
+                            progress,
+                            generate_commit_and_push_op(),
+                        ),
                         FleetOp::Prune => {
                             fleet::run(&repos, workers, &cancel, progress, fleet::prune_op())
                         }
@@ -1128,10 +1118,11 @@ impl RepoHarborApp {
     }
 
     /// Compact selection-scoped primaries beside Actions ▾:
-    /// Fetch / Pull / [Push] / Submodules / [Gen commit] / [Empty commit] —
-    /// Push / Empty commit only when a non–pull-only path is in the selection;
-    /// Submodules always shown (dimmed without nested checkouts); Gen commit
-    /// only when AI is ready (dimmed unless something is dirty).
+    /// Fetch / Pull / Push / Submodules / Gen commit / [Empty commit].
+    /// Push and Gen commit stay on the bar for every selection (a Needs-me
+    /// mix of vendor + digits must not drop them). Empty commit only when a
+    /// non–pull-only path is selected. Submodules dim without nested checkouts;
+    /// Gen commit dims unless something is dirty and AI is ready.
     pub fn fleet_primary_sync_buttons(
         &self,
         t: &Theme,
@@ -1171,20 +1162,31 @@ impl RepoHarborApp {
                 this.run_fleet_repos(FleetOp::Pull, repos, cx);
             }),
         ));
-        if caps.has_pushable_path {
-            row = row.child(bar_btn(
-                "mc-fleet-push",
-                "arrow-up",
-                "Push",
-                idle && caps.can_push,
-                false,
-                t,
-                cx.listener(|this, _e, _w, cx| {
-                    let repos = this.selected_repos_ordered();
-                    this.run_fleet_repos(FleetOp::Push, repos, cx);
-                }),
-            ));
-        }
+        let push_enabled = idle && caps.can_push;
+        row = row.child(bar_btn_explain(
+            "mc-fleet-push",
+            "arrow-up",
+            "Push",
+            push_enabled,
+            t,
+            cx.listener(move |this, _e, _w, cx| {
+                let repos = this.selected_repos_ordered();
+                let caps = crate::menu_actions::fleet_menu_caps(this, &repos);
+                if !(this.fleet_actions_idle() && caps.can_push) {
+                    this.push_toast(
+                        crate::toast::ToastKind::Info,
+                        "Nothing to push",
+                        Some(
+                            "Push enables when a selected repo has commits that are not on its upstream."
+                                .into(),
+                        ),
+                        cx,
+                    );
+                    return;
+                }
+                this.run_fleet_repos(FleetOp::Push, repos, cx);
+            }),
+        ));
         // Always visible with a selection — same handler as Actions → Update
         // submodules; dimmed when none of the targets have nested checkouts.
         row = row.child(bar_btn(
@@ -1199,39 +1201,43 @@ impl RepoHarborApp {
                 this.run_fleet_repos(FleetOp::SubmoduleUpdate, repos, cx);
             }),
         ));
-        if ai_ready {
-            let gen_enabled = idle && caps.has_dirty;
-            row = row.child(bar_btn_explain(
-                "mc-fleet-gen",
-                "sparkles",
-                "Gen commit",
-                gen_enabled,
-                t,
-                cx.listener(move |this, _e, _w, cx| {
-                    if !(this.fleet_actions_idle()
-                        && crate::menu_actions::fleet_menu_caps(
-                            this,
-                            &this.selected_repos_ordered(),
-                        )
+        let gen_enabled = idle && ai_ready && caps.has_dirty;
+        row = row.child(bar_btn_explain(
+            "mc-fleet-gen",
+            "sparkles",
+            "Gen commit",
+            gen_enabled,
+            t,
+            cx.listener(move |this, _e, _w, cx| {
+                if !this.services.ai_ready {
+                    this.push_toast(
+                        crate::toast::ToastKind::Error,
+                        "AI unavailable",
+                        Some("Enable Ollama / AI in Settings first.".into()),
+                        cx,
+                    );
+                    return;
+                }
+                if !(this.fleet_actions_idle()
+                    && crate::menu_actions::fleet_menu_caps(this, &this.selected_repos_ordered())
                         .has_dirty)
-                    {
-                        this.push_toast(
-                            crate::toast::ToastKind::Info,
-                            "Nothing to generate",
-                            Some(
-                                "Select dirty repos first (Gen commit dims when the selection is clean)."
-                                    .into(),
-                            ),
-                            cx,
-                        );
-                        return;
-                    }
-                    let repos = this.selected_repos_ordered();
-                    this.adopt_fleet_targets(&repos);
-                    this.prompt_generate_commit_selected(cx);
-                }),
-            ));
-        }
+                {
+                    this.push_toast(
+                        crate::toast::ToastKind::Info,
+                        "Nothing to generate",
+                        Some(
+                            "Select dirty repos first (Gen commit dims when the selection is clean)."
+                                .into(),
+                        ),
+                        cx,
+                    );
+                    return;
+                }
+                let repos = this.selected_repos_ordered();
+                this.adopt_fleet_targets(&repos);
+                this.prompt_generate_commit_selected(cx);
+            }),
+        ));
         // Same pull-only gating as Push — hide when selection is entirely vendor.
         if caps.has_pushable_path {
             row = row.child(bar_btn(
@@ -1677,11 +1683,12 @@ fn generate_message_only_op() -> impl Fn(&str) -> Outcome + Sync {
     }
 }
 
-/// AI → commit_all → push. Push is skipped (still Ok) when the path is
-/// pull-only so digits work completes while upstream checkouts only commit.
-/// If AI is unreachable after a retry, a local fallback message still commits
-/// (same degrade-gracefully contract as PR drafting).
-fn generate_commit_and_push_op(pull_only_prefixes: Vec<String>) -> impl Fn(&str) -> Outcome + Sync {
+/// AI → commit_all → push. An explicit Generate, commit & push publishes
+/// every selected repo, including ones under a pull-only prefix — Needs me
+/// already asked for that publish. If AI is unreachable after a retry, a
+/// local fallback message still commits (same degrade-gracefully contract as
+/// PR drafting).
+fn generate_commit_and_push_op() -> impl Fn(&str) -> Outcome + Sync {
     move |path| {
         let (message, used_fallback) = match generate_commit_message(path) {
             Ok(m) => (m, false),
@@ -1701,7 +1708,7 @@ fn generate_commit_and_push_op(pull_only_prefixes: Vec<String>) -> impl Fn(&str)
                 } else {
                     commit_detail
                 };
-                finish_push(path, commit_detail, &pull_only_prefixes)
+                finish_push(path, commit_detail)
             }
             other => other,
         }
@@ -1757,14 +1764,10 @@ fn generate_commit_message(path: &str) -> Result<String, Outcome> {
     Ok(trimmed.to_string())
 }
 
-fn finish_push(path: &str, commit_detail: String, pull_only_prefixes: &[String]) -> Outcome {
-    if repoharbor_core::model::path_is_pull_only(path, pull_only_prefixes) {
-        Outcome::Ok(format!("{commit_detail} — push skipped (pull-only)"))
-    } else {
-        match repoharbor_core::git_ops::push(path) {
-            Ok(push_msg) => Outcome::Ok(format!("{commit_detail} — pushed ({push_msg})")),
-            Err(e) => Outcome::Failed(format!("{commit_detail}; push failed: {e}")),
-        }
+fn finish_push(path: &str, commit_detail: String) -> Outcome {
+    match repoharbor_core::git_ops::push(path) {
+        Ok(push_msg) => Outcome::Ok(format!("{commit_detail} — pushed ({push_msg})")),
+        Err(e) => Outcome::Failed(format!("{commit_detail}; push failed: {e}")),
     }
 }
 

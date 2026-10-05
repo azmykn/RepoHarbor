@@ -854,7 +854,6 @@ pub fn drawer(
     agent_cmd: &str,
     ai_ready: bool,
     github_authed: bool,
-    pull_only: bool,
 ) -> impl IntoElement {
     // Scrim: click anywhere outside the panel to dismiss.
     let backdrop = {
@@ -882,16 +881,7 @@ pub fn drawer(
         .border_color(rgb(t.border))
         .child(header(row, t, app))
         .child(tab_bar(tab, t, app, data.repo.clone(), github_slug(row)))
-        .child(body(
-            row,
-            tab,
-            t,
-            data,
-            app,
-            ai_ready,
-            github_authed,
-            pull_only,
-        ))
+        .child(body(row, tab, t, data, app, ai_ready, github_authed))
         .child(footer(row, t, app, ide_cmd, agent_cmd));
 
     div()
@@ -1120,14 +1110,13 @@ fn body(
     app: &Entity<RepoHarborApp>,
     ai_ready: bool,
     github_authed: bool,
-    pull_only: bool,
 ) -> impl IntoElement {
     let content = match tab {
         DrawerTab::Overview => overview(row, t, data, app).into_any_element(),
         DrawerTab::Readme => readme_view(data, t).into_any_element(),
         DrawerTab::Pr => pr_view(row, data, t, app).into_any_element(),
         DrawerTab::Changes => {
-            changes_view(row, data, t, app, ai_ready, github_authed, pull_only).into_any_element()
+            changes_view(row, data, t, app, ai_ready, github_authed).into_any_element()
         }
         DrawerTab::Notes => notes_view(row, data, t, app, ai_ready).into_any_element(),
     };
@@ -1593,7 +1582,6 @@ fn changes_view(
     app: &Entity<RepoHarborApp>,
     ai_ready: bool,
     github_authed: bool,
-    pull_only: bool,
 ) -> impl IntoElement {
     let mut col = div().flex().flex_col().gap(px(12.));
     let has_staged = data
@@ -1760,12 +1748,13 @@ fn changes_view(
 
     // Push / Open PR / Reset hard — the last mile after committing. Push shows when there's
     // something to push (ahead, or a commit made in this drawer session while
-    // the row's ahead count may be stale) and the checkout is not pull-only.
+    // the row's ahead count may be stale), including pull-only checkouts that
+    // Needs me already marked "Not pushed".
     // Open PR shows only when it can work: a GitHub remote, a GitHub token, a
     // known default branch, and the current branch isn't it — hidden otherwise,
     // never broken (the aiReady philosophy; only the AI *drafting* inside the
     // flow is gated on aiReady).
-    let show_push = !pull_only && (row.ahead > 0 || data.committed);
+    let show_push = row.ahead > 0 || data.committed;
     let show_reset = !row.branch.is_empty();
     let show_pr = github_authed
         && github_slug(row).is_some()

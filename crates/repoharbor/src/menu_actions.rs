@@ -13,11 +13,12 @@ use crate::shell::RepoHarborApp;
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct FleetMenuCaps {
     pub has_dirty: bool,
-    /// At least one selected repo is ahead on a non–pull-only path.
+    /// At least one selected repo has commits that are not on its upstream.
+    /// Includes pull-only checkouts: Needs me already says "Not pushed", so
+    /// Push stays available instead of vanishing with the selection.
     pub can_push: bool,
     /// At least one selected repo is not under a pull-only prefix (Digits /
-    /// pushable path). Used to hide Push as a primary when the selection is
-    /// entirely vendor / upstream.
+    /// pushable path). Empty commit stays limited to these paths.
     pub has_pushable_path: bool,
     pub has_submodules: bool,
     /// At least one target is not yet on `mute_attention_prefixes`.
@@ -41,7 +42,7 @@ pub(crate) fn fleet_menu_caps(app: &RepoHarborApp, targets: &[String]) -> FleetM
         if !pull_only {
             caps.has_pushable_path = true;
         }
-        if row.ahead > 0 && !pull_only {
+        if row.ahead > 0 {
             caps.can_push = true;
         }
         if row.child_count > 0 {
@@ -153,11 +154,14 @@ pub(crate) fn fill_fleet_actions_menu(
                 });
             }),
     );
-    if opts.ai_ready {
+    // Always listed. AI-offline and clean selections toast from the handler
+    // instead of the item vanishing when a Needs-me selection is mixed.
+    {
         let (a, r) = (app.clone(), repos.clone());
+        let gen_on = on && (opts.ai_ready || opts.caps.has_dirty);
         m = m.item(
             PopupMenuItem::new("Generate…")
-                .disabled(!dirty_on)
+                .disabled(!gen_on)
                 .on_click(move |_, _, cx| {
                     a.update(cx, |this, cx| {
                         this.adopt_fleet_targets(&r);
