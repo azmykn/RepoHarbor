@@ -13,12 +13,16 @@ use crate::shell::RepoHarborApp;
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct FleetMenuCaps {
     pub has_dirty: bool,
+    /// At least one *non–pull-only* selected repo is dirty (Gen & push / Push
+    /// publish paths — vendor dirty alone must not enable Gen & push).
+    pub has_dirty_pushable: bool,
     /// At least one *non–pull-only* selected repo is ahead of its upstream.
     /// Vendor / `core` / `custom` Ahead alone must not enable Push (Needs me
     /// already hides pull-only Ahead; the ops-row matches).
     pub can_push: bool,
     /// At least one selected repo is not under a pull-only prefix (Digits /
-    /// pushable path). Empty commit and Push stay limited to these paths.
+    /// pushable path). Empty commit, Push, and Gen & push stay limited to
+    /// these paths.
     pub has_pushable_path: bool,
     pub has_submodules: bool,
     /// At least one target is not yet on `mute_attention_prefixes`.
@@ -41,6 +45,9 @@ pub(crate) fn fleet_menu_caps(app: &RepoHarborApp, targets: &[String]) -> FleetM
         let pull_only = app.is_pull_only(id);
         if !pull_only {
             caps.has_pushable_path = true;
+            if row.dirty > 0 {
+                caps.has_dirty_pushable = true;
+            }
             if row.ahead > 0 {
                 caps.can_push = true;
             }
@@ -104,6 +111,7 @@ pub(crate) fn fill_fleet_actions_menu(
     let push_on = on && opts.caps.can_push;
     let sub_on = on && opts.caps.has_submodules;
     let gen_on = on && opts.ai_ready && opts.caps.has_dirty;
+    let gen_push_on = on && opts.ai_ready && opts.caps.has_dirty_pushable;
     let empty_on = on && opts.caps.has_pushable_path;
     let mut m = menu;
 
@@ -193,21 +201,23 @@ pub(crate) fn fill_fleet_actions_menu(
         }
         {
             let (a, r) = (app.clone(), repos.clone());
-            m = m.item(PopupMenuItem::new("Gen & push").disabled(!gen_on).on_click(
-                move |_, window, cx| {
-                    a.update(cx, |this, cx| {
-                        let dirty = dirty_targets(this, &r);
-                        this.adopt_fleet_targets(&dirty);
-                        this.run_generate_commit(
-                            crate::views::generate_commit::GenerateCommitChoice::CommitAndPush,
-                            dirty,
-                            false,
-                            window,
-                            cx,
-                        );
-                    });
-                },
-            ));
+            m = m.item(
+                PopupMenuItem::new("Gen & push")
+                    .disabled(!gen_push_on)
+                    .on_click(move |_, window, cx| {
+                        a.update(cx, |this, cx| {
+                            let dirty = dirty_targets(this, &r);
+                            this.adopt_fleet_targets(&dirty);
+                            this.run_generate_commit(
+                                crate::views::generate_commit::GenerateCommitChoice::CommitAndPush,
+                                dirty,
+                                false,
+                                window,
+                                cx,
+                            );
+                        });
+                    }),
+            );
         }
         let (a, r) = (app.clone(), repos.clone());
         m = m.item(

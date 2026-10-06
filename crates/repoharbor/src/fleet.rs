@@ -167,8 +167,9 @@ pub enum FleetOp {
     EmptyCommit,
     /// Per-repo AI message only — no commit/push (toast + Log).
     GenerateMessageOnly,
-    /// Per-repo AI message → `commit_all` → `push`. Multi-repo fleet runs
-    /// start only through the confirm modal ([`RepoHarborApp::confirm_fleet_gen_push`]).
+    /// Per-repo AI message → `commit_all` → `push`. Skips pull-only paths
+    /// (same as Push). Multi-repo fleet runs start only through the confirm
+    /// modal ([`RepoHarborApp::confirm_fleet_gen_push`]).
     GenerateCommitAndPush,
     /// Only ever started through the confirm strip
     /// ([`RepoHarborApp::confirm_fleet_prune`]) — never directly from a button.
@@ -312,6 +313,43 @@ pub(crate) fn fleet_should_enqueue(run_active: bool) -> bool {
     run_active
 }
 
+/// Toast detail when a shortcut / palette fleet start is blocked by an armed
+/// confirm strip or Gen & push modal.
+pub(crate) const FLEET_CONFIRM_PENDING_DETAIL: &str =
+    "Finish or cancel the pending fleet confirm first.";
+
+/// Pure idle check for pending fleet confirms (unit-tested).
+pub(crate) fn fleet_confirms_idle(
+    has_prune: bool,
+    has_reset: bool,
+    has_discard: bool,
+    has_commit: bool,
+    has_gen_push: bool,
+) -> bool {
+    !has_prune && !has_reset && !has_discard && !has_commit && !has_gen_push
+}
+
+/// Toast copy when Push / Empty commit / Gen & push drop pull-only targets.
+fn pull_only_block_copy(op: FleetOp) -> (&'static str, &'static str, &'static str) {
+    match op {
+        FleetOp::Push => (
+            "Push blocked",
+            "Selected repos are pull-only (upstream / vendor). Push is disabled.",
+            "skipped — push runs only on digits / pushable paths.",
+        ),
+        FleetOp::GenerateCommitAndPush => (
+            "Gen & push blocked",
+            "Selected repos are pull-only (upstream / vendor). Gen & push is disabled.",
+            "skipped — gen & push runs only on digits / pushable paths.",
+        ),
+        _ => (
+            "Empty commit blocked",
+            "Selected repos are pull-only (upstream / vendor). Empty commit is disabled.",
+            "skipped — empty commit runs only on digits / pushable paths.",
+        ),
+    }
+}
+
 impl RepoHarborApp {
     /// Toggle a repo in/out of the multi-selection (card checkbox, Ctrl+click).
     pub fn toggle_selected(&mut self, id: SharedString, cx: &mut Context<Self>) {
@@ -413,11 +451,68 @@ impl RepoHarborApp {
     /// push modal). An active [`Self::fleet_run`] does **not** block — the next
     /// job joins [`Self::fleet_queue`] instead of no-op'ing.
     pub(crate) fn fleet_actions_idle(&self) -> bool {
-        self.fleet_prune.is_none()
-            && self.fleet_reset.is_none()
-            && self.fleet_discard.is_none()
-            && self.fleet_commit.is_none()
-            && self.fleet_gen_push.is_none()
+        fleet_confirms_idle(
+            self.fleet_prune.is_some(),
+            self.fleet_reset.is_some(),
+            self.fleet_discard.is_some(),
+            self.fleet_commit.is_some(),
+            self.fleet_gen_push.is_some(),
+        )
+    }
+
+    /// Gate keyboard / palette / bulk starts the same way as the ops-row:
+    /// refuse while a confirm strip or Gen & push modal is armed, and toast.
+    pub(crate) fn ensure_fleet_actions_idle(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.fleet_actions_idle() {
+            return true;
+        }
+        self.push_toast(
+            ToastKind::Info,
+            "Confirm pending",
+            Some(FLEET_CONFIRM_PENDING_DETAIL.into()),
+            cx,
+        );
+        false
+    }
+
+    /// Drop pull-only paths from `repos` for Push / Empty commit / Gen & push.
+    /// Returns `None` after an Error toast when every target was pull-only;
+    /// otherwise returns the kept list (Info toast when some were skipped).
+    pub(crate) fn retain_non_pull_only_for_op(
+        &mut self,
+        op: FleetOp,
+        mut repos: Vec<String>,
+        cx: &mut Context<Self>,
+    ) -> Option<Vec<String>> {
+        let prefixes = &self.config.pull_only_prefixes;
+        let before = repos.len();
+        repos.retain(|r| !repoharbor_core::model::path_is_pull_only(r, prefixes));
+        let blocked = before - repos.len();
+        let (blocked_title, blocked_detail, skip_detail) = pull_only_block_copy(op);
+        if repos.is_empty() {
+            self.push_toast(
+                ToastKind::Error,
+                blocked_title,
+                Some(blocked_detail.into()),
+                cx,
+            );
+            return None;
+        }
+        if blocked > 0 {
+            self.push_toast(
+                ToastKind::Info,
+                "Skipped pull-only",
+                Some(
+                    format!(
+                        "{blocked} {} {skip_detail}",
+                        if blocked == 1 { "repo" } else { "repos" }
+                    )
+                    .into(),
+                ),
+                cx,
+            );
+        }
+        Some(repos)
     }
 
     /// Replace the selection with the *currently visible* repos matching
@@ -585,51 +680,25 @@ impl RepoHarborApp {
         if repos.is_empty() {
             return;
         }
+        // Confirm handlers `.take()` their plan before calling here, so Confirm
+        // itself stays allowed. Shortcuts / palette must not clear an armed
+        // strip by starting a different fleet job underneath it.
+        if !self.ensure_fleet_actions_idle(cx) {
+            return;
+        }
         // Keep the HashSet honest with the badge (selected ∩ visible) so a
         // leftover off-filter id can't make Actions (N) disagree with checks.
         self.prune_selection_to_visible();
-        // Empty commit and Push stay off vendor / pull-only trees. Mixed
-        // selections drop those paths with an Info toast; all-pull-only → Error.
-        if matches!(op, FleetOp::EmptyCommit | FleetOp::Push) {
-            let prefixes = &self.config.pull_only_prefixes;
-            let before = repos.len();
-            repos.retain(|r| !repoharbor_core::model::path_is_pull_only(r, prefixes));
-            let blocked = before - repos.len();
-            let (blocked_title, blocked_detail, skip_detail) = match op {
-                FleetOp::Push => (
-                    "Push blocked",
-                    "Selected repos are pull-only (upstream / vendor). Push is disabled.",
-                    "skipped — push runs only on digits / pushable paths.",
-                ),
-                _ => (
-                    "Empty commit blocked",
-                    "Selected repos are pull-only (upstream / vendor). Empty commit is disabled.",
-                    "skipped — empty commit runs only on digits / pushable paths.",
-                ),
-            };
-            if repos.is_empty() {
-                self.push_toast(
-                    ToastKind::Error,
-                    blocked_title,
-                    Some(blocked_detail.into()),
-                    cx,
-                );
+        // Empty commit, Push, and Gen & push stay off vendor / pull-only trees.
+        // Mixed selections drop those paths with an Info toast; all-pull-only → Error.
+        if matches!(
+            op,
+            FleetOp::EmptyCommit | FleetOp::Push | FleetOp::GenerateCommitAndPush
+        ) {
+            let Some(kept) = self.retain_non_pull_only_for_op(op, repos, cx) else {
                 return;
-            }
-            if blocked > 0 {
-                self.push_toast(
-                    ToastKind::Info,
-                    "Skipped pull-only",
-                    Some(
-                        format!(
-                            "{blocked} {} {skip_detail}",
-                            if blocked == 1 { "repo" } else { "repos" }
-                        )
-                        .into(),
-                    ),
-                    cx,
-                );
-            }
+            };
+            repos = kept;
         }
         if matches!(op, FleetOp::CommitAll)
             && commit_message
@@ -1465,11 +1534,12 @@ impl RepoHarborApp {
     /// Fetch / Pull / Push / Gen only / Gen & push / [Empty commit].
     /// (**Submodules** lives on the always-on ops row next to Pull behind —
     /// empty selection updates every visible submodule parent.)
-    /// Push and the Gen pair stay on the bar for every selection (a Needs-me
-    /// mix of vendor + digits must not drop Gen). Push enables only when a
-    /// non–pull-only path is ahead; Empty commit only when a non–pull-only
-    /// path is selected. Gen buttons dim unless something is dirty and AI is
-    /// ready. Gen & push on N>1 arms a confirm modal first.
+    /// Push and Gen stay on the bar for every selection (a Needs-me mix of
+    /// vendor + digits must not drop Gen only). Push enables only when a
+    /// non–pull-only path is ahead; Gen & push when a non–pull-only path is
+    /// dirty; Empty commit when a non–pull-only path is selected. Gen only
+    /// dims unless something is dirty and AI is ready. Gen & push on N>1
+    /// arms a confirm modal first.
     pub fn fleet_primary_sync_buttons(
         &self,
         t: &Theme,
@@ -1534,12 +1604,13 @@ impl RepoHarborApp {
                 this.run_fleet_repos(FleetOp::Push, repos, cx);
             }),
         ));
-        let gen_enabled = idle && ai_ready && caps.has_dirty;
+        let gen_only_enabled = idle && ai_ready && caps.has_dirty;
+        let gen_push_enabled = idle && ai_ready && caps.has_dirty_pushable;
         row = row.child(bar_btn_explain(
             "mc-fleet-gen-only",
             "sparkles",
             "Gen only",
-            gen_enabled,
+            gen_only_enabled,
             t,
             cx.listener(move |this, _e, window, cx| {
                 if !this.services.ai_ready {
@@ -1577,7 +1648,7 @@ impl RepoHarborApp {
             "mc-fleet-gen-push",
             "sparkles",
             "Gen & push",
-            gen_enabled,
+            gen_push_enabled,
             t,
             cx.listener(move |this, _e, window, cx| {
                 if !this.services.ai_ready {
@@ -1591,13 +1662,13 @@ impl RepoHarborApp {
                 }
                 if !(this.fleet_actions_idle()
                     && crate::menu_actions::fleet_menu_caps(this, &this.selected_repos_ordered())
-                        .has_dirty)
+                        .has_dirty_pushable)
                 {
                     this.push_toast(
                         crate::toast::ToastKind::Info,
                         "Nothing to generate",
                         Some(
-                            "Select dirty repos first (Gen & push dims when the selection is clean)."
+                            "Select dirty non–pull-only repos first (Gen & push skips upstream / vendor paths)."
                                 .into(),
                         ),
                         cx,
@@ -2231,11 +2302,9 @@ fn generate_message_only_op() -> impl Fn(&str) -> Outcome + Sync {
     }
 }
 
-/// AI → commit_all → push. An explicit Generate, commit & push publishes
-/// every selected repo, including ones under a pull-only prefix — Needs me
-/// already asked for that publish. If AI is unreachable after a retry, a
-/// local fallback message still commits (same degrade-gracefully contract as
-/// PR drafting).
+/// AI → commit_all → push. Callers drop pull-only targets first (same filter
+/// as Push). If AI is unreachable after a retry, a local fallback message
+/// still commits (same degrade-gracefully contract as PR drafting).
 fn generate_commit_and_push_op() -> impl Fn(&str) -> Outcome + Sync {
     move |path| {
         let (message, used_fallback) = match generate_commit_message(path) {
@@ -2724,6 +2793,31 @@ mod tests {
     fn fleet_should_enqueue_only_when_run_active() {
         assert!(!fleet_should_enqueue(false));
         assert!(fleet_should_enqueue(true));
+    }
+
+    #[test]
+    fn fleet_confirms_idle_requires_no_armed_confirm() {
+        assert!(fleet_confirms_idle(false, false, false, false, false));
+        assert!(!fleet_confirms_idle(true, false, false, false, false));
+        assert!(!fleet_confirms_idle(false, true, false, false, false));
+        assert!(!fleet_confirms_idle(false, false, true, false, false));
+        assert!(!fleet_confirms_idle(false, false, false, true, false));
+        assert!(!fleet_confirms_idle(false, false, false, false, true));
+        assert!(
+            FLEET_CONFIRM_PENDING_DETAIL.contains("Finish or cancel"),
+            "{}",
+            FLEET_CONFIRM_PENDING_DETAIL
+        );
+    }
+
+    #[test]
+    fn pull_only_block_copy_covers_gen_push() {
+        let (title, detail, skip) = pull_only_block_copy(FleetOp::GenerateCommitAndPush);
+        assert_eq!(title, "Gen & push blocked");
+        assert!(detail.contains("pull-only"));
+        assert!(skip.contains("gen & push"));
+        let (push_title, _, _) = pull_only_block_copy(FleetOp::Push);
+        assert_eq!(push_title, "Push blocked");
     }
 
     #[test]

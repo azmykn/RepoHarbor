@@ -40,6 +40,21 @@ versioned trees, including nested submodule parents).
 
 ### Fixed
 
+- **Armed fleet confirms block shortcuts / palette** — `Ctrl+Shift+F` /
+  `Ctrl+Shift+P` and palette Fetch/Pull no longer clear a pending prune /
+  reset / discard / commit strip or Gen & push modal by starting another job.
+  Same idle gate as the ops-row; blocked starts toast **Confirm pending**
+  (*Finish or cancel the pending fleet confirm first.*).
+- **Pull-only Settings removals survive restart** — removing an Odoo
+  `core`/`custom` (or other) pull-only prefix records `pullOnlyOptOut` so
+  cold-load heal/seed will not re-append it. New untouched `core`/`custom`
+  trees under added roots still auto-heal; re-adding a path in Settings
+  clears that opt-out.
+- **Gen & push respects pull-only** — same filter as Push / Empty commit:
+  pull-only targets are dropped with **Skipped pull-only**; all–pull-only →
+  **Gen & push blocked**. The multi-repo confirm modal lists only pushable
+  repos; the button dims when the selection has no dirty non–pull-only path.
+  **Gen only** still works on vendor trees.
 - **Gen & push commit+push-fail toast** — when AI commit succeeds but push
   fails (e.g. DNS `Temporary failure in name resolution`), the resolution
   toast is titled **Committed, push failed** (not “Generate, commit & push

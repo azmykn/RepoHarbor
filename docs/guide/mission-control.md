@@ -61,7 +61,7 @@ Each card has a checkbox; select one or more (or use the toolbar's select-all) t
 - <kbd>Ctrl/Cmd+Shift+F</kbd> — Fetch selected
 - <kbd>Ctrl/Cmd+Shift+P</kbd> — Pull selected
 
-**Push** enables only when a selected *non–pull-only* repo is ahead. Ahead on vendor / `core` / `custom` alone does not light Push; a mixed selection runs Push only on the pushable subset (**Skipped pull-only** toast for the rest).
+**Push** and **Gen & push** enable only for *non–pull-only* targets (ahead / dirty respectively). Ahead or dirty on vendor / `core` / `custom` alone does not light those buttons; a mixed selection runs only on the pushable subset (**Skipped pull-only** toast for the rest). **Gen only** still drafts messages on pull-only trees.
 
 **Pull behind** (ops row / command palette) selects every repo with `behind > 0` and fleet-pulls them — useful for upstream Odoo/core trees you keep current without hunting the Behind mode. Pair with **pull-only prefixes** in Settings so those trees never offer Push and upstream CI / local-only Ahead stay off Needs me (silence — you'll only hear about a push if one is attempted and fails).
 

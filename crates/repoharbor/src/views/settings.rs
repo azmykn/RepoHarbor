@@ -560,7 +560,7 @@ fn roots_section(s: &SettingsState, t: &Theme, app: &Entity<RepoHarborApp>) -> i
             .text_size(px(t.text_data_sm))
             .text_color(rgb(t.fg3))
             .child(
-                "Repos under these prefixes: Pull to update, hide Push, demote upstream CI. Your digits modules stay Pushable when outside this list.",
+                "Repos under these prefixes: Pull to update; hide Push / Gen & push / Empty commit; demote upstream CI. Removing a path is remembered across restarts (new Odoo core/custom trees still auto-add). Your digits modules stay Pushable when outside this list.",
             ),
     );
     for (i, prefix) in s.draft.pull_only_prefixes.iter().enumerate() {

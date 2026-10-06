@@ -22,7 +22,7 @@ Point RepoHarbor at one or more directories. It walks each up to **scan depth** 
 | Roots | `~/dev` | One or more directories to scan. |
 | Scan depth | `3` | How many levels deep to descend (1–8). |
 | Ignore | `node_modules, .cache, vendor, target, dist, .git` | Comma-separated directory names to skip. |
-| Pull-only paths | seeded `core` / `custom` under roots | Pull to update; hide Push; silence Ahead + upstream CI on Needs me. |
+| Pull-only paths | seeded `core` / `custom` under roots | Pull to update; hide Push / Gen & push / Empty commit; silence Ahead + upstream CI on Needs me. Removals persist via `pullOnlyOptOut` so cold-load heal won't undo them; new Odoo `core`/`custom` trees still auto-add. |
 | Mute attention paths | _(empty)_ | Path prefixes excluded from Needs me / attention chips / tray (`muteAttentionPrefixes` in TOML). Does not edit repo files. |
 
 ## Hosts

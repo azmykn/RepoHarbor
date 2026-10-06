@@ -2236,6 +2236,15 @@ impl RepoHarborApp {
                 }
             }
             GenerateCommitChoice::CommitAndPush => {
+                // Same pull-only filter as Push — drop vendor targets before
+                // arming the modal / starting a one-click run.
+                let Some(repos) = self.retain_non_pull_only_for_op(
+                    crate::fleet::FleetOp::GenerateCommitAndPush,
+                    repos,
+                    cx,
+                ) else {
+                    return;
+                };
                 if repos.len() > 1 {
                     self.start_fleet_gen_push(repos, cx);
                 } else {
@@ -4447,6 +4456,9 @@ impl RepoHarborApp {
 
     /// Fleet-pull every repo that is behind its upstream (palette + toolbar).
     pub fn pull_behind_repos(&mut self, cx: &mut Context<Self>) {
+        if !self.ensure_fleet_actions_idle(cx) {
+            return;
+        }
         let repos: Vec<String> = self
             .rows
             .iter()
@@ -7054,11 +7066,17 @@ impl Render for RepoHarborApp {
             }))
             .on_action(
                 cx.listener(|this, _: &crate::FleetFetchSelected, _window, cx| {
+                    if !this.ensure_fleet_actions_idle(cx) {
+                        return;
+                    }
                     this.run_fleet(crate::fleet::FleetOp::Fetch, cx);
                 }),
             )
             .on_action(
                 cx.listener(|this, _: &crate::FleetPullSelected, _window, cx| {
+                    if !this.ensure_fleet_actions_idle(cx) {
+                        return;
+                    }
                     this.run_fleet(crate::fleet::FleetOp::Pull, cx);
                 }),
             )
