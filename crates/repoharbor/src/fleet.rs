@@ -80,16 +80,20 @@ pub(crate) fn selected_visible_ordered(
 
 /// Submodule Update target set for the ops-row **Submodules** button.
 ///
-/// - **Empty selection** → every *visible* parent with nested checkouts
+/// - **Empty visible selection** → every *visible* parent with nested checkouts
 ///   (`child_count > 0`), so Mission Control filters still scope "الجميع".
-/// - **Non-empty selection** → selected ∩ visible (same hard gate as other
-///   fleet ops; the core skips repos without `.gitmodules`).
+/// - **Non-empty selected ∩ visible** → that intersection (same hard gate as
+///   other fleet ops; the core skips repos without `.gitmodules`).
+///
+/// Callers should prune `selected` to the visible set first so a leftover
+/// off-filter id cannot block the empty→all path or inflate the Actions badge.
 pub(crate) fn submodule_update_targets(
     rows: &[crate::data::Row],
     selected: &std::collections::HashSet<SharedString>,
     visible: &[usize],
 ) -> Vec<String> {
-    if selected.is_empty() {
+    let visible_selected = selected_visible_ordered(rows, selected, visible);
+    if visible_selected.is_empty() {
         visible
             .iter()
             .filter_map(|&i| rows.get(i))
@@ -97,9 +101,43 @@ pub(crate) fn submodule_update_targets(
             .map(|r| r.id.to_string())
             .collect()
     } else {
-        selected_visible_ordered(rows, selected, visible)
+        visible_selected
     }
 }
+
+/// Short display names for toast/log copy (grid `name`, else path basename).
+pub(crate) fn repo_display_names(rows: &[crate::data::Row], ids: &[String]) -> Vec<String> {
+    ids.iter()
+        .map(|id| {
+            rows.iter()
+                .find(|r| r.id.as_ref() == id.as_str())
+                .map(|r| {
+                    let n = r.name.trim();
+                    if n.is_empty() {
+                        id.rsplit('/').next().unwrap_or(id).to_string()
+                    } else {
+                        n.to_string()
+                    }
+                })
+                .unwrap_or_else(|| id.rsplit('/').next().unwrap_or(id).to_string())
+        })
+        .collect()
+}
+
+/// Comma-separated parent names, capped at `max` with "+N more".
+pub(crate) fn join_names_capped(names: &[String], max: usize) -> String {
+    if names.is_empty() {
+        return String::new();
+    }
+    if names.len() <= max {
+        return names.join(", ");
+    }
+    let shown = &names[..max];
+    format!("{}, +{} more", shown.join(", "), names.len() - max)
+}
+
+/// How many parent names to list in Submodules start toasts / Log lines.
+const MAX_SUBMODULE_PARENTS_LISTED: usize = 6;
 
 /// Which bulk operation the fleet bar runs.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -142,6 +180,8 @@ impl FleetOp {
             FleetOp::Pull => "Pulling",
             FleetOp::StageAll => "Staging",
             FleetOp::Push => "Pushing",
+            // Progress toast uses [`Self::progress_title`] so the counter reads
+            // as parent repos, not nested submodule children.
             FleetOp::SubmoduleUpdate => "Updating submodules",
             FleetOp::CommitAll => "Committing",
             FleetOp::EmptyCommit => "Creating empty commit",
@@ -150,6 +190,23 @@ impl FleetOp {
             FleetOp::Prune => "Pruning",
             FleetOp::ResetHard => "Resetting",
             FleetOp::DiscardChanges => "Discarding",
+        }
+    }
+
+    /// Progress toast / fleet-bar title. Submodules names the current parent
+    /// so `2/3` is clearly parents in the run, not children inside one repo.
+    fn progress_title(self, done: usize, total: usize, current_repo: Option<&str>) -> String {
+        match self {
+            FleetOp::SubmoduleUpdate => {
+                let unit = if total == 1 { "parent" } else { "parents" };
+                if let Some(repo) = current_repo {
+                    let name = repo.rsplit('/').next().unwrap_or(repo);
+                    format!("Updating submodules — {name} ({done}/{total})…")
+                } else {
+                    format!("Updating submodules {done}/{total} {unit}…")
+                }
+            }
+            _ => format!("{} {done}/{total}…", self.verb()),
         }
     }
 
@@ -213,6 +270,8 @@ pub struct FleetRun {
     pub cancel: Arc<AtomicBool>,
     pub done: usize,
     pub total: usize,
+    /// Basename of the repo that most recently finished (progress toast / bar).
+    pub current_name: Option<SharedString>,
 }
 
 impl RepoHarborApp {
@@ -405,6 +464,8 @@ impl RepoHarborApp {
     /// something is checked; otherwise every visible parent with nested
     /// checkouts (ops-row **Submodules** with an empty selection).
     pub fn run_submodule_update(&mut self, cx: &mut Context<Self>) {
+        // Drop off-filter leftovers so the Actions badge / empty→all cue stay honest.
+        self.prune_selection_to_visible();
         let visible = self.visible_rows();
         let empty_selection = self.selected.is_empty();
         let repos = submodule_update_targets(&self.rows, &self.selected, &visible);
@@ -422,19 +483,18 @@ impl RepoHarborApp {
             );
             return;
         }
-        // Empty→all-visible cue: name the scope before the progress toast.
-        if empty_selection {
-            let n = repos.len();
-            self.push_toast(
-                ToastKind::Info,
-                format!(
-                    "Updating {n} visible {}",
-                    if n == 1 { "parent" } else { "parents" }
-                ),
-                Some("No selection — every visible parent with nested checkouts.".into()),
-                cx,
-            );
-        }
+        // Name the parent repos before the progress counter — `done/total` is
+        // parents in this run, not submodule children inside one parent.
+        let names = repo_display_names(&self.rows, &repos);
+        let listed = join_names_capped(&names, MAX_SUBMODULE_PARENTS_LISTED);
+        let n = repos.len();
+        let title = format!("Updating {n} {}", if n == 1 { "parent" } else { "parents" });
+        let detail = if empty_selection {
+            format!("No selection — every visible parent with nested checkouts: {listed}")
+        } else {
+            format!("Selected parents: {listed}")
+        };
+        self.push_toast(ToastKind::Info, title, Some(detail.into()), cx);
         self.run_fleet_repos(FleetOp::SubmoduleUpdate, repos, cx);
     }
 
@@ -461,6 +521,9 @@ impl RepoHarborApp {
         if self.fleet_run.is_some() || repos.is_empty() {
             return;
         }
+        // Keep the HashSet honest with the badge (selected ∩ visible) so a
+        // leftover off-filter id can't make Actions (N) disagree with checks.
+        self.prune_selection_to_visible();
         // Empty commit and Push stay off vendor / pull-only trees. Mixed
         // selections drop those paths with an Info toast; all-pull-only → Error.
         if matches!(op, FleetOp::EmptyCommit | FleetOp::Push) {
@@ -534,12 +597,13 @@ impl RepoHarborApp {
             cancel: cancel.clone(),
             done: 0,
             total,
+            current_name: None,
         });
         let key = SharedString::from(format!("fleet:{run_id}"));
         self.upsert_toast(
             key.clone(),
             ToastKind::Progress,
-            format!("{} 0/{total}…", op.verb()),
+            op.progress_title(0, total, None),
             None,
             cx,
         );
@@ -554,20 +618,18 @@ impl RepoHarborApp {
                     let applied = this.update(cx, |this, cx| {
                         // Only the still-active run updates the toast: a stale
                         // queued event must not overwrite the resolution.
-                        let verb = match &mut this.fleet_run {
+                        let title = match &mut this.fleet_run {
                             Some(run) if run.id == run_id => {
                                 run.done = ev.done;
-                                run.op.verb()
+                                let name =
+                                    ev.result.repo.rsplit('/').next().unwrap_or(&ev.result.repo);
+                                run.current_name = Some(SharedString::from(name.to_string()));
+                                run.op
+                                    .progress_title(ev.done, ev.total, Some(&ev.result.repo))
                             }
                             _ => return,
                         };
-                        this.upsert_toast(
-                            key.clone(),
-                            ToastKind::Progress,
-                            format!("{verb} {}/{}…", ev.done, ev.total),
-                            None,
-                            cx,
-                        );
+                        this.upsert_toast(key.clone(), ToastKind::Progress, title, None, cx);
                     });
                     if applied.is_err() {
                         break;
@@ -692,6 +754,9 @@ impl RepoHarborApp {
                 let (kind, title, detail) = resolve_toast(op, &report);
                 let ctx = fleet_log_context(this, &report);
                 this.upsert_toast_ctx(key, kind, title, detail, ctx, cx);
+                if matches!(op, FleetOp::SubmoduleUpdate) {
+                    push_submodule_log_lines(this, &report);
+                }
                 // One rescan for the whole run (not per repo) so the grid
                 // reflects the new ahead/behind/dirty state.
                 this.rescan(cx);
@@ -1056,18 +1121,16 @@ impl RepoHarborApp {
             );
         }
         if let Some(run) = &self.fleet_run {
+            let current = run.current_name.as_deref();
             bar = bar
                 .child(
                     div()
                         .font_family("monospace")
                         .text_size(px(t.text_data_sm))
                         .text_color(rgb(t.fg2))
-                        .child(SharedString::from(format!(
-                            "{} {}/{}…",
-                            run.op.verb(),
-                            run.done,
-                            run.total
-                        ))),
+                        .child(SharedString::from(
+                            run.op.progress_title(run.done, run.total, current),
+                        )),
                 )
                 .child(bar_btn(
                     "fleet-cancel",
@@ -1775,6 +1838,32 @@ fn fleet_log_context(app: &RepoHarborApp, report: &FleetReport) -> crate::activi
     ctx
 }
 
+/// One Log line per parent: `Submodules: parent — child1: ff; child2: skipped`.
+fn push_submodule_log_lines(app: &mut RepoHarborApp, report: &FleetReport) {
+    use crate::activity_log::LogLevel;
+    let at = crate::data::now_unix();
+    for r in &report.results {
+        let name = r.repo.rsplit('/').next().unwrap_or(&r.repo);
+        let body = match &r.outcome {
+            Outcome::Ok(m) if !m.is_empty() => m.as_str(),
+            Outcome::Ok(_) => "ok",
+            Outcome::Failed(m) => m.as_str(),
+            Outcome::Skipped(m) => m.as_str(),
+        };
+        let level = match &r.outcome {
+            Outcome::Failed(_) => LogLevel::Error,
+            Outcome::Skipped(_) => LogLevel::Warn,
+            Outcome::Ok(_) => LogLevel::Info,
+        };
+        let msg = format!(
+            "Submodules: {name} — {}",
+            crate::data::oneline(body.to_string())
+        );
+        let ctx = app.log_context_for_id(&r.repo);
+        app.activity_log.push_ctx(at, level, msg, ctx);
+    }
+}
+
 /// Kind + title + detail for the fleet resolution toast.
 ///
 /// Titles read as outcomes ("Pull succeeded" / "Pull failed"), not bare
@@ -1804,7 +1893,7 @@ fn resolve_toast(op: FleetOp, report: &FleetReport) -> (ToastKind, String, Optio
     let detail = if failed > 0 {
         failure_detail(report)
     } else {
-        success_detail(report, ok, skipped)
+        success_detail(op, report, ok, skipped)
     };
     (kind, title, detail)
 }
@@ -1824,7 +1913,12 @@ fn count_line(ok: usize, failed: usize, skipped: usize) -> String {
 /// Success-path detail: per-repo git outcome when there are few, else a count
 /// summary. Prefers the engine's short messages ("up to date",
 /// "fast-forwarded 3") so Pull/Fetch results are unambiguous.
-fn success_detail(report: &FleetReport, ok: usize, skipped: usize) -> Option<SharedString> {
+fn success_detail(
+    op: FleetOp,
+    report: &FleetReport,
+    ok: usize,
+    skipped: usize,
+) -> Option<SharedString> {
     if report.cancelled {
         return Some(count_line(ok, 0, skipped).into());
     }
@@ -1840,10 +1934,13 @@ fn success_detail(report: &FleetReport, ok: usize, skipped: usize) -> Option<Sha
                     } else {
                         msg.as_str()
                     };
-                    Some(format!(
-                        "{name}: {}",
-                        clip(&crate::data::oneline(msg.to_string()), MAX_REASON_CHARS)
-                    ))
+                    let body = clip(&crate::data::oneline(msg.to_string()), MAX_REASON_CHARS);
+                    // Submodule summaries are already "child: status; …".
+                    Some(if matches!(op, FleetOp::SubmoduleUpdate) {
+                        format!("{name} — {body}")
+                    } else {
+                        format!("{name}: {body}")
+                    })
                 }
                 Outcome::Ok(_) => Some(name.to_string()),
                 Outcome::Skipped(why) => Some(format!(
@@ -2287,5 +2384,46 @@ mod tests {
         let visible = vec![1usize, 2];
         let out = submodule_update_targets(&rows, &selected, &visible);
         assert_eq!(out, vec!["/b".to_string(), "/c".to_string()]);
+    }
+
+    #[test]
+    fn submodule_targets_off_filter_selection_falls_back_to_visible_parents() {
+        let rows = vec![
+            stub_parent("/visible-subs", 2),
+            stub_parent("/hidden", 3),
+            stub_parent("/plain", 0),
+        ];
+        // Selection only names an off-filter repo — treat as empty visible
+        // selection so Submodules (N) / empty→all still works.
+        let selected = ["/hidden"].into_iter().map(SharedString::from).collect();
+        let visible = vec![0usize, 2];
+        let out = submodule_update_targets(&rows, &selected, &visible);
+        assert_eq!(out, vec!["/visible-subs".to_string()]);
+    }
+
+    #[test]
+    fn submodule_progress_title_names_parent_and_unit() {
+        assert_eq!(
+            FleetOp::SubmoduleUpdate.progress_title(0, 3, None),
+            "Updating submodules 0/3 parents…"
+        );
+        assert_eq!(
+            FleetOp::SubmoduleUpdate.progress_title(2, 3, Some("/home/azmy/odoo/manooshaalreef")),
+            "Updating submodules — manooshaalreef (2/3)…"
+        );
+        assert_eq!(
+            FleetOp::Pull.progress_title(1, 4, Some("/x/a")),
+            "Pulling 1/4…"
+        );
+    }
+
+    #[test]
+    fn join_names_capped_lists_then_more() {
+        let names: Vec<String> = (0..8).map(|i| format!("r{i}")).collect();
+        assert_eq!(join_names_capped(&names[..2], 6), "r0, r1");
+        assert_eq!(
+            join_names_capped(&names, 6),
+            "r0, r1, r2, r3, r4, r5, +2 more"
+        );
     }
 }

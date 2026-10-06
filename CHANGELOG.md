@@ -23,11 +23,18 @@ versioned trees, including nested submodule parents).
   all → push) before running. **Gen only** stays one-click; single-repo Gen &
   push (drawer / one dirty target) stays one-click.
 - **Submodules empty→all cue** — idle empty selection shows **Submodules (N)**
-  for visible parents with nested checkouts; starting that path toasts
-  **Updating N visible parents…** before the progress counter.
+  for visible parents with nested checkouts; starting Submodules toasts the
+  parent name list before the progress counter.
 
 ### Fixed
 
+- **Submodules progress names parents** — the `done/total` counter is parent
+  repos in the run (not nested children). Progress reads
+  `Updating submodules — name (2/3)…` / `… 0/3 parents…`; start toasts list
+  parent names; completion writes Log lines
+  `Submodules: parent — child: status; …`. Off-filter leftover selection ids
+  are pruned so Actions (N) matches visible checkboxes, and empty→all still
+  shows **Submodules (N)** when nothing visible is checked.
 - **Fleet ops ignore off-filter selections** — Fetch / Pull / Push / Gen /
   Empty commit / Actions / context-menu selection scope only target repos that
   are both selected and currently visible under Mission Control filters
@@ -64,7 +71,8 @@ versioned trees, including nested submodule parents).
 - **Submodules without a selection** — ops-row **Submodules** stays visible
   when nothing is checked and updates every *visible* parent with nested
   checkouts (`child_count > 0`); with a selection it still runs only
-  selected ∩ visible. Progress toast remains **Updating submodules** `N/…`.
+  selected ∩ visible. Progress toast names the current parent and says
+  **parents** so `N/…` is unambiguous.
 - **Gen commit without a popup** — Mission Control ops row and drawer Changes
   show side-by-side **Gen only** (AI message) and **Gen & push** (message →
   commit all → push); no choice modal (multi-repo Gen & push uses the confirm

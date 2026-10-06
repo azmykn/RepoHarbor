@@ -6598,10 +6598,12 @@ impl RepoHarborApp {
             t,
             cx.listener(|this, _ev, _w, cx| this.fetch_all_hosts(cx)),
         ));
-        // Always-on Submodules: empty selection → all visible parents with
-        // nested checkouts; with a selection → selected ∩ visible only.
+        // Always-on Submodules: empty *visible* selection → all visible parents
+        // with nested checkouts; with a visible selection → selected ∩ visible.
         // Idle+empty: show the visible-parent count so empty→all is obvious.
-        let sub_label = if self.selected.is_empty() {
+        // Use selected∩visible (not raw HashSet) so off-filter leftovers don't
+        // hide the (N) cue or disagree with the Actions badge.
+        let sub_label = if self.selected_repos_ordered().is_empty() {
             let visible = self.visible_rows();
             let n =
                 crate::fleet::submodule_update_targets(&self.rows, &self.selected, &visible).len();

@@ -39,7 +39,7 @@ Ops row (bottom) — verbs that execute work, visible even with no selection:
 - **Refresh** — labeled accent control that re-scans workspace roots (git status, attention, grid). The same action is on the chrome bar next to **+**. A toast reports **Scanning…** then **Scan finished**.
 - **Pull behind** — fleet-pulls every repo currently behind upstream.
 - **Fetch all** — host enrichment refresh (ignores TTL).
-- **Submodules** — update nested checkouts. Empty selection → every visible parent with submodules (**Submodules (N)** when idle); with a selection → selected ∩ visible only. Empty→all toasts **Updating N visible parents…**.
+- **Submodules** — update nested checkouts. Empty selection → every visible parent with submodules (**Submodules (N)** when idle); with a selection → selected ∩ visible only. Start toasts list parent names; progress is per parent (`Updating submodules — name (2/3)…`).
 - **Summarize** — one-line AI summaries for every repo (when AI is ready). A toast tracks **Summarizing…** then success / already up to date / error; summaries appear on List rows and Grid cards (cached by commit).
 - With a selection: select-all plus **Fetch / Pull / Push / Gen only / Gen & push / [Empty commit]** and a slim **Actions ▾** (Stage / Commit / Discard / Prune / Reset / Mute / IDE — sync verbs stay on the primaries).
 

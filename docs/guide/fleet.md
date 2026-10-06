@@ -23,7 +23,7 @@ Always-on (no selection required):
 | **Refresh** | Re-scan workspace roots. |
 | **Pull behind** | Fleet-pull every repo currently behind upstream. |
 | **Fetch all** | Host enrichment refresh (ignores TTL). |
-| **Submodules** | Update nested checkouts. With a selection → selected ∩ visible; with an **empty** selection → every *visible* parent with `child_count > 0`. Idle empty selection shows **Submodules (N)**; starting empty→all toasts **Updating N visible parents…**. Progress remains **Updating submodules** `N/…`. |
+| **Submodules** | Update nested checkouts. With a selection → selected ∩ visible; with an **empty** selection → every *visible* parent with `child_count > 0`. Idle empty selection shows **Submodules (N)**; starting toasts list parent names. Progress is **parent repos** (`Updating submodules — name (2/3)…`); Log lines are `Submodules: parent — child: status`. |
 | **Summarize** | One-line AI summaries when `aiReady`. |
 
 Results stream back **per repo** as each finishes — done, skipped, or error — and a long run can be **cancelled** mid-flight. Clear the selection from the bar (or Esc) when you're done. Destructive ops (Discard / Prune / Reset) and multi-repo **Gen & push** expand a confirm strip before running.
