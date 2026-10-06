@@ -196,10 +196,38 @@ impl Default for AppConfig {
             workspace_groups: Vec::new(),
             active_workspace_group: None,
             pull_only_prefixes: Vec::new(),
+            pull_only_opt_out: Vec::new(),
             mute_attention_prefixes: Vec::new(),
             diff_command: crate::model::default_diff_command(),
         }
     }
+}
+
+/// Trailing-slash–insensitive path equality for pull-only lists.
+fn same_pull_only_path(a: &str, b: &str) -> bool {
+    a.trim_end_matches('/') == b.trim_end_matches('/')
+}
+
+/// True when `path` is listed in `pull_only_opt_out` (user removed it).
+fn pull_only_path_opted_out(cfg: &AppConfig, path: &str) -> bool {
+    cfg.pull_only_opt_out
+        .iter()
+        .any(|p| same_pull_only_path(p, path))
+}
+
+/// Record an explicit Settings removal so heal/seed will not re-append `path`.
+pub fn note_pull_only_opt_out(cfg: &mut AppConfig, path: &str) {
+    let path = path.trim_end_matches('/');
+    if path.is_empty() || pull_only_path_opted_out(cfg, path) {
+        return;
+    }
+    cfg.pull_only_opt_out.push(path.to_string());
+}
+
+/// Clear opt-out when the user re-adds a pull-only prefix in Settings.
+pub fn clear_pull_only_opt_out(cfg: &mut AppConfig, path: &str) {
+    cfg.pull_only_opt_out
+        .retain(|p| !same_pull_only_path(p, path));
 }
 
 /// If `workspace_groups` is empty, seed Odoo-style groups (`core` / `digits` /
@@ -261,12 +289,16 @@ fn odoo_pull_only_candidates(roots: &[String]) -> Vec<String> {
 }
 
 /// If `pull_only_prefixes` is empty, seed upstream / vendor trees from the
-/// Odoo layout under each root. Returns true when prefixes were added.
+/// Odoo layout under each root. Skips paths the user explicitly removed
+/// (`pull_only_opt_out`). Returns true when prefixes were added.
 pub fn seed_pull_only_if_empty(cfg: &mut AppConfig) -> bool {
     if !cfg.pull_only_prefixes.is_empty() {
         return false;
     }
-    let prefixes = odoo_pull_only_candidates(&cfg.roots);
+    let prefixes: Vec<String> = odoo_pull_only_candidates(&cfg.roots)
+        .into_iter()
+        .filter(|path| !pull_only_path_opted_out(cfg, path))
+        .collect();
     if prefixes.is_empty() {
         return false;
     }
@@ -276,7 +308,9 @@ pub fn seed_pull_only_if_empty(cfg: &mut AppConfig) -> bool {
 
 /// Append missing Odoo `core` / `custom` pull-only prefixes when a root was
 /// added after the first seed (e.g. `odoo20` while 17–19 were already listed).
-/// Does not remove user edits. Returns true when anything was appended.
+/// Does not remove user edits, and never re-adds paths listed in
+/// `pull_only_opt_out` (Settings removals). Returns true when anything was
+/// appended.
 pub fn heal_pull_only_odoo_trees(cfg: &mut AppConfig) -> bool {
     let candidates = odoo_pull_only_candidates(&cfg.roots);
     if candidates.is_empty() {
@@ -284,12 +318,11 @@ pub fn heal_pull_only_odoo_trees(cfg: &mut AppConfig) -> bool {
     }
     let mut changed = false;
     for path in candidates {
-        let already = cfg.pull_only_prefixes.iter().any(|p| {
-            let a = p.trim_end_matches('/');
-            let b = path.trim_end_matches('/');
-            a == b
-        });
-        if !already {
+        let already = cfg
+            .pull_only_prefixes
+            .iter()
+            .any(|p| same_pull_only_path(p, &path));
+        if !already && !pull_only_path_opted_out(cfg, &path) {
             cfg.pull_only_prefixes.push(path);
             changed = true;
         }
@@ -464,6 +497,54 @@ mod tests {
             !heal_pull_only_odoo_trees(&mut cfg),
             "second heal is a no-op"
         );
+    }
+
+    #[test]
+    fn heal_pull_only_respects_settings_opt_out() {
+        let root = tempfile::tempdir().unwrap();
+        let odoo20 = root.path().join("odoo20");
+        std::fs::create_dir_all(odoo20.join("core")).unwrap();
+        std::fs::create_dir_all(odoo20.join("custom")).unwrap();
+        let core = odoo20.join("core").to_string_lossy().into_owned();
+        let custom = odoo20.join("custom").to_string_lossy().into_owned();
+        let mut cfg = AppConfig {
+            roots: vec![odoo20.to_string_lossy().into_owned()],
+            // User kept custom pull-only but removed core in Settings.
+            pull_only_prefixes: vec![custom.clone()],
+            pull_only_opt_out: vec![core.clone()],
+            ..AppConfig::default()
+        };
+        assert!(
+            !heal_pull_only_odoo_trees(&mut cfg),
+            "opted-out core must not be re-appended"
+        );
+        assert!(!cfg.pull_only_prefixes.iter().any(|p| p == &core));
+        assert!(cfg.pull_only_prefixes.iter().any(|p| p == &custom));
+
+        // Re-adding in Settings clears opt-out; heal is still a no-op once listed.
+        clear_pull_only_opt_out(&mut cfg, &core);
+        cfg.pull_only_prefixes.push(core.clone());
+        assert!(!heal_pull_only_odoo_trees(&mut cfg));
+        assert!(cfg.pull_only_opt_out.is_empty());
+    }
+
+    #[test]
+    fn seed_pull_only_skips_opted_out_candidates() {
+        let root = tempfile::tempdir().unwrap();
+        let odoo20 = root.path().join("odoo20");
+        std::fs::create_dir_all(odoo20.join("core")).unwrap();
+        std::fs::create_dir_all(odoo20.join("custom")).unwrap();
+        let core = odoo20.join("core").to_string_lossy().into_owned();
+        let custom = odoo20.join("custom").to_string_lossy().into_owned();
+        let mut cfg = AppConfig {
+            roots: vec![odoo20.to_string_lossy().into_owned()],
+            pull_only_prefixes: Vec::new(),
+            pull_only_opt_out: vec![core.clone()],
+            ..AppConfig::default()
+        };
+        assert!(seed_pull_only_if_empty(&mut cfg));
+        assert!(!cfg.pull_only_prefixes.iter().any(|p| p == &core));
+        assert!(cfg.pull_only_prefixes.iter().any(|p| p == &custom));
     }
 
     #[test]

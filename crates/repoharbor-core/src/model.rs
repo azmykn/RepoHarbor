@@ -213,6 +213,11 @@ pub struct AppConfig {
     /// demote upstream CI to Info and hide Push; Behind still prompts Pull.
     #[serde(default)]
     pub pull_only_prefixes: Vec<String>,
+    /// Absolute path prefixes the user removed from `pull_only_prefixes`.
+    /// Cold-load heal / seed must not re-append matching Odoo `core`/`custom`
+    /// candidates until the user adds the path back in Settings.
+    #[serde(default)]
+    pub pull_only_opt_out: Vec<String>,
     /// Absolute path prefixes (or `~`-expandable) whose repos are excluded
     /// from Needs me / attention chips / tray actionable items entirely.
     /// Does not edit files inside the repo — mute is local to RepoHarbor.

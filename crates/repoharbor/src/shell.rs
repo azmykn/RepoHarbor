@@ -1594,6 +1594,9 @@ impl RepoHarborApp {
             // Fleet verbs (#184) — the same run plumbing as the fleet bar
             // (`fleet.rs`); one bulk run at a time is enforced there.
             PaletteItem::Action(PaletteAction::FetchAll) => {
+                if !self.ensure_fleet_actions_idle(cx) {
+                    return;
+                }
                 let repos: Vec<String> = self.rows.iter().map(|r| r.id.to_string()).collect();
                 self.run_fleet_repos(crate::fleet::FleetOp::Fetch, repos, cx);
             }
@@ -1601,9 +1604,15 @@ impl RepoHarborApp {
                 self.pull_behind_repos(cx);
             }
             PaletteItem::Action(PaletteAction::FetchSelected) => {
+                if !self.ensure_fleet_actions_idle(cx) {
+                    return;
+                }
                 self.run_fleet(crate::fleet::FleetOp::Fetch, cx)
             }
             PaletteItem::Action(PaletteAction::PullSelected) => {
+                if !self.ensure_fleet_actions_idle(cx) {
+                    return;
+                }
                 self.run_fleet(crate::fleet::FleetOp::Pull, cx)
             }
             PaletteItem::Action(PaletteAction::SelectDirty) => {
@@ -2897,16 +2906,18 @@ impl RepoHarborApp {
                 s.draft.pull_only_prefixes.push(store.clone());
                 s.saved = false;
             }
+            // Re-adding clears a prior Settings removal so heal may treat it as
+            // an intentional pull-only path again.
+            repoharbor_core::config::clear_pull_only_opt_out(&mut s.draft, &store);
             let input = s.add_pull_only.clone();
             input.update(cx, |input, cx| {
                 input.set_value("", window, cx);
             });
         }
-        self.config.pull_only_prefixes = self
-            .settings
-            .as_ref()
-            .map(|s| s.draft.pull_only_prefixes.clone())
-            .unwrap_or_default();
+        if let Some(s) = &self.settings {
+            self.config.pull_only_prefixes = s.draft.pull_only_prefixes.clone();
+            self.config.pull_only_opt_out = s.draft.pull_only_opt_out.clone();
+        }
         let _ = repoharbor_core::config::save(&self.config);
         self.recompute_attention();
         cx.notify();
@@ -2916,10 +2927,13 @@ impl RepoHarborApp {
     pub fn settings_remove_pull_only(&mut self, index: usize, cx: &mut Context<Self>) {
         if let Some(s) = &mut self.settings {
             if index < s.draft.pull_only_prefixes.len() {
-                s.draft.pull_only_prefixes.remove(index);
+                let removed = s.draft.pull_only_prefixes.remove(index);
+                // Remember the removal so cold-load heal/seed won't undo it.
+                repoharbor_core::config::note_pull_only_opt_out(&mut s.draft, &removed);
                 s.saved = false;
             }
             self.config.pull_only_prefixes = s.draft.pull_only_prefixes.clone();
+            self.config.pull_only_opt_out = s.draft.pull_only_opt_out.clone();
         }
         let _ = repoharbor_core::config::save(&self.config);
         self.recompute_attention();
