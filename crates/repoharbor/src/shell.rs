@@ -963,6 +963,9 @@ impl RepoHarborApp {
         // Needs-me occurrence is its highest actionable severity. Live agent
         // sessions are a readout, not a filter hit.
         self.attention_by_repo = index_needs_me(&self.attention_items);
+        // Needs me / chip membership can change without an explicit filter
+        // click — drop selection ids that left the visible set.
+        self.prune_selection_to_visible();
         self.push_tray_attention();
         self.notify_fresh_urgent();
     }
@@ -1374,7 +1377,7 @@ impl RepoHarborApp {
                 &d.code,
                 &d.semantic,
                 &d.query.read(cx).value(),
-                !self.selected.is_empty(),
+                !self.selected_repos_ordered().is_empty(),
             ),
             _ => Vec::new(),
         }
@@ -2158,12 +2161,16 @@ impl RepoHarborApp {
         .detach();
     }
 
-    /// Dirty repos in the current selection (grid order) — Gen only / Gen & push targets.
+    /// Dirty repos in the current *visible* selection (grid order) — Gen only /
+    /// Gen & push targets.
     pub fn dirty_selected_repos(&self) -> Vec<String> {
-        self.rows
-            .iter()
-            .filter(|r| self.selected.contains(&r.id) && r.dirty > 0)
-            .map(|r| r.id.to_string())
+        self.selected_repos_ordered()
+            .into_iter()
+            .filter(|id| {
+                self.rows
+                    .iter()
+                    .any(|r| r.id.as_ref() == id.as_str() && r.dirty > 0)
+            })
             .collect()
     }
 
@@ -5022,6 +5029,9 @@ impl RepoHarborApp {
         let input = cx.new(|cx| InputState::new(window, cx).placeholder("Filter repos by name…"));
         let sub = cx.observe(&input, |this, input, cx| {
             this.grid.query = input.read(cx).value().to_string();
+            // Name filter is orthogonal to chips — prune (don't clear) so
+            // still-visible picks stay selected and hidden ones can't be fleeted.
+            this.prune_selection_to_visible();
             cx.notify();
         });
         self.repo_search = Some(input);
@@ -6579,6 +6589,19 @@ impl RepoHarborApp {
             t,
             cx.listener(|this, _ev, _w, cx| this.fetch_all_hosts(cx)),
         ));
+        // Always-on Submodules: empty selection → all visible parents with
+        // nested checkouts; with a selection → selected ∩ visible only.
+        row = row.child(tool_btn(
+            "tb-submodules",
+            "box",
+            Some("Submodules"),
+            Some(
+                "Update nested checkouts — selection when checked, else every visible parent with submodules",
+            ),
+            false,
+            t,
+            cx.listener(|this, _ev, _w, cx| this.run_submodule_update(cx)),
+        ));
         if self.services.ai_ready {
             row = row.child(tool_btn(
                 "tb-summarize",
@@ -6590,9 +6613,11 @@ impl RepoHarborApp {
                 cx.listener(|this, _ev, _w, cx| this.summarize_all(cx)),
             ));
         }
-        // Selection-scoped primaries: Fetch / Pull / Push / Submodules /
-        // Gen only / Gen & push / [Empty commit] beside Actions ▾.
-        if !self.selected.is_empty() {
+        // Selection-scoped primaries: Fetch / Pull / Push / Gen only /
+        // Gen & push / [Empty commit] beside Actions ▾. Count only repos
+        // still visible under the active Mission Control filters.
+        let selected_n = self.selected_repos_ordered().len();
+        if selected_n > 0 {
             row = row
                 .child(self.fleet_primary_sync_buttons(t, cx))
                 .child(self.fleet_actions_button(t, cx))
@@ -6601,10 +6626,7 @@ impl RepoHarborApp {
                         .font_family("monospace")
                         .text_size(px(t.text_data_sm))
                         .text_color(rgb(t.fg2))
-                        .child(SharedString::from(format!(
-                            "{} selected",
-                            self.selected.len()
-                        ))),
+                        .child(SharedString::from(format!("{selected_n} selected"))),
                 );
         }
         row
@@ -7070,7 +7092,7 @@ impl RepoHarborApp {
                     &data.code,
                     &data.semantic,
                     &query,
-                    !self.selected.is_empty(),
+                    !self.selected_repos_ordered().is_empty(),
                 );
                 Some(
                     crate::palette::render(data, &items, &self.rows, &query, t, &cx.entity())

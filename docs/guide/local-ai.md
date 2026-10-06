@@ -5,7 +5,7 @@ RepoHarbor's AI features run **on-device by default** — nothing leaves your ma
 ## What it powers
 
 - **Repo summaries** — a synthesized "what is this / what's been happening" blurb on each card, generated on demand or in bulk.
-- **Commit messages** — drafted from your staged diff in the repo drawer, enriched with the `CHANGELOG.md` nearest the files you touched and your recent commit subjects (see [Commit-message context](#commit-message-context)).
+- **Commit messages** — drafted from your staged/working diff (drawer + fleet Gen only / Gen & push), preferring staged changelog hunks when present, else the nearest on-disk `CHANGELOG.md` and recent commit subjects (see [Commit-message context](#commit-message-context)).
 - **Changelogs** — summarised from recent history.
 - **Daily briefing** — a one-line "here's where things stand" across your workspace.
 - **Resume catch-up** — what changed in a repo since you last looked (see [The repo drawer](./repo-drawer)).
@@ -85,12 +85,13 @@ The key is **not** stored in `config.toml` (which people paste into bug reports)
 
 ## Commit-message context
 
-A diff alone rarely explains *why* something changed, so **Generate commit** adds two more sources before prompting the model:
+A diff alone rarely explains *why* something changed, so **Generate commit** (drawer Gen only / Gen & push, and the Mission Control fleet equivalents) adds two more sources before prompting the model:
 
-- **The nearest changelog.** RepoHarbor walks up from each changed file to the repo root and takes the first `CHANGELOG.md` (also `.rst` / `.txt`, `CHANGES.md`, `HISTORY.md`, `NEWS.md`) it finds — up to three across a multi-module commit. It prefers the `## [Unreleased]` section, falling back to the newest entries. In a monorepo of Odoo modules this means you get the changelog of the module you actually touched, not dozens of unrelated ones.
+- **Changelog updates in the staged/working diff (preferred).** When you edit `CHANGELOG.md` (also `CHANGELOG`, `.rst` / `.txt`, `CHANGES.md`, `HISTORY.md`, `NEWS.md`, or similar) in the same change set, RepoHarbor extracts the **added lines** from those hunks — typically the new `## [Unreleased]` bullets — and treats them as the primary WHAT/WHY prior. If those notes are rich enough, the code diff fed to the model is truncated tightly (changelog file hunks are omitted from the Diff block) so generation is faster and the Conventional Commit subject tracks what you already wrote. Thin or missing log edits fall back to the full clamped working diff.
+- **The nearest on-disk changelog** when the log itself isn't part of the diff (or to fill other modules in a multi-module commit). Walks up from each changed file to the repo root and takes the first matching filename — up to three across the commit — preferring `## [Unreleased]`, else the newest entries.
 - **Your last five commit subjects**, for scope naming and house style only.
 
-So keeping a short `Unreleased` note per module pays off twice: the changelog stays current *and* the generated messages get sharply better. Odoo module versions from `__manifest__.py` are still injected as before.
+So keeping a short `Unreleased` note **in the same commit as the code** pays off twice: the changelog stays current *and* Gen only / Gen & push draft faster, better-aligned messages. No extra setting — same `aiReady` gate as every other AI control. Odoo module versions from `__manifest__.py` are still injected as before.
 
 ## Where data is stored, and clearing it
 

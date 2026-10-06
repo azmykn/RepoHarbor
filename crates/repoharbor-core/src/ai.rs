@@ -68,6 +68,12 @@ const DEFAULT_NUM_PREDICT: u32 = 120;
 const COMMIT_NUM_PREDICT: u32 = 384;
 /// Max diff characters fed into the commit prompt (keeps context bounded).
 const COMMIT_DIFF_CLAMP: usize = 10_000;
+/// Tighter budget when staged changelog hunks already explain the change —
+/// skips most of the code diff so the model does less work.
+const COMMIT_DIFF_CLAMP_WITH_PRIOR: usize = 1_500;
+/// Substantive added changelog characters required before we shrink the code
+/// diff. Below this we keep the full working diff (notes alone are too thin).
+const CHANGELOG_PRIOR_MIN_CHARS: usize = 40;
 
 /// Generate text from `prompt` using `model` on the active backend. The
 /// llama.cpp backend serves the configured GGUF, so it ignores `model`.
@@ -548,6 +554,169 @@ const CHANGELOG_TAIL_LINES: usize = 80;
 /// Recent commit subjects shown to the model for house style.
 const RECENT_SUBJECTS: usize = 5;
 
+/// True when a repo-relative path is a common changelog / history log file.
+/// Matches the well-known names and any basename containing `changelog`.
+pub fn is_changelog_path(path: &str) -> bool {
+    let base = path.rsplit('/').next().unwrap_or(path);
+    if CHANGELOG_NAMES.iter().any(|n| base.eq_ignore_ascii_case(n)) {
+        return true;
+    }
+    let lower = base.to_ascii_lowercase();
+    lower.contains("changelog")
+        || lower == "changes"
+        || lower.starts_with("changes.")
+        || lower == "history"
+        || lower.starts_with("history.")
+        || lower == "news"
+        || lower.starts_with("news.")
+}
+
+/// Pick a changelog path from a `diff --git a/… b/…` header, if either side is
+/// a changelog file. Prefers the `b/` (new) side.
+fn changelog_path_from_git_header(line: &str) -> Option<String> {
+    let rest = line.strip_prefix("diff --git ")?;
+    let mut a: Option<&str> = None;
+    let mut b: Option<&str> = None;
+    for part in rest.split_whitespace() {
+        if let Some(p) = part.strip_prefix("a/") {
+            a = Some(p);
+        } else if let Some(p) = part.strip_prefix("b/") {
+            b = Some(p);
+        }
+    }
+    b.filter(|p| is_changelog_path(p))
+        .or_else(|| a.filter(|p| is_changelog_path(p)))
+        .map(|p| p.to_string())
+}
+
+/// Added lines from changelog files touched by a unified diff, as
+/// `(repo-relative path, joined +lines)`. Prefers the new/changed content the
+/// user just wrote (Unreleased bullets, etc.) over feeding the whole file.
+/// Pure — unit-tested without a filesystem or network.
+pub fn changelog_hunks_from_diff(diff: &str) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    let mut cur_path: Option<String> = None;
+    let mut cur_added: Vec<String> = Vec::new();
+
+    let flush =
+        |path: &mut Option<String>, added: &mut Vec<String>, out: &mut Vec<(String, String)>| {
+            if let Some(p) = path.take() {
+                if !added.is_empty() {
+                    let text = added.join("\n").trim().to_string();
+                    if !text.is_empty() {
+                        out.push((p, clamp_chars(&text, CHANGELOG_EXCERPT_CHARS)));
+                    }
+                }
+            }
+            added.clear();
+        };
+
+    for line in diff.lines() {
+        if line.starts_with("diff --git ") {
+            flush(&mut cur_path, &mut cur_added, &mut out);
+            cur_path = changelog_path_from_git_header(line);
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("+++ b/") {
+            let p = rest.split('\t').next().unwrap_or(rest).trim();
+            if is_changelog_path(p) {
+                // Header may have missed rename oddities; trust +++ b/.
+                if cur_path.as_deref() != Some(p) {
+                    flush(&mut cur_path, &mut cur_added, &mut out);
+                    cur_path = Some(p.to_string());
+                }
+            } else if cur_path.is_some() {
+                // Left a changelog file for a non-changelog one.
+                flush(&mut cur_path, &mut cur_added, &mut out);
+            }
+            continue;
+        }
+        if cur_path.is_none() {
+            continue;
+        }
+        if line.starts_with('+') && !line.starts_with("+++") {
+            cur_added.push(line[1..].to_string());
+        }
+    }
+    flush(&mut cur_path, &mut cur_added, &mut out);
+    out
+}
+
+/// True when staged changelog additions are rich enough to stand in for most
+/// of the code diff (faster prompt, better Conventional Commit alignment).
+pub fn changelog_prior_is_rich(hunks: &[(String, String)]) -> bool {
+    let mut bullets = 0usize;
+    let mut chars = 0usize;
+    for (_, text) in hunks {
+        for line in text.lines() {
+            let t = line.trim();
+            if t.is_empty() || t.starts_with('#') {
+                continue;
+            }
+            chars = chars.saturating_add(t.chars().count());
+            let body = t.trim_start_matches(['-', '*', '+']).trim();
+            if !body.is_empty() && body.len() < t.len() {
+                bullets = bullets.saturating_add(1);
+            }
+        }
+    }
+    (bullets >= 1 && chars >= CHANGELOG_PRIOR_MIN_CHARS)
+        || chars >= CHANGELOG_PRIOR_MIN_CHARS.saturating_mul(2)
+}
+
+/// Drop changelog file sections from a unified diff (those notes are already
+/// injected via [`CommitExtras`]). Pure helper for the slim prompt path.
+fn strip_changelog_files_from_diff(diff: &str) -> String {
+    let mut out = String::new();
+    let mut keep = true;
+    for line in diff.lines() {
+        if line.starts_with("diff --git ") {
+            keep = changelog_path_from_git_header(line).is_none();
+            // Also treat headers where only +++ would mark it — check both sides
+            // via the same helper (covers a/ and b/).
+            if !keep {
+                continue;
+            }
+        } else if let Some(rest) = line.strip_prefix("+++ b/") {
+            let p = rest.split('\t').next().unwrap_or(rest).trim();
+            if is_changelog_path(p) {
+                keep = false;
+                continue;
+            }
+        }
+        if keep {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    out
+}
+
+/// Diff text embedded in the commit prompt: full clamp by default; when
+/// `rich_changelog_prior` the changelog file hunks are omitted and the remaining
+/// code diff is clamped tightly (or replaced with a file list).
+pub fn commit_prompt_diff(diff: &str, rich_changelog_prior: bool) -> String {
+    if !rich_changelog_prior {
+        return clamp_chars(diff, COMMIT_DIFF_CLAMP);
+    }
+    let slim = strip_changelog_files_from_diff(diff);
+    if slim.trim().is_empty() {
+        let paths = changed_paths_in_diff(diff);
+        if paths.is_empty() {
+            return String::new();
+        }
+        return format!(
+            "Changed files (changelog already describes the change):\n{}",
+            paths
+                .iter()
+                .map(|p| format!("- {p}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+    }
+    clamp_chars(&slim, COMMIT_DIFF_CLAMP_WITH_PRIOR)
+}
+
 /// True for a `## Unreleased` / `## [Unreleased]` heading (Keep a Changelog).
 fn is_unreleased_heading(line: &str) -> bool {
     let l = line.trim();
@@ -680,9 +849,23 @@ impl CommitExtras {
     /// Collect changelog notes + recent subjects for `repo_path`. Every source
     /// is optional: a repo with no changelog and no history yields empty
     /// extras and the prompt is unchanged.
+    ///
+    /// Prefers **staged changelog hunks** from the diff (what the user just
+    /// wrote under Unreleased) over on-disk excerpts of the same path, then
+    /// fills remaining slots via [`nearby_changelogs`].
     pub fn gather(diff: &str, repo_path: &str) -> Self {
+        let mut changelogs = changelog_hunks_from_diff(diff);
+        for (path, excerpt) in nearby_changelogs(diff, repo_path) {
+            if changelogs.len() >= MAX_CHANGELOGS {
+                break;
+            }
+            if changelogs.iter().any(|(p, _)| *p == path) {
+                continue;
+            }
+            changelogs.push((path, excerpt));
+        }
         CommitExtras {
-            changelogs: nearby_changelogs(diff, repo_path),
+            changelogs,
             recent_subjects: crate::git_ops::recent_log(repo_path, RECENT_SUBJECTS)
                 .unwrap_or_default()
                 .into_iter()
@@ -796,13 +979,25 @@ pub fn commit_prompt_with_context(diff: &str, repo_path: Option<&str>) -> String
 
 /// Render the changelog notes / recent-subject blocks. Empty extras render
 /// nothing, so the prompt is byte-identical to the plain diff-only form.
-fn extras_block(extras: &CommitExtras) -> String {
+/// When `rich_prior` the notes are framed as the primary WHAT/WHY source.
+fn extras_block(extras: &CommitExtras, rich_prior: bool) -> String {
     let mut out = String::new();
     for (path, excerpt) in &extras.changelogs {
-        out.push_str(&format!(
-            "\nExisting changelog notes from `{path}` — use them to explain WHAT changed and WHY. \
-Only rely on entries that match this diff; do not copy them verbatim:\n{excerpt}\n"
-        ));
+        let lead = if rich_prior {
+            format!(
+                "\nChangelog updates in this commit from `{path}` — treat them as the primary \
+description of WHAT changed and WHY (align the Conventional Commit subject with them). \
+Do not copy them verbatim:\n"
+            )
+        } else {
+            format!(
+                "\nExisting changelog notes from `{path}` — use them to explain WHAT changed and WHY. \
+Only rely on entries that match this diff; do not copy them verbatim:\n"
+            )
+        };
+        out.push_str(&lead);
+        out.push_str(excerpt);
+        out.push('\n');
     }
     if !extras.recent_subjects.is_empty() {
         out.push_str(&format!(
@@ -821,6 +1016,10 @@ describe their changes:\n{}\n",
 
 /// The full commit prompt: the diff, the Odoo manifest version hint, and any
 /// [`CommitExtras`] gathered from the repo (changelog notes, recent subjects).
+///
+/// When the staged diff includes rich changelog hunks, the code diff is
+/// truncated tightly ([`commit_prompt_diff`]) so generation is faster and the
+/// message tracks what the user already wrote in the log.
 pub fn commit_prompt_with_extras(
     diff: &str,
     repo_path: Option<&str>,
@@ -829,14 +1028,23 @@ pub fn commit_prompt_with_extras(
     // The Odoo version requirement is only stated when a manifest version was
     // actually found. Stating it unconditionally taught models to invent one:
     // a Rust repo got `feat(ai): add cloud backend support (19.0.1.0.0)`.
+    let hunks = changelog_hunks_from_diff(diff);
+    let rich_prior = changelog_prior_is_rich(&hunks);
     let version_hint = odoo_manifest_version_hint(diff, repo_path);
     let version_rule = if version_hint.is_some() {
         "- You MUST mention the module version shown below in the subject or body.\n"
     } else {
         ""
     };
+    let prior_rule = if rich_prior {
+        "- Prefer the changelog updates below over the truncated code diff for WHAT/WHY; \
+use the diff only for scope / file names.\n"
+    } else {
+        ""
+    };
     let hint = version_hint.map(|h| format!("\n{h}\n")).unwrap_or_default();
-    let hint = format!("{hint}{}", extras_block(extras));
+    let hint = format!("{hint}{}", extras_block(extras, rich_prior));
+    let diff_block = commit_prompt_diff(diff, rich_prior);
     format!(
         "Write a Conventional Commit message for these staged changes.\n\n\
 Requirements:\n\
@@ -844,11 +1052,11 @@ Requirements:\n\
 - Then a blank line, then a real body of 2–5 short sentences or bullets explaining WHAT changed and WHY — not a subject-only one-liner.\n\
 - Do not invent version numbers, issue ids or file names that are not in the input.\n\
 {version_rule}\
+{prior_rule}\
 - Output ONLY the commit message — no code fences, no preamble, no quotes around the whole message.\n\
 - Write in English.\n\
 {hint}\n\
-Diff:\n{}\n\nCommit message:",
-        clamp_chars(diff, COMMIT_DIFF_CLAMP)
+Diff:\n{diff_block}\n\nCommit message:"
     )
 }
 
@@ -1492,6 +1700,138 @@ diff --git a/old.py b/old.py
         assert_eq!(
             commit_prompt_with_extras("diff --git a/x b/x\n+hi", None, &CommitExtras::default()),
             commit_prompt("diff --git a/x b/x\n+hi")
+        );
+    }
+
+    #[test]
+    fn is_changelog_path_matches_common_names() {
+        assert!(is_changelog_path("CHANGELOG.md"));
+        assert!(is_changelog_path("docs/CHANGELOG"));
+        assert!(is_changelog_path("mod/CHANGES.md"));
+        assert!(is_changelog_path("HISTORY.md"));
+        assert!(is_changelog_path("pkg/my-changelog.txt"));
+        assert!(!is_changelog_path("src/main.rs"));
+        assert!(!is_changelog_path("README.md"));
+    }
+
+    #[test]
+    fn changelog_hunks_from_diff_keeps_added_lines() {
+        let diff = "\
+diff --git a/src/main.rs b/src/main.rs
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -1 +1 @@
+-old
++new code that is long enough to look like a real change in the working tree
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -1,4 +1,6 @@
+ ## [Unreleased]
++### Fixed
++- Drawer Gen only fills the commit composer again.
+";
+        let hunks = changelog_hunks_from_diff(diff);
+        assert_eq!(hunks.len(), 1);
+        assert_eq!(hunks[0].0, "CHANGELOG.md");
+        assert!(hunks[0].1.contains("Drawer Gen only"), "{:?}", hunks[0].1);
+        assert!(!hunks[0].1.contains("new code"), "{:?}", hunks[0].1);
+        assert!(changelog_prior_is_rich(&hunks));
+    }
+
+    #[test]
+    fn thin_changelog_hunk_is_not_rich() {
+        let hunks = vec![("CHANGELOG.md".into(), "+ \n".into())];
+        assert!(!changelog_prior_is_rich(&hunks));
+        let hunks = vec![("CHANGELOG.md".into(), "### Added\n".into())];
+        assert!(!changelog_prior_is_rich(&hunks));
+    }
+
+    #[test]
+    fn rich_changelog_prior_shrinks_code_diff_in_prompt() {
+        let long_code = format!("+{}", "x".repeat(5_000));
+        let diff = format!(
+            "\
+diff --git a/src/big.rs b/src/big.rs
+--- a/src/big.rs
++++ b/src/big.rs
+@@ -1 +1 @@
+{long_code}
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -1,3 +1,5 @@
+ ## [Unreleased]
++### Changed
++- Changelog-prior commit prompts shrink the code diff when Unreleased notes are rich.
+"
+        );
+        let hunks = changelog_hunks_from_diff(&diff);
+        assert!(changelog_prior_is_rich(&hunks));
+        let slim = commit_prompt_diff(&diff, true);
+        assert!(
+            slim.chars().count() <= COMMIT_DIFF_CLAMP_WITH_PRIOR,
+            "slim len {}",
+            slim.chars().count()
+        );
+        assert!(!slim.contains("CHANGELOG.md"), "{slim}");
+        assert!(slim.contains("big.rs") || slim.contains('x'), "{slim}");
+
+        let extras = CommitExtras {
+            changelogs: hunks.clone(),
+            recent_subjects: vec![],
+        };
+        let p = commit_prompt_with_extras(&diff, None, &extras);
+        assert!(
+            p.contains("primary description") || p.contains("Prefer the changelog"),
+            "{p}"
+        );
+        assert!(p.contains("Changelog-prior commit prompts"), "{p}");
+        // The 5k run of x must not appear in full once the prior path kicks in.
+        assert!(!p.contains(&"x".repeat(3_000)), "prompt still huge");
+        assert!(
+            p.len() < COMMIT_DIFF_CLAMP + 4_000,
+            "prompt len {}",
+            p.len()
+        );
+
+        // Without a rich changelog hunk, the full clamp still applies.
+        let code_only =
+            format!("diff --git a/src/big.rs b/src/big.rs\n+++ b/src/big.rs\n{long_code}\n");
+        let full = commit_prompt_diff(&code_only, false);
+        assert!(full.chars().count() <= COMMIT_DIFF_CLAMP);
+        assert!(full.contains('x'));
+    }
+
+    #[test]
+    fn commit_extras_gather_prefers_diff_hunks_over_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(
+            root.join("CHANGELOG.md"),
+            "## [Unreleased]\n- Stale on-disk bullet that should lose.\n",
+        )
+        .unwrap();
+        let diff = "\
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -1,2 +1,3 @@
+ ## [Unreleased]
++- Fresh staged bullet for the commit message prior.
+- Stale on-disk bullet that should lose.
+";
+        let extras = CommitExtras::gather(diff, root.to_str().unwrap());
+        assert_eq!(extras.changelogs.len(), 1);
+        assert!(
+            extras.changelogs[0].1.contains("Fresh staged bullet"),
+            "{:?}",
+            extras.changelogs
+        );
+        assert!(
+            !extras.changelogs[0].1.contains("Stale on-disk"),
+            "{:?}",
+            extras.changelogs
         );
     }
 

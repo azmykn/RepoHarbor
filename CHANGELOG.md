@@ -21,11 +21,19 @@ versioned trees, including nested submodule parents).
 
 ### Fixed
 
+- **Fleet ops ignore off-filter selections** — Fetch / Pull / Push / Gen /
+  Empty commit / Actions / context-menu selection scope only target repos that
+  are both selected and currently visible under Mission Control filters
+  (work mode, chips, root, language, workspace group, TREE, Needs me, search).
+  Search prunes the selection; chip / mode / group / TREE / saved-view changes
+  still clear it. The “N selected” badge matches the visible set.
 - **Odoo `core`/`custom` pull-only heals when a version root is added later**
   — e.g. adding `odoo20` while 17–19 were already listed no longer leaves
   OCA vendor trees (like `odoo20/custom/l10n-*`) as pushable Needs-me CI.
   Missing `<root>/core` and `<root>/custom` prefixes are appended on load;
   `digits/` stays writable. Upstream CI on those paths stays out of Needs me.
+- **Drawer Gen only** — Changes-tab **Gen only** again fills the commit
+  composer (was calling a removed helper); uses the real Window path.
 - **Needs me no longer lies about an empty list** — submodule children that
   need you (e.g. unpushed `digits_hr` under TREE parents) stay visible on
   **Needs me** even without a TREE focus, and the Mission Control badge /
@@ -35,6 +43,24 @@ versioned trees, including nested submodule parents).
 
 ### Changed
 
+- **Changelog-prior commit prompts** — Gen only / Gen & push prefer **added
+  lines** from staged `CHANGELOG.md` (and similar log files) as the primary
+  WHAT/WHY prior. When those Unreleased notes are rich enough, the code diff
+  in the prompt is truncated tightly so local/hosted models draft Conventional
+  Commits faster and closer to the log the user already wrote; thin or missing
+  log edits still use the full clamped working diff plus nearest on-disk notes.
+- **Submodules without a selection** — ops-row **Submodules** stays visible
+  when nothing is checked and updates every *visible* parent with nested
+  checkouts (`child_count > 0`); with a selection it still runs only
+  selected ∩ visible. Progress toast remains **Updating submodules** `N/…`.
+- **Gen commit without a popup** — Mission Control ops row and drawer Changes
+  show side-by-side **Gen only** (AI message) and **Gen & push** (message →
+  commit all → push); no choice modal.
+- **Actions ▾ no longer duplicates ops-row sync** — Fetch / Pull / Push /
+  Gen only / Gen & push / Empty commit stay on the selection primaries;
+  **Submodules** is always-on next to Pull behind / Fetch all; the gear keeps
+  Stage / Commit / Discard / Prune / Reset / Mute / IDE. Card / TREE
+  right-click still includes the full sync set.
 - **Summarize feedback** — ops-row **Summarize** toasts **Summarizing…** then
   *N* new summaries / **Already up to date** / error (never silent). List rows
   show the same truncated sparkles AI line as Grid cards; hover tooltip
@@ -48,8 +74,9 @@ versioned trees, including nested submodule parents).
 - **Mission Control chrome** — top row is filters only (search, work modes,
   Public / Private / Starred / Stale, Working chips, Sort, Grid | List). The
   bottom row is execute ops: always-on **Refresh**, **Pull behind**, **Fetch
-  all**, and **Summarize** (when AI is ready); selection Fetch / Pull / Push /
-  Submodules / Gen commit / Empty commit / Actions when something is checked.
+  all**, **Submodules**, and **Summarize** (when AI is ready); selection
+  Fetch / Pull / Push / Gen only / Gen & push / Empty commit / Actions when
+  something is checked.
   **More ⋮** is gone from the filter row.
 - **Mission Control Refresh** — labeled icon+text **Refresh** on the ops row
   (accent wash / `fg0`) and chrome bar; click re-scans roots and toasts when

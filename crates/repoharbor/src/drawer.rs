@@ -1329,7 +1329,7 @@ fn dispatch_section(data: &DrawerData, t: &Theme, app: &Entity<RepoHarborApp>) -
                         SharedString::from("dispatch-agent"),
                         "Dispatch",
                         t,
-                        move |cx| {
+                        move |_win, cx| {
                             let repo = repo2.clone();
                             let prompt = input2.read(cx).value().trim().to_string();
                             if prompt.is_empty() {
@@ -1557,16 +1557,21 @@ fn worktrees_section(
                         .min_w(px(0.))
                         .child(gpui_component::input::Input::new(input)),
                 )
-                .child(pr_btn(SharedString::from("wt-add"), "Add", t, move |cx| {
-                    let repo = repo.clone();
-                    let name = input2.read(cx).value();
-                    if name.trim().is_empty() {
-                        return;
-                    }
-                    app.update(cx, |_this, cx| {
-                        add_worktree(repo, name.trim().to_string(), cx)
-                    });
-                })),
+                .child(pr_btn(
+                    SharedString::from("wt-add"),
+                    "Add",
+                    t,
+                    move |_win, cx| {
+                        let repo = repo.clone();
+                        let name = input2.read(cx).value();
+                        if name.trim().is_empty() {
+                            return;
+                        }
+                        app.update(cx, |_this, cx| {
+                            add_worktree(repo, name.trim().to_string(), cx)
+                        });
+                    },
+                )),
         );
     }
     s
@@ -1615,7 +1620,7 @@ fn changes_view(
                 SharedString::from("ext-diff"),
                 "Open external diff",
                 t,
-                move |cx: &mut gpui::App| {
+                move |_win, cx: &mut gpui::App| {
                     let file = file.clone();
                     app_d.update(cx, |this, cx| {
                         this.open_external_diff(
@@ -1638,25 +1643,15 @@ fn changes_view(
                 SharedString::from("gen-only"),
                 "Gen only",
                 t,
-                move |cx: &mut gpui::App| {
+                move |window, cx: &mut gpui::App| {
                     app_only.update(cx, |this, cx| {
-                        // Drawer clicks have no Window in this helper — open
-                        // Changes inputs if needed and draft into the composer.
-                        let repo = this.drawer.repo.to_string();
-                        if !this.services.ai_ready {
-                            this.push_toast(
-                                crate::toast::ToastKind::Error,
-                                "AI unavailable",
-                                Some("Enable Ollama / AI in Settings first.".into()),
-                                cx,
-                            );
-                            return;
-                        }
-                        // Message-only from the drawer: reuse the open Changes tab.
-                        // Window is required for InputState; the open path already
-                        // created the commit fields when the tab was shown.
-                        let _ = repo;
-                        this.drawer_generate_commit_from_app(cx);
+                        this.run_generate_commit(
+                            crate::views::generate_commit::GenerateCommitChoice::MessageOnly,
+                            vec![this.drawer.repo.to_string()],
+                            true,
+                            window,
+                            cx,
+                        );
                     });
                 },
             ));
@@ -1665,21 +1660,13 @@ fn changes_view(
                 SharedString::from("gen-push"),
                 "Gen & push",
                 t,
-                move |cx: &mut gpui::App| {
+                move |window, cx: &mut gpui::App| {
                     app_push.update(cx, |this, cx| {
-                        let repo = this.drawer.repo.to_string();
-                        if !this.services.ai_ready {
-                            this.push_toast(
-                                crate::toast::ToastKind::Error,
-                                "AI unavailable",
-                                Some("Enable Ollama / AI in Settings first.".into()),
-                                cx,
-                            );
-                            return;
-                        }
-                        this.run_fleet_repos(
-                            crate::fleet::FleetOp::GenerateCommitAndPush,
-                            vec![repo],
+                        this.run_generate_commit(
+                            crate::views::generate_commit::GenerateCommitChoice::CommitAndPush,
+                            vec![this.drawer.repo.to_string()],
+                            true,
+                            window,
                             cx,
                         );
                     });
@@ -1698,7 +1685,7 @@ fn changes_view(
                 SharedString::from("commit"),
                 label,
                 t,
-                move |cx: &mut gpui::App| {
+                move |_win, cx: &mut gpui::App| {
                     let repo = repo.clone();
                     let subject = input2.read(cx).value();
                     if subject.trim().is_empty() {
@@ -1771,7 +1758,7 @@ fn changes_view(
                     "Commit this"
                 },
                 t,
-                move |cx: &mut gpui::App| {
+                move |_win, cx: &mut gpui::App| {
                     let repo = repo.clone();
                     if subject2.trim().is_empty() {
                         return;
@@ -1818,7 +1805,7 @@ fn changes_view(
                     SharedString::from("push"),
                     "Push",
                     t,
-                    move |cx: &mut gpui::App| {
+                    move |_win, cx: &mut gpui::App| {
                         app6.update(cx, |this, cx| this.drawer_push(cx));
                     },
                 ));
@@ -1838,7 +1825,7 @@ fn changes_view(
                     SharedString::from("reset-hard"),
                     &label,
                     t,
-                    move |cx: &mut gpui::App| {
+                    move |_win, cx: &mut gpui::App| {
                         app_r.update(cx, |this, cx| this.drawer_reset_hard(cx));
                     },
                 ));
@@ -1853,7 +1840,7 @@ fn changes_view(
                     SharedString::from("open-pr"),
                     "Open PR",
                     t,
-                    move |cx: &mut gpui::App| {
+                    move |_win, cx: &mut gpui::App| {
                         app7.update(cx, |this, cx| this.drawer_open_pr(cx));
                     },
                 ));
@@ -1904,7 +1891,7 @@ fn changes_view(
                     SharedString::from("gen-changelog"),
                     "Generate changelog",
                     t,
-                    move |cx: &mut gpui::App| {
+                    move |_win, cx: &mut gpui::App| {
                         app5.update(cx, |this, cx| this.drawer_generate_changelog(cx));
                     },
                 )),
@@ -1992,7 +1979,7 @@ fn changes_section(
                     SharedString::from(format!("stage-all-{staged}")),
                     label,
                     t,
-                    move |cx: &mut gpui::App| {
+                    move |_win, cx: &mut gpui::App| {
                         let (repo, all) = (repo2.clone(), all.clone());
                         app2.update(cx, |_this, cx| set_staged(repo, all, !staged, cx));
                     },
@@ -2410,7 +2397,7 @@ fn pr_card(
             {
                 let (repo, slug, number) = (repo.clone(), slug.clone(), pr.number);
                 let app = app.clone();
-                move |cx: &mut gpui::App| {
+                move |_win, cx: &mut gpui::App| {
                     let (repo, slug) = (repo.clone(), slug.clone());
                     app.update(cx, |this, cx| {
                         this.drawer.pr = PrState::Loading;
@@ -2430,7 +2417,7 @@ fn pr_card(
                 let (repo, slug, number, method) =
                     (repo.clone(), slug.clone(), pr.number, method.to_string());
                 let app = app.clone();
-                move |cx: &mut gpui::App| {
+                move |_win, cx: &mut gpui::App| {
                     let (repo, slug, method) = (repo.clone(), slug.clone(), method.clone());
                     app.update(cx, |this, cx| {
                         this.drawer.pr = PrState::Loading;
@@ -2468,12 +2455,13 @@ fn pr_card(
     card.child(actions)
 }
 
-/// A small PR action button.
+/// A small PR action button. Passes `Window` so callers that need InputState
+/// (e.g. Gen only → drawer_generate_commit) can use it.
 fn pr_btn(
     id: SharedString,
     label: &str,
     t: &Theme,
-    on: impl Fn(&mut gpui::App) + 'static,
+    on: impl Fn(&mut Window, &mut gpui::App) + 'static,
 ) -> impl IntoElement {
     let (hov_border, hov_fg) = (t.border_strong, t.fg0);
     div()
@@ -2490,7 +2478,7 @@ fn pr_btn(
         .cursor_pointer()
         .hover(move |s| s.border_color(rgb(hov_border)).text_color(rgb(hov_fg)))
         .child(SharedString::from(label.to_string()))
-        .on_click(move |_ev, _win, cx| on(cx))
+        .on_click(move |_ev, win, cx| on(win, cx))
 }
 
 /// A [`pr_btn`]-shaped button in its disabled state: muted, inert, no hover.
@@ -2575,7 +2563,7 @@ fn notes_view(
             SharedString::from("gen-resume"),
             "Catch me up",
             t,
-            move |cx| {
+            move |_win, cx| {
                 app2.update(cx, |this, cx| this.drawer_generate_resume(cx));
             },
         ));
@@ -2586,7 +2574,7 @@ fn notes_view(
             SharedString::from("mark-seen"),
             "Mark caught up",
             t,
-            move |cx| {
+            move |_win, cx| {
                 let repo = repo.clone();
                 app.update(cx, |_this, cx| mark_seen(repo, cx));
             },
@@ -2635,7 +2623,7 @@ fn notes_view(
                 SharedString::from("save-note"),
                 "Save note",
                 t,
-                move |cx| {
+                move |_win, cx| {
                     let (repo, text) = (repo.clone(), input2.read(cx).value());
                     app.update(cx, |_this, cx| save_note(repo, text.to_string(), cx));
                 },

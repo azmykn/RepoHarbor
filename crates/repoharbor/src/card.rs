@@ -67,15 +67,12 @@ pub(crate) fn fill_repo_context_menu(
 }
 
 /// Selection-scoped fleet targets for context menus: if the clicked repo is in
-/// the multi-selection, return that whole set (grid order); otherwise just the
-/// clicked repo.
+/// the multi-selection, return the visible selected set (same gate as the
+/// Actions gear); otherwise just the clicked repo.
 pub(crate) fn fleet_context_targets(app: &RepoHarborApp, repo_id: &str) -> Vec<String> {
-    if !app.selected.is_empty() && app.selected.iter().any(|id| id.as_ref() == repo_id) {
-        app.rows
-            .iter()
-            .filter(|r| app.selected.contains(&r.id))
-            .map(|r| r.id.to_string())
-            .collect()
+    let visible_selected = app.selected_repos_ordered();
+    if visible_selected.iter().any(|id| id.as_str() == repo_id) {
+        visible_selected
     } else {
         vec![repo_id.to_string()]
     }

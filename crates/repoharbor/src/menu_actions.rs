@@ -65,10 +65,11 @@ pub(crate) struct FleetMenuOpts {
     pub open_drawer: Option<SharedString>,
     /// Section label above the ops (e.g. `Selection (4)`).
     pub section_label: Option<String>,
-    /// Include Fetch / Pull / Push / Submodules / Gen only / Gen & push /
-    /// Empty commit. Mission Control's ops-row already paints those as
-    /// primaries beside Actions ▾ — pass `false` there to avoid duplication.
-    /// Card / TREE context menus pass `true` (no ops-row on those surfaces).
+    /// Include Fetch / Pull / Push / Update submodules / Gen only / Gen & push /
+    /// Empty commit. Mission Control's ops-row already paints Fetch/Pull/Push/
+    /// Gen/Empty as selection primaries (and Submodules always-on) — pass
+    /// `false` on the Actions gear to avoid duplication. Card / TREE context
+    /// menus pass `true` (no ops-row on those surfaces).
     pub include_sync_primaries: bool,
 }
 
@@ -174,43 +175,39 @@ pub(crate) fn fill_fleet_actions_menu(
         // Two flat choices (no modal).
         {
             let (a, r) = (app.clone(), repos.clone());
-            m = m.item(
-                PopupMenuItem::new("Gen only")
-                    .disabled(!gen_on)
-                    .on_click(move |_, window, cx| {
-                        a.update(cx, |this, cx| {
-                            let dirty = dirty_targets(this, &r);
-                            this.adopt_fleet_targets(&dirty);
-                            this.run_generate_commit(
-                                crate::views::generate_commit::GenerateCommitChoice::MessageOnly,
-                                dirty,
-                                false,
-                                window,
-                                cx,
-                            );
-                        });
-                    }),
-            );
+            m = m.item(PopupMenuItem::new("Gen only").disabled(!gen_on).on_click(
+                move |_, window, cx| {
+                    a.update(cx, |this, cx| {
+                        let dirty = dirty_targets(this, &r);
+                        this.adopt_fleet_targets(&dirty);
+                        this.run_generate_commit(
+                            crate::views::generate_commit::GenerateCommitChoice::MessageOnly,
+                            dirty,
+                            false,
+                            window,
+                            cx,
+                        );
+                    });
+                },
+            ));
         }
         {
             let (a, r) = (app.clone(), repos.clone());
-            m = m.item(
-                PopupMenuItem::new("Gen & push")
-                    .disabled(!gen_on)
-                    .on_click(move |_, window, cx| {
-                        a.update(cx, |this, cx| {
-                            let dirty = dirty_targets(this, &r);
-                            this.adopt_fleet_targets(&dirty);
-                            this.run_generate_commit(
-                                crate::views::generate_commit::GenerateCommitChoice::CommitAndPush,
-                                dirty,
-                                false,
-                                window,
-                                cx,
-                            );
-                        });
-                    }),
-            );
+            m = m.item(PopupMenuItem::new("Gen & push").disabled(!gen_on).on_click(
+                move |_, window, cx| {
+                    a.update(cx, |this, cx| {
+                        let dirty = dirty_targets(this, &r);
+                        this.adopt_fleet_targets(&dirty);
+                        this.run_generate_commit(
+                            crate::views::generate_commit::GenerateCommitChoice::CommitAndPush,
+                            dirty,
+                            false,
+                            window,
+                            cx,
+                        );
+                    });
+                },
+            ));
         }
         let (a, r) = (app.clone(), repos.clone());
         m = m.item(

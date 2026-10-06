@@ -5,7 +5,11 @@
 //! Selection lives on [`RepoHarborApp::selected`] as repo ids. Changing Mission
 //! Control filters (chip / root / language / group / TREE focus / saved view)
 //! clears the selection so bulk ops can't accidentally target the wrong set.
-//! Rescans prune ids for repos that vanished. One run at a time: [`RepoHarborApp::fleet_run`] carries the engine's cancel flag + live
+//! The name search prunes selection to currently visible rows. Rescans (and
+//! attention recomputes) also drop ids that left the visible set or vanished.
+//! Fleet targets are always [`RepoHarborApp::selected_repos_ordered`] —
+//! selected ∩ `visible_rows()` — so a stale off-filter id can never run.
+//! One run at a time: [`RepoHarborApp::fleet_run`] carries the engine's cancel flag + live
 //! counter and gates the bar's buttons while active. The engine fires progress
 //! events on its worker threads; they're bridged over an `async-channel`
 //! drained by one foreground task (the `live.rs` pattern) that keeps a keyed
@@ -57,6 +61,45 @@ const MAX_SKIPPED_SHOWN: usize = 3;
 /// Cap on bulk "Open in IDE" — spawning dozens of editor windows at once is a
 /// footgun, so larger selections are refused with a toast instead.
 pub const MAX_BULK_LAUNCH: usize = 10;
+
+/// Selected repo ids that also appear in `visible` (indices into `rows`), in
+/// visible/grid order. Shared by fleet ops and unit tests — the hard gate that
+/// keeps Mission Control filters from leaking into bulk targets.
+pub(crate) fn selected_visible_ordered(
+    rows: &[crate::data::Row],
+    selected: &std::collections::HashSet<SharedString>,
+    visible: &[usize],
+) -> Vec<String> {
+    visible
+        .iter()
+        .filter_map(|&i| rows.get(i))
+        .filter(|r| selected.contains(&r.id))
+        .map(|r| r.id.to_string())
+        .collect()
+}
+
+/// Submodule Update target set for the ops-row **Submodules** button.
+///
+/// - **Empty selection** → every *visible* parent with nested checkouts
+///   (`child_count > 0`), so Mission Control filters still scope "الجميع".
+/// - **Non-empty selection** → selected ∩ visible (same hard gate as other
+///   fleet ops; the core skips repos without `.gitmodules`).
+pub(crate) fn submodule_update_targets(
+    rows: &[crate::data::Row],
+    selected: &std::collections::HashSet<SharedString>,
+    visible: &[usize],
+) -> Vec<String> {
+    if selected.is_empty() {
+        visible
+            .iter()
+            .filter_map(|&i| rows.get(i))
+            .filter(|r| r.child_count > 0)
+            .map(|r| r.id.to_string())
+            .collect()
+    } else {
+        selected_visible_ordered(rows, selected, visible)
+    }
+}
 
 /// Which bulk operation the fleet bar runs.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -218,14 +261,15 @@ impl RepoHarborApp {
                 .all(|&i| self.selected.contains(&self.rows[i].id))
     }
 
-    /// Select every row passing the current filters. Adds to the existing
-    /// selection rather than replacing it, so a hand-picked repo outside the
-    /// filter isn't dropped.
+    /// Select every row passing the current filters. Drops any previously
+    /// selected ids that are no longer visible, then adds every visible row —
+    /// so select-all never re-introduces off-filter targets.
     pub fn select_all_visible(&mut self, cx: &mut Context<Self>) {
         self.fleet_prune = None;
         self.fleet_reset = None;
         self.fleet_discard = None;
         self.fleet_commit = None;
+        self.prune_selection_to_visible();
         for i in self.visible_rows() {
             let id = self.rows[i].id.clone();
             self.selected.insert(id);
@@ -270,10 +314,12 @@ impl RepoHarborApp {
             && self.fleet_commit.is_none()
     }
 
-    /// Replace the selection with the repos matching `pred` — the palette's
-    /// select-by-filter verbs ("Select dirty" / "Select behind"). When nothing
-    /// matches, the existing selection is kept and an Info toast explains why
-    /// (`what` reads as "No repos are {what}.").
+    /// Replace the selection with the *currently visible* repos matching
+    /// `pred` — the palette's select-by-filter verbs ("Select dirty" /
+    /// "Select behind"). Scoped to `visible_rows()` so a later fleet op can't
+    /// hit off-filter matches. When nothing matches, the existing selection is
+    /// kept and an Info toast explains why (`what` reads as "No repos are
+    /// {what}.").
     pub fn select_where(
         &mut self,
         pred: impl Fn(&crate::data::Row) -> bool,
@@ -281,10 +327,10 @@ impl RepoHarborApp {
         cx: &mut Context<Self>,
     ) {
         let matched: std::collections::HashSet<SharedString> = self
-            .rows
-            .iter()
-            .filter(|r| pred(r))
-            .map(|r| r.id.clone())
+            .visible_rows()
+            .into_iter()
+            .filter(|&i| pred(&self.rows[i]))
+            .map(|i| self.rows[i].id.clone())
             .collect();
         if matched.is_empty() {
             self.push_toast(
@@ -303,15 +349,32 @@ impl RepoHarborApp {
         cx.notify();
     }
 
-    /// Drop selected ids that no longer exist. Called after rescans replace
-    /// `rows`, so the selection (and the bar's count) never goes stale.
+    /// Drop selected ids that vanished or left the current Mission Control
+    /// visible set. Called after rescans / attention recomputes / search edits
+    /// so the "N selected" badge and fleet ops never include hidden repos.
     pub fn prune_selection(&mut self) {
+        self.prune_selection_to_visible();
+    }
+
+    /// Retain only selected ids that currently pass `visible_rows()`. Clears
+    /// pending fleet confirms when the set shrinks.
+    pub(crate) fn prune_selection_to_visible(&mut self) {
         if self.selected.is_empty() {
             return;
         }
-        let ids: std::collections::HashSet<&SharedString> =
-            self.rows.iter().map(|r| &r.id).collect();
-        self.selected.retain(|id| ids.contains(id));
+        let visible_ids: std::collections::HashSet<SharedString> = self
+            .visible_rows()
+            .into_iter()
+            .map(|i| self.rows[i].id.clone())
+            .collect();
+        let before = self.selected.len();
+        self.selected.retain(|id| visible_ids.contains(id));
+        if self.selected.len() != before {
+            self.fleet_prune = None;
+            self.fleet_reset = None;
+            self.fleet_discard = None;
+            self.fleet_commit = None;
+        }
     }
 
     /// Flip the active run's cancel flag (fleet bar "Cancel"). In-flight git
@@ -323,16 +386,33 @@ impl RepoHarborApp {
         }
     }
 
-    /// Run `op` across the selected repos (see [`Self::run_fleet_repos`]).
+    /// Run `op` across the selected *visible* repos (see [`Self::run_fleet_repos`]).
     pub fn run_fleet(&mut self, op: FleetOp, cx: &mut Context<Self>) {
-        // Row order (not hash order), so results/failures read like the grid.
-        let repos: Vec<String> = self
-            .rows
-            .iter()
-            .filter(|r| self.selected.contains(&r.id))
-            .map(|r| r.id.to_string())
-            .collect();
+        let repos = self.selected_repos_ordered();
         self.run_fleet_repos(op, repos, cx);
+    }
+
+    /// Update submodules for the current scope — selected ∩ visible when
+    /// something is checked; otherwise every visible parent with nested
+    /// checkouts (ops-row **Submodules** with an empty selection).
+    pub fn run_submodule_update(&mut self, cx: &mut Context<Self>) {
+        let visible = self.visible_rows();
+        let repos = submodule_update_targets(&self.rows, &self.selected, &visible);
+        if repos.is_empty() {
+            let detail = if self.selected.is_empty() {
+                "No visible repos declare nested checkouts."
+            } else {
+                "Nothing selected is visible under the current filters."
+            };
+            self.push_toast(
+                ToastKind::Info,
+                "No submodules to update",
+                Some(detail.into()),
+                cx,
+            );
+            return;
+        }
+        self.run_fleet_repos(FleetOp::SubmoduleUpdate, repos, cx);
     }
 
     /// Run `op` across `repos` on the background executor (one bulk run at a
@@ -601,12 +681,7 @@ impl RepoHarborApp {
         {
             return;
         }
-        let repos: Vec<String> = self
-            .rows
-            .iter()
-            .filter(|r| self.selected.contains(&r.id))
-            .map(|r| r.id.to_string())
-            .collect();
+        let repos = self.selected_repos_ordered();
         if repos.is_empty() {
             return;
         }
@@ -659,12 +734,16 @@ impl RepoHarborApp {
         {
             return;
         }
-        // Grid order, so the breakdown reads like the grid.
-        let rows: Vec<crate::data::Row> = self
-            .rows
+        // Visible selection order, so the breakdown matches the grid.
+        let targets = self.selected_repos_ordered();
+        let rows: Vec<crate::data::Row> = targets
             .iter()
-            .filter(|r| self.selected.contains(&r.id))
-            .cloned()
+            .filter_map(|id| {
+                self.rows
+                    .iter()
+                    .find(|r| r.id.as_ref() == id.as_str())
+                    .cloned()
+            })
             .collect();
         if rows.is_empty() {
             return;
@@ -757,12 +836,7 @@ impl RepoHarborApp {
         {
             return;
         }
-        let repos: Vec<String> = self
-            .rows
-            .iter()
-            .filter(|r| self.selected.contains(&r.id))
-            .map(|r| r.id.to_string())
-            .collect();
+        let repos = self.selected_repos_ordered();
         if repos.is_empty() {
             return;
         }
@@ -789,11 +863,14 @@ impl RepoHarborApp {
     /// HEAD` + `clean -fd` per dirty repo). Nothing is discarded until
     /// [`Self::confirm_fleet_discard`].
     pub fn start_fleet_discard(&mut self, cx: &mut Context<Self>) {
-        let repos: Vec<String> = self
-            .rows
-            .iter()
-            .filter(|r| self.selected.contains(&r.id) && r.dirty > 0)
-            .map(|r| r.id.to_string())
+        let selected = self.selected_repos_ordered();
+        let repos: Vec<String> = selected
+            .into_iter()
+            .filter(|id| {
+                self.rows
+                    .iter()
+                    .any(|r| r.id.as_ref() == id.as_str() && r.dirty > 0)
+            })
             .collect();
         self.start_fleet_discard_repos(repos, cx);
     }
@@ -836,12 +913,7 @@ impl RepoHarborApp {
     /// refused with a toast asking to narrow — spawning dozens of editor
     /// windows at once is a footgun.
     pub fn launch_selected(&mut self, cx: &mut Context<Self>) {
-        let ids: Vec<String> = self
-            .rows
-            .iter()
-            .filter(|r| self.selected.contains(&r.id))
-            .map(|r| r.id.to_string())
-            .collect();
+        let ids = self.selected_repos_ordered();
         if ids.is_empty() {
             return;
         }
@@ -903,16 +975,14 @@ impl RepoHarborApp {
             .border_t_1()
             .border_color(rgb(t.border))
             .bg(rgb(t.surface));
-        if !self.selected.is_empty() {
+        let selected_n = self.selected_repos_ordered().len();
+        if selected_n > 0 {
             bar = bar.child(lucide("check", 15., t.accent_bright)).child(
                 div()
                     .font_weight(FontWeight::MEDIUM)
                     .text_size(px(t.text_small))
                     .text_color(rgb(t.fg0))
-                    .child(SharedString::from(format!(
-                        "{} selected",
-                        self.selected.len()
-                    ))),
+                    .child(SharedString::from(format!("{selected_n} selected"))),
             );
         }
         if let Some(run) = &self.fleet_run {
@@ -1108,21 +1178,21 @@ impl RepoHarborApp {
         Some(bar.into_any_element())
     }
 
-    /// Selected repo ids in grid order (stable for fleet ops + menus).
-    fn selected_repos_ordered(&self) -> Vec<String> {
-        self.rows
-            .iter()
-            .filter(|r| self.selected.contains(&r.id))
-            .map(|r| r.id.to_string())
-            .collect()
+    /// Selected *and currently visible* repo ids in grid/visible order.
+    /// Hard gate for every selection-scoped fleet op, Actions menu, and badge.
+    pub(crate) fn selected_repos_ordered(&self) -> Vec<String> {
+        let visible = self.visible_rows();
+        selected_visible_ordered(&self.rows, &self.selected, &visible)
     }
 
     /// Compact selection-scoped primaries beside Actions ▾:
-    /// Fetch / Pull / Push / Submodules / Gen only / Gen & push / [Empty commit].
+    /// Fetch / Pull / Push / Gen only / Gen & push / [Empty commit].
+    /// (**Submodules** lives on the always-on ops row next to Pull behind —
+    /// empty selection updates every visible submodule parent.)
     /// Push and the Gen pair stay on the bar for every selection (a Needs-me
     /// mix of vendor + digits must not drop them). Empty commit only when a
-    /// non–pull-only path is selected. Submodules dim without nested checkouts;
-    /// Gen buttons dim unless something is dirty and AI is ready.
+    /// non–pull-only path is selected. Gen buttons dim unless something is
+    /// dirty and AI is ready.
     pub fn fleet_primary_sync_buttons(
         &self,
         t: &Theme,
@@ -1185,20 +1255,6 @@ impl RepoHarborApp {
                     return;
                 }
                 this.run_fleet_repos(FleetOp::Push, repos, cx);
-            }),
-        ));
-        // Always visible with a selection — same handler as Actions → Update
-        // submodules; dimmed when none of the targets have nested checkouts.
-        row = row.child(bar_btn(
-            "mc-fleet-subs",
-            "box",
-            "Submodules",
-            idle && caps.has_submodules,
-            false,
-            t,
-            cx.listener(|this, _e, _w, cx| {
-                let repos = this.selected_repos_ordered();
-                this.run_fleet_repos(FleetOp::SubmoduleUpdate, repos, cx);
             }),
         ));
         let gen_enabled = idle && ai_ready && caps.has_dirty;
@@ -1985,5 +2041,108 @@ mod tests {
             "{out}"
         );
         assert!(!out.contains("r6"), "{out}");
+    }
+
+    fn stub_row(id: &str) -> crate::data::Row {
+        crate::data::Row {
+            id: id.into(),
+            url: "".into(),
+            name: id.into(),
+            slug: "".into(),
+            root: "".into(),
+            path: id.into(),
+            description: "".into(),
+            language: "".into(),
+            branch: "".into(),
+            age: "".into(),
+            release: "".into(),
+            ai_summary: "".into(),
+            ahead: 0,
+            behind: 0,
+            dirty: 0,
+            staged: 0,
+            unstaged: 0,
+            stars: "".into(),
+            host: "".into(),
+            private: false,
+            favorite: false,
+            activity: repoharbor_core::model::Activity::Active,
+            last_commit_unix: 0,
+            parent_id: None,
+            submodule_path: None,
+            child_count: 0,
+        }
+    }
+
+    #[test]
+    fn selected_visible_ordered_intersects_and_keeps_visible_order() {
+        let rows = vec![
+            stub_row("/a"),
+            stub_row("/b"),
+            stub_row("/c"),
+            stub_row("/d"),
+        ];
+        let selected = ["/a", "/c", "/d"]
+            .into_iter()
+            .map(SharedString::from)
+            .collect();
+        // Visible set is b, d, a (not grid order) — only a + d are selected.
+        let visible = vec![1usize, 3, 0];
+        let out = selected_visible_ordered(&rows, &selected, &visible);
+        assert_eq!(out, vec!["/d".to_string(), "/a".to_string()]);
+    }
+
+    #[test]
+    fn selected_visible_ordered_drops_hidden_selection() {
+        let rows = vec![stub_row("/keep"), stub_row("/hidden")];
+        let selected = ["/keep", "/hidden"]
+            .into_iter()
+            .map(SharedString::from)
+            .collect();
+        let visible = vec![0usize]; // only /keep shown
+        let out = selected_visible_ordered(&rows, &selected, &visible);
+        assert_eq!(out, vec!["/keep".to_string()]);
+    }
+
+    fn stub_parent(id: &str, child_count: u32) -> crate::data::Row {
+        let mut r = stub_row(id);
+        r.child_count = child_count;
+        r
+    }
+
+    #[test]
+    fn submodule_targets_empty_selection_uses_visible_parents() {
+        let rows = vec![
+            stub_parent("/plain", 0),
+            stub_parent("/with-subs", 3),
+            stub_parent("/hidden-subs", 2),
+            stub_parent("/also", 1),
+        ];
+        let selected = std::collections::HashSet::new();
+        // /hidden-subs is off-filter — must not run.
+        let visible = vec![0usize, 1, 3];
+        let out = submodule_update_targets(&rows, &selected, &visible);
+        assert_eq!(
+            out,
+            vec!["/with-subs".to_string(), "/also".to_string()],
+            "empty selection → visible parents with child_count > 0 only"
+        );
+    }
+
+    #[test]
+    fn submodule_targets_selection_intersects_visible() {
+        let rows = vec![
+            stub_parent("/a", 2),
+            stub_parent("/b", 0),
+            stub_parent("/c", 1),
+        ];
+        let selected = ["/a", "/b", "/c"]
+            .into_iter()
+            .map(SharedString::from)
+            .collect();
+        // Only /b and /c visible — keep non-submodule /b (core skips).
+        let visible = vec![1usize, 2];
+        let out = submodule_update_targets(&rows, &selected, &visible);
+        assert_eq!(out, vec!["/b".to_string(), "/c".to_string()]);
     }
 }
