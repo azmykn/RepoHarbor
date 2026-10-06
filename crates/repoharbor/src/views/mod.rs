@@ -16,6 +16,7 @@ pub mod cleanup;
 pub mod devtools;
 pub mod explore;
 pub mod feed;
+pub mod fleet_gen_push;
 pub mod generate_commit;
 pub mod inbox;
 pub mod log;

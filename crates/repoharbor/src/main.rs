@@ -194,6 +194,7 @@ fn main() {
                             watcher,
                             selected: Default::default(),
                             fleet_run: None,
+                            fleet_queue: Default::default(),
                             fleet_seq: 0,
                             fleet_prune: None,
                             fleet_prune_seq: 0,

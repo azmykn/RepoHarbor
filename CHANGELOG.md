@@ -12,6 +12,11 @@ versioned trees, including nested submodule parents).
 
 ### Added
 
+- **Fleet job queue** — starting Fetch / Pull / Push / Submodules / … while a
+  fleet run is already active enqueues the next job (`Queued: Pull (3 repos)`)
+  instead of a silent no-op. One job still executes at a time (same-repo writes
+  stay sequential); the strip shows `· N queued`; **Cancel** clears the queue
+  with the active run.
 - **Changes drawer copy** — Unstaged/Staged rows expose a copy icon (and
   right-click → **Copy path**) for the relative file path; the DIFF header
   has **Copy diff** (plus right-click on the patch) for the full unified
@@ -23,9 +28,12 @@ versioned trees, including nested submodule parents).
   selected path(s). Pull-only still only silences Ahead + upstream CI; dirty
   vendor trees (e.g. `odooplm` under `custom/`) need an explicit mute.
 - **Gen & push confirm (multi-repo)** — fleet **Gen & push** on two or more
-  dirty repos arms a confirm strip listing the targets (AI message → commit
-  all → push) before running. **Gen only** stays one-click; single-repo Gen &
-  push (drawer / one dirty target) stays one-click.
+  dirty repos opens a centered confirm modal (title, short explanation,
+  scrollable repo list, Confirm / Cancel; Esc / backdrop cancel) before AI
+  message → commit all → push. **Gen only** stays one-click; single-repo Gen &
+  push (drawer / one dirty target) stays one-click. Destructive fleet ops
+  (Discard / Prune / Reset) keep bottom confirm strips; Push / Pull / Fetch /
+  Submodules / Empty commit stay one-click.
 - **Submodules empty→all cue** — idle empty selection shows **Submodules (N)**
   for visible parents with nested checkouts; starting Submodules toasts the
   parent name list before the progress counter.
@@ -80,7 +88,7 @@ versioned trees, including nested submodule parents).
 - **Gen commit without a popup** — Mission Control ops row and drawer Changes
   show side-by-side **Gen only** (AI message) and **Gen & push** (message →
   commit all → push); no choice modal (multi-repo Gen & push uses the confirm
-  strip above).
+  modal).
 - **Actions ▾ no longer duplicates ops-row sync** — Fetch / Pull / Push /
   Gen only / Gen & push / Empty commit stay on the selection primaries;
   **Submodules** is always-on next to Pull behind / Fetch all; the gear keeps

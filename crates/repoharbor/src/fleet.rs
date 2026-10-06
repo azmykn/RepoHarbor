@@ -9,15 +9,20 @@
 //! attention recomputes) also drop ids that left the visible set or vanished.
 //! Fleet targets are always [`RepoHarborApp::selected_repos_ordered`] —
 //! selected ∩ `visible_rows()` — so a stale off-filter id can never run.
-//! One run at a time: [`RepoHarborApp::fleet_run`] carries the engine's cancel flag + live
-//! counter and gates the bar's buttons while active. The engine fires progress
-//! events on its worker threads; they're bridged over an `async-channel`
-//! drained by one foreground task (the `live.rs` pattern) that keeps a keyed
-//! Progress toast ("Pulling 12/40…") current. The completion resolves that
-//! toast to an aggregate summary — "Pull succeeded" / "Pull failed" with
-//! per-repo detail, Error (persists until clicked) when anything failed so a
-//! 40-repo pull never fails silently — then rescans once so the
-//! grid reflects the new state.
+//! One **active** run at a time ([`RepoHarborApp::fleet_run`]), plus a FIFO
+//! [`RepoHarborApp::fleet_queue`] so a second job is enqueued instead of
+//! silently ignored. Jobs still serialize globally — that keeps same-repo
+//! write ops sequential without per-repo locks — but the ops bar stays usable
+//! while a run is in flight so the user can queue Fetch/Pull/… for another
+//! selection. Cancel flips the active engine flag **and** clears the queue.
+//! The engine fires progress events on its worker threads; they're bridged
+//! over an `async-channel` drained by one foreground task (the `live.rs`
+//! pattern) that keeps a keyed Progress toast ("Pulling 12/40…") current.
+//! Completion resolves that toast to an aggregate summary — "Pull succeeded" /
+//! "Pull failed" with per-repo detail, Error (persists until clicked) when
+//! anything failed so a 40-repo pull never fails silently — then drains the
+//! next queued job (if any) and rescans once so the grid reflects the new
+//! state.
 //!
 //! Bulk **Prune** is confirm-gated (branch deletion is irreversible — the #173
 //! pattern scaled up): the Prune button first scans the selection for prunable
@@ -61,6 +66,9 @@ const MAX_SKIPPED_SHOWN: usize = 3;
 /// Cap on bulk "Open in IDE" — spawning dozens of editor windows at once is a
 /// footgun, so larger selections are refused with a toast instead.
 pub const MAX_BULK_LAUNCH: usize = 10;
+/// Cap on waiting fleet jobs (not including the active run). Beyond this the
+/// starter toasts an error instead of growing unbounded.
+pub const MAX_FLEET_QUEUE: usize = 32;
 
 /// Selected repo ids that also appear in `visible` (indices into `rows`), in
 /// visible/grid order. Shared by fleet ops and unit tests — the hard gate that
@@ -158,7 +166,7 @@ pub enum FleetOp {
     /// Per-repo AI message only — no commit/push (toast + Log).
     GenerateMessageOnly,
     /// Per-repo AI message → `commit_all` → `push`. Multi-repo fleet runs
-    /// start only through the confirm strip ([`RepoHarborApp::confirm_fleet_gen_push`]).
+    /// start only through the confirm modal ([`RepoHarborApp::confirm_fleet_gen_push`]).
     GenerateCommitAndPush,
     /// Only ever started through the confirm strip
     /// ([`RepoHarborApp::confirm_fleet_prune`]) — never directly from a button.
@@ -274,6 +282,34 @@ pub struct FleetRun {
     pub current_name: Option<SharedString>,
 }
 
+/// A fleet job waiting for the active run to finish (global FIFO queue).
+#[derive(Clone)]
+pub struct QueuedFleetJob {
+    pub op: FleetOp,
+    pub repos: Vec<String>,
+    pub commit_message: Option<String>,
+}
+
+/// Toast / Log copy when a job is appended while another run is active.
+pub(crate) fn queued_job_toast(op: FleetOp, repo_count: usize) -> String {
+    let unit = if repo_count == 1 { "repo" } else { "repos" };
+    format!("Queued: {} ({repo_count} {unit})", op.label())
+}
+
+/// Ops-bar suffix when jobs are waiting behind the active run.
+pub(crate) fn fleet_queue_status_label(queued: usize) -> Option<String> {
+    if queued == 0 {
+        None
+    } else {
+        Some(format!("{queued} queued"))
+    }
+}
+
+/// Whether a new job must wait (active run holds the single execution slot).
+pub(crate) fn fleet_should_enqueue(run_active: bool) -> bool {
+    run_active
+}
+
 impl RepoHarborApp {
     /// Toggle a repo in/out of the multi-selection (card checkbox, Ctrl+click).
     pub fn toggle_selected(&mut self, id: SharedString, cx: &mut Context<Self>) {
@@ -359,21 +395,23 @@ impl RepoHarborApp {
         self.selected = repos.iter().cloned().map(SharedString::from).collect();
     }
 
-    /// True when a fleet run or confirm strip is armed — the slim bottom bar
-    /// only paints in that case (actions live in the top Actions menu).
+    /// True when a fleet run, queued job, or bottom confirm strip is armed —
+    /// the slim bottom bar only paints in that case (actions live in the top
+    /// Actions menu). Gen & push uses a centered modal, not this strip.
     pub(crate) fn fleet_strip_active(&self) -> bool {
         self.fleet_run.is_some()
+            || !self.fleet_queue.is_empty()
             || self.fleet_prune.is_some()
             || self.fleet_reset.is_some()
             || self.fleet_discard.is_some()
             || self.fleet_commit.is_some()
-            || self.fleet_gen_push.is_some()
     }
 
-    /// Idle = no run and no confirm strip (Actions menu items enabled).
+    /// Idle for starting / enqueueing ops = no pending confirm (strip or Gen &
+    /// push modal). An active [`Self::fleet_run`] does **not** block — the next
+    /// job joins [`Self::fleet_queue`] instead of no-op'ing.
     pub(crate) fn fleet_actions_idle(&self) -> bool {
-        self.fleet_run.is_none()
-            && self.fleet_prune.is_none()
+        self.fleet_prune.is_none()
             && self.fleet_reset.is_none()
             && self.fleet_discard.is_none()
             && self.fleet_commit.is_none()
@@ -445,11 +483,33 @@ impl RepoHarborApp {
         }
     }
 
-    /// Flip the active run's cancel flag (fleet bar "Cancel"). In-flight git
-    /// ops finish; repos not yet started report as skipped.
+    /// Cancel the active run and drop every waiting job. In-flight git ops
+    /// finish; repos not yet started in the active engine report as skipped.
+    /// Queued jobs never start (no stranded locks — serialization is the slot).
     pub fn cancel_fleet(&mut self, cx: &mut Context<Self>) {
-        if let Some(run) = &self.fleet_run {
+        let cleared = self.fleet_queue.len();
+        self.fleet_queue.clear();
+        let had_run = if let Some(run) = &self.fleet_run {
             run.cancel.store(true, Ordering::SeqCst);
+            true
+        } else {
+            false
+        };
+        if cleared > 0 {
+            self.push_toast(
+                ToastKind::Info,
+                "Queue cleared",
+                Some(
+                    format!(
+                        "Dropped {cleared} queued {}",
+                        if cleared == 1 { "job" } else { "jobs" }
+                    )
+                    .into(),
+                ),
+                cx,
+            );
+        }
+        if had_run || cleared > 0 {
             cx.notify();
         }
     }
@@ -498,12 +558,14 @@ impl RepoHarborApp {
         self.run_fleet_repos(FleetOp::SubmoduleUpdate, repos, cx);
     }
 
-    /// Run `op` across `repos` on the background executor (one bulk run at a
-    /// time). Shared by the fleet bar (selection) and the palette's fleet
-    /// verbs ("Fetch all", "Pull all behind" — no selection needed). Progress
-    /// marshals onto the foreground via a channel and keeps a keyed Progress
-    /// toast current; completion resolves the toast to the aggregate summary
-    /// and rescans once.
+    /// Run `op` across `repos` on the background executor. Shared by the fleet
+    /// bar (selection) and the palette's fleet verbs ("Fetch all", "Pull all
+    /// behind" — no selection needed). When a run is already active the job
+    /// joins [`Self::fleet_queue`] (toast "Queued: …") instead of no-op'ing;
+    /// only one job executes at a time so same-repo writes stay sequential.
+    /// Progress marshals onto the foreground via a channel and keeps a keyed
+    /// Progress toast current; completion resolves the toast, drains the next
+    /// queued job if any, and rescans once.
     ///
     /// `commit_message` is required for [`FleetOp::CommitAll`] (one shared
     /// message). Generate ops ignore it and draft a fresh AI message per repo.
@@ -518,7 +580,7 @@ impl RepoHarborApp {
         commit_message: Option<String>,
         cx: &mut Context<Self>,
     ) {
-        if self.fleet_run.is_some() || repos.is_empty() {
+        if repos.is_empty() {
             return;
         }
         // Keep the HashSet honest with the badge (selected ∩ visible) so a
@@ -581,12 +643,65 @@ impl RepoHarborApp {
             );
             return;
         }
-        // Starting any run invalidates a pending prune/reset/commit confirm.
+        // Starting / enqueueing invalidates a pending prune/reset/commit confirm.
         self.fleet_prune = None;
         self.fleet_reset = None;
         self.fleet_discard = None;
         self.fleet_commit = None;
         self.fleet_gen_push = None;
+
+        if fleet_should_enqueue(self.fleet_run.is_some()) {
+            if self.fleet_queue.len() >= MAX_FLEET_QUEUE {
+                self.push_toast(
+                    ToastKind::Error,
+                    "Fleet queue full",
+                    Some(
+                        format!("At most {MAX_FLEET_QUEUE} jobs can wait behind the active run.")
+                            .into(),
+                    ),
+                    cx,
+                );
+                return;
+            }
+            let n = repos.len();
+            self.fleet_queue.push_back(QueuedFleetJob {
+                op,
+                repos,
+                commit_message,
+            });
+            self.push_toast(
+                ToastKind::Info,
+                queued_job_toast(op, n),
+                Some("Starts when the active run finishes.".into()),
+                cx,
+            );
+            cx.notify();
+            return;
+        }
+
+        self.begin_fleet_run(op, repos, commit_message, cx);
+    }
+
+    /// Pop the next queued job into the execution slot (no-op if busy or empty).
+    fn start_next_queued_fleet(&mut self, cx: &mut Context<Self>) {
+        if self.fleet_run.is_some() {
+            return;
+        }
+        let Some(job) = self.fleet_queue.pop_front() else {
+            return;
+        };
+        self.begin_fleet_run(job.op, job.repos, job.commit_message, cx);
+    }
+
+    /// Start a fleet engine run. Caller must ensure [`Self::fleet_run`] is
+    /// vacant and `repos` is non-empty / already filtered.
+    fn begin_fleet_run(
+        &mut self,
+        op: FleetOp,
+        repos: Vec<String>,
+        commit_message: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
         let total = repos.len();
         self.fleet_seq += 1;
         let run_id = self.fleet_seq;
@@ -760,6 +875,9 @@ impl RepoHarborApp {
                 // One rescan for the whole run (not per repo) so the grid
                 // reflects the new ahead/behind/dirty state.
                 this.rescan(cx);
+                // Drain FIFO — same-repo serial is automatic while only one
+                // job holds the execution slot.
+                this.start_next_queued_fleet(cx);
                 cx.notify();
             });
         })
@@ -769,8 +887,8 @@ impl RepoHarborApp {
     /// Open the fleet-bar commit-message strip for the current selection.
     /// Nothing is committed until [`Self::confirm_fleet_commit`].
     pub fn start_fleet_commit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.fleet_run.is_some()
-            || self.fleet_commit.is_some()
+        // Allow arming while a run is active — Confirm enqueues behind it.
+        if self.fleet_commit.is_some()
             || self.fleet_prune.is_some()
             || self.fleet_reset.is_some()
             || self.fleet_discard.is_some()
@@ -818,12 +936,12 @@ impl RepoHarborApp {
         }
     }
 
-    /// Arm a Gen & push confirm for multiple dirty repos. Single-repo Gen &
-    /// push stays one-click via [`Self::run_generate_commit`]. Nothing runs
-    /// until [`Self::confirm_fleet_gen_push`].
+    /// Arm the Gen & push confirm modal for multiple dirty repos. Single-repo
+    /// Gen & push stays one-click via [`Self::run_generate_commit`]. Nothing
+    /// runs until [`Self::confirm_fleet_gen_push`].
     pub fn start_fleet_gen_push(&mut self, repos: Vec<String>, cx: &mut Context<Self>) {
-        if self.fleet_run.is_some()
-            || self.fleet_gen_push.is_some()
+        // Allow arming while a run is active — Confirm enqueues behind it.
+        if self.fleet_gen_push.is_some()
             || self.fleet_commit.is_some()
             || self.fleet_prune.is_some()
             || self.fleet_reset.is_some()
@@ -838,7 +956,7 @@ impl RepoHarborApp {
         cx.notify();
     }
 
-    /// Confirm strip → AI message → commit all → push for the planned repos.
+    /// Confirm modal → AI message → commit all → push for the planned repos.
     pub fn confirm_fleet_gen_push(&mut self, cx: &mut Context<Self>) {
         let Some(repos) = self.fleet_gen_push.take() else {
             return;
@@ -846,7 +964,7 @@ impl RepoHarborApp {
         self.run_fleet_repos(FleetOp::GenerateCommitAndPush, repos, cx);
     }
 
-    /// Drop the pending Gen & push confirm (strip Cancel, or Esc).
+    /// Drop the pending Gen & push confirm (modal Cancel / backdrop / Esc).
     pub fn cancel_fleet_gen_push(&mut self, cx: &mut Context<Self>) {
         if self.fleet_gen_push.take().is_some() {
             cx.notify();
@@ -858,8 +976,8 @@ impl RepoHarborApp {
     /// expand the bar into the confirm strip with the per-repo breakdown.
     /// Nothing is deleted here — only [`Self::confirm_fleet_prune`] executes.
     pub fn start_fleet_prune(&mut self, cx: &mut Context<Self>) {
-        if self.fleet_run.is_some()
-            || self.fleet_prune.is_some()
+        // Allow arming while a run is active — Confirm enqueues behind it.
+        if self.fleet_prune.is_some()
             || self.fleet_reset.is_some()
             || self.fleet_discard.is_some()
             || self.fleet_commit.is_some()
@@ -961,8 +1079,8 @@ impl RepoHarborApp {
     /// Arm a hard-reset confirm for the current selection (`git reset --hard
     /// @{upstream}` per repo). Nothing is reset until [`Self::confirm_fleet_reset`].
     pub fn start_fleet_reset(&mut self, cx: &mut Context<Self>) {
-        if self.fleet_run.is_some()
-            || self.fleet_reset.is_some()
+        // Allow arming while a run is active — Confirm enqueues behind it.
+        if self.fleet_reset.is_some()
             || self.fleet_discard.is_some()
             || self.fleet_prune.is_some()
             || self.fleet_commit.is_some()
@@ -1012,8 +1130,8 @@ impl RepoHarborApp {
     /// Arm discard for an explicit repo list (fleet bar selection or a single
     /// dirty repo from the context menu).
     pub fn start_fleet_discard_repos(&mut self, repos: Vec<String>, cx: &mut Context<Self>) {
-        if self.fleet_run.is_some()
-            || self.fleet_discard.is_some()
+        // Allow arming while a run is active — Confirm enqueues behind it.
+        if self.fleet_discard.is_some()
             || self.fleet_reset.is_some()
             || self.fleet_prune.is_some()
             || self.fleet_commit.is_some()
@@ -1094,8 +1212,9 @@ impl RepoHarborApp {
     }
 
     /// Slim bottom strip: in-flight progress / Cancel, plus confirm strips for
-    /// commit / Gen & push / discard / reset / prune. Bulk action buttons live
-    /// in the top Actions dropdown (and the repo context menu) — not here.
+    /// commit / discard / reset / prune. Multi-repo Gen & push uses a centered
+    /// modal ([`crate::views::fleet_gen_push`]), not this strip. Bulk action
+    /// buttons live in the top Actions dropdown (and the repo context menu).
     pub fn fleet_bar(&self, t: &Theme, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
         if !self.fleet_strip_active() {
             return None;
@@ -1122,15 +1241,37 @@ impl RepoHarborApp {
         }
         if let Some(run) = &self.fleet_run {
             let current = run.current_name.as_deref();
+            let mut status = run.op.progress_title(run.done, run.total, current);
+            if let Some(q) = fleet_queue_status_label(self.fleet_queue.len()) {
+                status = format!("{status} · {q}");
+            }
             bar = bar
                 .child(
                     div()
                         .font_family("monospace")
                         .text_size(px(t.text_data_sm))
                         .text_color(rgb(t.fg2))
-                        .child(SharedString::from(
-                            run.op.progress_title(run.done, run.total, current),
-                        )),
+                        .child(SharedString::from(status)),
+                )
+                .child(bar_btn(
+                    "fleet-cancel",
+                    "x",
+                    "Cancel",
+                    true,
+                    true,
+                    t,
+                    cx.listener(|this, _e, _w, cx| this.cancel_fleet(cx)),
+                ));
+        } else if let Some(q) = fleet_queue_status_label(self.fleet_queue.len()) {
+            // Defensive: queue without a run should be rare; still show Cancel
+            // so the user can clear stranded waiting jobs.
+            bar = bar
+                .child(
+                    div()
+                        .font_family("monospace")
+                        .text_size(px(t.text_data_sm))
+                        .text_color(rgb(t.fg2))
+                        .child(SharedString::from(q)),
                 )
                 .child(bar_btn(
                     "fleet-cancel",
@@ -1189,57 +1330,6 @@ impl RepoHarborApp {
                     false,
                     t,
                     cx.listener(|this, _e, _w, cx| this.cancel_fleet_commit(cx)),
-                ));
-            return Some(
-                div()
-                    .flex()
-                    .flex_col()
-                    .child(strip)
-                    .child(bar)
-                    .into_any_element(),
-            );
-        }
-        // Multi-repo Gen & push: list targets + commit-all+push warning.
-        if let Some(repos) = &self.fleet_gen_push {
-            let n = repos.len();
-            let names = gen_push_name_list(self, repos);
-            let strip = div()
-                .flex()
-                .flex_row()
-                .items_center()
-                .gap(px(10.))
-                .px(px(16.))
-                .py(px(10.))
-                .border_t_1()
-                .border_color(rgb(t.border_accent))
-                .bg(rgb(t.accent_wash))
-                .child(lucide("sparkles", 15., t.accent_bright))
-                .child(
-                    div()
-                        .flex_1()
-                        .text_size(px(t.text_small))
-                        .text_color(rgb(t.fg0))
-                        .child(SharedString::from(format!(
-                            "Gen & push {n} repos — AI message, commit all, then push: {names}"
-                        ))),
-                )
-                .child(bar_btn(
-                    "fleet-gen-push-confirm",
-                    "sparkles",
-                    "Confirm Gen & push",
-                    true,
-                    false,
-                    t,
-                    cx.listener(|this, _e, _w, cx| this.confirm_fleet_gen_push(cx)),
-                ))
-                .child(bar_btn(
-                    "fleet-gen-push-cancel",
-                    "x",
-                    "Cancel",
-                    true,
-                    false,
-                    t,
-                    cx.listener(|this, _e, _w, cx| this.cancel_fleet_gen_push(cx)),
                 ));
             return Some(
                 div()
@@ -1377,7 +1467,7 @@ impl RepoHarborApp {
     /// mix of vendor + digits must not drop Gen). Push enables only when a
     /// non–pull-only path is ahead; Empty commit only when a non–pull-only
     /// path is selected. Gen buttons dim unless something is dirty and AI is
-    /// ready. Gen & push on N>1 arms a confirm strip first.
+    /// ready. Gen & push on N>1 arms a confirm modal first.
     pub fn fleet_primary_sync_buttons(
         &self,
         t: &Theme,
@@ -1679,27 +1769,6 @@ fn prune_title(branches: usize, repos: usize) -> String {
         if branches == 1 { "branch" } else { "branches" },
         if repos == 1 { "repo" } else { "repos" },
     )
-}
-
-/// Short display names for the Gen & push confirm strip (grid `name`, else
-/// path tail), capped like the prune breakdown.
-fn gen_push_name_list(app: &RepoHarborApp, repos: &[String]) -> String {
-    const MAX_SHOWN: usize = 5;
-    let mut names: Vec<String> = repos
-        .iter()
-        .take(MAX_SHOWN)
-        .map(|id| {
-            app.rows
-                .iter()
-                .find(|r| r.id.as_ref() == id.as_str())
-                .map(|r| r.name.to_string())
-                .unwrap_or_else(|| id.rsplit('/').next().unwrap_or(id).to_string())
-        })
-        .collect();
-    if repos.len() > MAX_SHOWN {
-        names.push(format!("+{} more", repos.len() - MAX_SHOWN));
-    }
-    names.join(", ")
 }
 
 /// The confirm strip's per-repo breakdown: "repoharbor ×3 · zed ×2 · +4 more",
@@ -2425,5 +2494,31 @@ mod tests {
             join_names_capped(&names, 6),
             "r0, r1, r2, r3, r4, r5, +2 more"
         );
+    }
+
+    #[test]
+    fn fleet_should_enqueue_only_when_run_active() {
+        assert!(!fleet_should_enqueue(false));
+        assert!(fleet_should_enqueue(true));
+    }
+
+    #[test]
+    fn queued_job_toast_names_op_and_count() {
+        assert_eq!(queued_job_toast(FleetOp::Pull, 3), "Queued: Pull (3 repos)");
+        assert_eq!(
+            queued_job_toast(FleetOp::Fetch, 1),
+            "Queued: Fetch (1 repo)"
+        );
+        assert_eq!(
+            queued_job_toast(FleetOp::SubmoduleUpdate, 2),
+            "Queued: Update submodules (2 repos)"
+        );
+    }
+
+    #[test]
+    fn fleet_queue_status_label_none_when_empty() {
+        assert!(fleet_queue_status_label(0).is_none());
+        assert_eq!(fleet_queue_status_label(1).as_deref(), Some("1 queued"));
+        assert_eq!(fleet_queue_status_label(2).as_deref(), Some("2 queued"));
     }
 }

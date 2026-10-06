@@ -463,9 +463,12 @@ pub struct RepoHarborApp {
     /// wrong visible set. Pruned to existing repos on rescan. Drives the fleet
     /// bar (see `fleet.rs`).
     pub selected: std::collections::HashSet<SharedString>,
-    /// The in-flight fleet bulk run, if any — one at a time; carries the
+    /// The in-flight fleet bulk run, if any — one execution slot; carries the
     /// engine's cancel flag + the live done/total counter.
     pub fleet_run: Option<crate::fleet::FleetRun>,
+    /// FIFO jobs waiting for [`Self::fleet_run`] to finish. Cancel clears this
+    /// with the active run so waiting work never starts after Cancel.
+    pub fleet_queue: std::collections::VecDeque<crate::fleet::QueuedFleetJob>,
     /// Monotonic fleet-run id source — guards stale progress events.
     pub fleet_seq: u64,
     /// The pending bulk-prune confirm (the fleet bar's confirm strip), if any.
@@ -482,8 +485,9 @@ pub struct RepoHarborApp {
     pub fleet_discard: Option<Vec<String>>,
     /// Pending bulk-commit message strip (one shared message for Commit All…).
     pub fleet_commit: Option<crate::fleet::CommitPlan>,
-    /// Pending Gen & push confirm (multi-repo only) — AI message → commit all
-    /// → push. Dropped on selection change / Esc / Cancel / another run.
+    /// Pending Gen & push confirm modal (multi-repo only) — AI message →
+    /// commit all → push. Dropped on selection change / Esc / Cancel /
+    /// backdrop / Confirm.
     pub fleet_gen_push: Option<Vec<String>>,
     /// Click-through detail panel for a toast / Log row.
     pub notice_detail: Option<crate::activity_log::LogEntry>,
@@ -2178,8 +2182,8 @@ impl RepoHarborApp {
     }
 
     /// Run a Generate outcome for `repos`. **Gen only** is always immediate.
-    /// **Gen & push** with more than one repo arms the fleet confirm strip
-    /// first; a single dirty target (drawer or fleet) stays one-click.
+    /// **Gen & push** with more than one repo arms the confirm modal first; a
+    /// single dirty target (drawer or fleet) stays one-click.
     /// `from_drawer` keeps MessageOnly in the open Changes tab.
     pub fn run_generate_commit(
         &mut self,
@@ -6696,12 +6700,9 @@ impl RepoHarborApp {
     /// Unique id `mc-select-all` — must not collide with card checkboxes.
     fn select_all_checkbox(&self, t: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
         let selected = self.all_visible_selected();
-        let idle = self.fleet_run.is_none()
-            && self.fleet_prune.is_none()
-            && self.fleet_reset.is_none()
-            && self.fleet_discard.is_none()
-            && self.fleet_commit.is_none()
-            && self.fleet_gen_push.is_none();
+        // Selection edits stay available while a fleet run is active (next
+        // op can target a different set and enqueue). Confirm strips still lock.
+        let idle = self.fleet_actions_idle();
         let (border_c, bg_c) = if selected {
             (t.primary, t.primary)
         } else {
@@ -7001,6 +7002,9 @@ impl Render for RepoHarborApp {
                     this.close_notice(cx);
                     window.focus(&this.focus, cx);
                     cx.notify();
+                } else if this.fleet_gen_push.is_some() {
+                    // Centered confirm modal — dismiss before drawer/palette.
+                    this.cancel_fleet_gen_push(cx);
                 } else if this.overlay.is_some() {
                     this.close_overlay();
                     window.focus(&this.focus, cx);
@@ -7009,8 +7013,6 @@ impl Render for RepoHarborApp {
                     this.cancel_fleet_discard(cx);
                 } else if this.fleet_reset.is_some() {
                     this.cancel_fleet_reset(cx);
-                } else if this.fleet_gen_push.is_some() {
-                    this.cancel_fleet_gen_push(cx);
                 } else if this.fleet_commit.is_some() {
                     this.cancel_fleet_commit(cx);
                 } else if this.fleet_prune.is_some() {
@@ -7080,6 +7082,13 @@ impl Render for RepoHarborApp {
         if let Some(entry) = &self.notice_detail {
             root = root
                 .child(crate::views::notice::render(entry, &t, &cx.entity()).into_any_element());
+        }
+        if let Some(repos) = &self.fleet_gen_push {
+            let names = crate::views::fleet_gen_push::repo_names(self, repos);
+            root = root.child(
+                crate::views::fleet_gen_push::render(repos, &t, &cx.entity(), &names)
+                    .into_any_element(),
+            );
         }
         root
     }

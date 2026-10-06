@@ -2141,17 +2141,17 @@ fn change_item(
     };
     let (app_click, path_click, staged) = (app.clone(), c.path.clone(), c.staged);
     let (app_menu, path_menu) = (app.clone(), c.path.to_string());
-    row.context_menu(move |menu, _win, _cx| {
+    row.on_click(move |_ev, _win, cx| {
+        let path = path_click.clone();
+        app_click.update(cx, |this, cx| select_change(this, path, staged, cx));
+    })
+    .context_menu(move |menu, _win, _cx| {
         let (app, path) = (app_menu.clone(), path_menu.clone());
         menu.item(
             PopupMenuItem::new("Copy path").on_click(move |_win, _w, cx| {
                 copy_text(&app, path.clone(), "Path copied", cx);
             }),
         )
-    })
-    .on_click(move |_ev, _win, cx| {
-        let path = path_click.clone();
-        app_click.update(cx, |this, cx| select_change(this, path, staged, cx));
     })
 }
 
