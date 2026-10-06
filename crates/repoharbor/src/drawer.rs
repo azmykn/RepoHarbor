@@ -13,10 +13,11 @@
 //! markdown note via gpui-component's multiline input).
 
 use gpui::{
-    App, AppContext, AsyncApp, Context, Div, Entity, FontWeight, InteractiveElement, IntoElement,
-    ParentElement, SharedString, StatefulInteractiveElement, Styled, WeakEntity, Window, div, px,
-    rgb, rgba,
+    App, AppContext, AsyncApp, ClipboardItem, Context, Div, Entity, FontWeight, InteractiveElement,
+    IntoElement, ParentElement, SharedString, StatefulInteractiveElement, Styled, WeakEntity,
+    Window, div, px, rgb, rgba,
 };
+use gpui_component::menu::{ContextMenuExt as _, PopupMenuItem};
 use repoharbor_core::{cache, git_ops, inbox, launch};
 
 use crate::data::{self, Row};
@@ -425,6 +426,50 @@ fn hunk_row(h: git_ops::Hunk) -> HunkRow {
         header: h.header.into(),
         lines: h.lines.into_iter().map(SharedString::from).collect(),
     }
+}
+
+/// Write `text` to the system clipboard and toast success (Settings About pattern).
+fn copy_text(app: &Entity<RepoHarborApp>, text: String, title: &'static str, cx: &mut App) {
+    cx.write_to_clipboard(ClipboardItem::new_string(text));
+    app.update(cx, |this, cx| {
+        this.push_toast(ToastKind::Success, title, None, cx);
+    });
+}
+
+/// Copy one file's staged/unstaged unified patch (full `git_ops::file_diff`).
+fn copy_file_diff(
+    repo: SharedString,
+    path: SharedString,
+    staged: bool,
+    cx: &mut Context<RepoHarborApp>,
+) {
+    let (id, file) = (repo.to_string(), path.to_string());
+    cx.spawn(async move |this, cx| {
+        let patch = cx
+            .background_executor()
+            .spawn(async move { git_ops::file_diff(&id, &file, staged) })
+            .await;
+        let _ = this.update(cx, |this, cx| {
+            match patch {
+                Ok(text) if text.trim().is_empty() => {
+                    this.push_toast(
+                        ToastKind::Info,
+                        "Nothing to copy",
+                        Some("No diff for this file.".into()),
+                        cx,
+                    );
+                }
+                Ok(text) => {
+                    cx.write_to_clipboard(ClipboardItem::new_string(text));
+                    this.push_toast(ToastKind::Success, "Diff copied", None, cx);
+                }
+                Err(e) => {
+                    this.push_toast(ToastKind::Error, "Copy diff failed", Some(e.into()), cx);
+                }
+            }
+        });
+    })
+    .detach();
 }
 
 /// Stage (or unstage) one hunk of the selected file, then re-read the file
@@ -1998,10 +2043,10 @@ fn changes_section(
         .child(col)
 }
 
-/// One file row: kind letter + path + a stage/unstage icon button. Clicking
-/// the row selects it for the diff pane; the trailing button moves it between
-/// the index and the working tree ("+" stages, "x" unstages — the same
-/// remove-from-list affordance as the worktree rows).
+/// One file row: kind letter + path + copy + stage/unstage. Clicking the row
+/// selects it for the diff pane; the copy icon (or right-click → Copy path)
+/// puts the relative path on the clipboard; the trailing button moves it
+/// between the index and the working tree ("+" stages, "x" unstages).
 fn change_item(
     c: &ChangeRow,
     repo: SharedString,
@@ -2014,6 +2059,28 @@ fn change_item(
         .as_ref()
         .is_some_and(|(p, s)| *p == c.path && *s == c.staged);
     let (letter, color) = kind_badge(c.kind, t);
+
+    let copy_btn = {
+        let (app, path) = (app.clone(), c.path.to_string());
+        div()
+            .id(SharedString::from(format!(
+                "chg-copy-{}-{}",
+                c.staged, c.path
+            )))
+            .flex()
+            .items_center()
+            .justify_center()
+            .w(px(22.))
+            .h(px(22.))
+            .rounded(px(t.r_xs))
+            .cursor_pointer()
+            .hover(|s| s.bg(rgb(t.surface_hover)))
+            .child(lucide("copy", 12., t.fg3))
+            .on_click(move |_ev, _win, cx| {
+                cx.stop_propagation();
+                copy_text(&app, path.clone(), "Path copied", cx);
+            })
+    };
 
     let action = {
         let (app, repo, path) = (app.clone(), repo.clone(), c.path.to_string());
@@ -2067,16 +2134,24 @@ fn change_item(
                 .text_color(rgb(if selected { t.fg0 } else { t.fg1 }))
                 .child(c.path.clone()),
         )
+        .child(copy_btn)
         .child(action);
     let row = if selected {
         row.bg(rgb(t.accent_wash))
     } else {
         row.hover(|s| s.bg(rgb(t.surface_hover)))
     };
-    let (app, path, staged) = (app.clone(), c.path.clone(), c.staged);
-    row.on_click(move |_ev, _win, cx| {
-        let path = path.clone();
-        app.update(cx, |this, cx| select_change(this, path, staged, cx));
+    let (app_click, path_click, staged) = (app.clone(), c.path.clone(), c.staged);
+    let (app_menu, path_menu) = (app.clone(), c.path.to_string());
+    row.context_menu(move |menu, _win, _cx| {
+        let (app, path) = (app_menu.clone(), path_menu.clone());
+        menu.item(PopupMenuItem::new("Copy path").on_click(move |_win, _w, cx| {
+            copy_text(&app, path.clone(), "Path copied", cx);
+        }))
+    })
+    .on_click(move |_ev, _win, cx| {
+        let path = path_click.clone();
+        app_click.update(cx, |this, cx| select_change(this, path, staged, cx));
     })
 }
 
@@ -2100,6 +2175,39 @@ fn diff_pane(repo: SharedString, data: &DrawerData, t: &Theme, app: &Entity<Repo
                 .truncate()
                 .child(SharedString::from(format!("· {path} ({side})"))),
         );
+        // Copy path + Copy diff — GPUI SharedString children aren't drag-
+        // selectable, so explicit clipboard affordances (same as Settings).
+        let (app_path, path_copy) = (app.clone(), path.to_string());
+        head = head.child(
+            div()
+                .id(SharedString::from(format!("diff-copy-path-{staged}-{path}")))
+                .flex()
+                .items_center()
+                .justify_center()
+                .w(px(22.))
+                .h(px(22.))
+                .rounded(px(t.r_xs))
+                .cursor_pointer()
+                .hover(|s| s.bg(rgb(t.surface_hover)))
+                .child(lucide("copy", 12., t.fg3))
+                .on_click(move |_ev, _win, cx| {
+                    copy_text(&app_path, path_copy.clone(), "Path copied", cx);
+                }),
+        );
+        let can_copy_diff = matches!(&data.diff, DiffState::Ready(h) if !h.is_empty());
+        if can_copy_diff {
+            let (app_d, repo_d, path_d, staged_d) =
+                (app.clone(), repo.clone(), path.clone(), *staged);
+            head = head.child(pr_btn(
+                SharedString::from(format!("copy-diff-{staged}-{path}")),
+                "Copy diff",
+                t,
+                move |_win, cx: &mut gpui::App| {
+                    let (repo, path) = (repo_d.clone(), path_d.clone());
+                    app_d.update(cx, |_this, cx| copy_file_diff(repo, path, staged_d, cx));
+                },
+            ));
+        }
     }
 
     let body = match (&data.changes, &data.diff) {
@@ -2145,6 +2253,7 @@ fn diff_block(
     app: &Entity<RepoHarborApp>,
 ) -> impl IntoElement {
     let mut block = div()
+        .id(SharedString::from(format!("diff-block-{staged}-{path}")))
         .flex()
         .flex_col()
         .p(px(10.))
