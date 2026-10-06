@@ -12,6 +12,10 @@ versioned trees, including nested submodule parents).
 
 ### Added
 
+- **Changes drawer copy** — Unstaged/Staged rows expose a copy icon (and
+  right-click → **Copy path**) for the relative file path; the DIFF header
+  has **Copy diff** (plus right-click on the patch) for the full unified
+  patch, and a copy icon for the path. Commit subject/body inputs unchanged.
 - **Mute attention paths** — Settings → Workspace lists `muteAttentionPrefixes`
   (absolute or `~`-expandable). Repos under those prefixes are excluded from
   Needs me, attention chips, and tray actionable items without editing anything

@@ -14,7 +14,8 @@ The home tab for a repo:
 
 Everything for turning working changes into a commit:
 
-- **Staged diff** — a syntax-aware view of what's staged.
+- **Unstaged / Staged lists** — per-file stage/unstage. Copy a relative path with the row's copy icon or right-click → **Copy path**.
+- **Diff pane** — the selected file's staged or unstaged patch (hunk stage/unstage). **Copy diff** (header button or right-click the patch) puts the full unified patch on the clipboard; the header copy icon copies the path. Commit subject/body stay normal text fields (select + Ctrl+C).
 - **Gen only / Gen & push** — side-by-side when [AI](./local-ai) is on: **Gen only** fills the commit composer from the staged/working diff (changelog-aware); **Gen & push** drafts, commits all, and pushes (single-repo, one-click from the drawer).
 - **Changelog** — summarise recent history into release-style notes.
 

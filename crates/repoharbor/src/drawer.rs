@@ -449,23 +449,21 @@ fn copy_file_diff(
             .background_executor()
             .spawn(async move { git_ops::file_diff(&id, &file, staged) })
             .await;
-        let _ = this.update(cx, |this, cx| {
-            match patch {
-                Ok(text) if text.trim().is_empty() => {
-                    this.push_toast(
-                        ToastKind::Info,
-                        "Nothing to copy",
-                        Some("No diff for this file.".into()),
-                        cx,
-                    );
-                }
-                Ok(text) => {
-                    cx.write_to_clipboard(ClipboardItem::new_string(text));
-                    this.push_toast(ToastKind::Success, "Diff copied", None, cx);
-                }
-                Err(e) => {
-                    this.push_toast(ToastKind::Error, "Copy diff failed", Some(e.into()), cx);
-                }
+        let _ = this.update(cx, |this, cx| match patch {
+            Ok(text) if text.trim().is_empty() => {
+                this.push_toast(
+                    ToastKind::Info,
+                    "Nothing to copy",
+                    Some("No diff for this file.".into()),
+                    cx,
+                );
+            }
+            Ok(text) => {
+                cx.write_to_clipboard(ClipboardItem::new_string(text));
+                this.push_toast(ToastKind::Success, "Diff copied", None, cx);
+            }
+            Err(e) => {
+                this.push_toast(ToastKind::Error, "Copy diff failed", Some(e.into()), cx);
             }
         });
     })
@@ -2145,9 +2143,11 @@ fn change_item(
     let (app_menu, path_menu) = (app.clone(), c.path.to_string());
     row.context_menu(move |menu, _win, _cx| {
         let (app, path) = (app_menu.clone(), path_menu.clone());
-        menu.item(PopupMenuItem::new("Copy path").on_click(move |_win, _w, cx| {
-            copy_text(&app, path.clone(), "Path copied", cx);
-        }))
+        menu.item(
+            PopupMenuItem::new("Copy path").on_click(move |_win, _w, cx| {
+                copy_text(&app, path.clone(), "Path copied", cx);
+            }),
+        )
     })
     .on_click(move |_ev, _win, cx| {
         let path = path_click.clone();
@@ -2180,7 +2180,9 @@ fn diff_pane(repo: SharedString, data: &DrawerData, t: &Theme, app: &Entity<Repo
         let (app_path, path_copy) = (app.clone(), path.to_string());
         head = head.child(
             div()
-                .id(SharedString::from(format!("diff-copy-path-{staged}-{path}")))
+                .id(SharedString::from(format!(
+                    "diff-copy-path-{staged}-{path}"
+                )))
                 .flex()
                 .items_center()
                 .justify_center()
@@ -2334,7 +2336,22 @@ fn diff_block(
         }
         budget = budget.saturating_sub(hunk.lines.len());
     }
-    block
+    let (app_menu, repo_menu, path_menu) = (app.clone(), repo.clone(), path.clone());
+    block.context_menu(move |menu, _win, _cx| {
+        let (app, repo, path) = (app_menu.clone(), repo_menu.clone(), path_menu.clone());
+        menu.item(
+            PopupMenuItem::new("Copy diff").on_click(move |_w, _win, cx| {
+                let (repo, path) = (repo.clone(), path.clone());
+                app.update(cx, |_this, cx| copy_file_diff(repo, path, staged, cx));
+            }),
+        )
+        .item({
+            let (app, path) = (app_menu.clone(), path_menu.to_string());
+            PopupMenuItem::new("Copy path").on_click(move |_w, _win, cx| {
+                copy_text(&app, path.clone(), "Path copied", cx);
+            })
+        })
+    })
 }
 
 /// Pick an icon for an individual check state.
