@@ -39,8 +39,9 @@ Ops row (bottom) — verbs that execute work, visible even with no selection:
 - **Refresh** — labeled accent control that re-scans workspace roots (git status, attention, grid). The same action is on the chrome bar next to **+**. A toast reports **Scanning…** then **Scan finished**.
 - **Pull behind** — fleet-pulls every repo currently behind upstream.
 - **Fetch all** — host enrichment refresh (ignores TTL).
+- **Submodules** — update nested checkouts. Empty selection → every visible parent with submodules (**Submodules (N)** when idle); with a selection → selected ∩ visible only. Empty→all toasts **Updating N visible parents…**.
 - **Summarize** — one-line AI summaries for every repo (when AI is ready). A toast tracks **Summarizing…** then success / already up to date / error; summaries appear on List rows and Grid cards (cached by commit).
-- Select-all plus **Fetch / Pull / Push / Submodules / Gen commit / Empty commit** and **Actions ▾** when something is selected.
+- With a selection: select-all plus **Fetch / Pull / Push / Gen only / Gen & push / [Empty commit]** and a slim **Actions ▾** (Stage / Commit / Discard / Prune / Reset / Mute / IDE — sync verbs stay on the primaries).
 
 ### Projects & saved views
 
@@ -53,12 +54,14 @@ Roots & Languages in the sidebar still filter by workspace root and detected lan
 
 ## Selecting repos
 
-Each card has a checkbox; select one or more (or use the toolbar's select-all) to bring up the **fleet bar** for batch git operations across the selection. See [Fleet operations](./fleet).
+Each card has a checkbox; select one or more (or use the toolbar's select-all) to bring up selection-scoped fleet verbs on the ops row. Fleet targets are always **selected ∩ currently visible** under Mission Control filters — see [Fleet operations](./fleet).
 
-**Actions ▾** appears on the ops row only when there is a selection; it runs the same fleet ops (Fetch, Pull, Stage, Commit, Discard, Submodule Update, …). Keyboard shortcuts on the current selection:
+**Actions ▾** appears on the ops row only when there is a selection; it keeps Stage / Commit / Discard / Prune / Reset / Mute / IDE (Fetch / Pull / Push / Gen only / Gen & push / Empty commit sit beside it as primaries). Keyboard shortcuts on the current selection:
 
 - <kbd>Ctrl/Cmd+Shift+F</kbd> — Fetch selected
 - <kbd>Ctrl/Cmd+Shift+P</kbd> — Pull selected
+
+**Push** enables only when a selected *non–pull-only* repo is ahead. Ahead on vendor / `core` / `custom` alone does not light Push; a mixed selection runs Push only on the pushable subset (**Skipped pull-only** toast for the rest).
 
 **Pull behind** (ops row / command palette) selects every repo with `behind > 0` and fleet-pulls them — useful for upstream Odoo/core trees you keep current without hunting the Behind mode. Pair with **pull-only prefixes** in Settings so those trees never offer Push and upstream CI / local-only Ahead stay off Needs me (silence — you'll only hear about a push if one is attempted and fails).
 

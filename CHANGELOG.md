@@ -18,6 +18,13 @@ versioned trees, including nested submodule parents).
   inside the repo. Right-click / Actions → **Mute attention** appends the
   selected path(s). Pull-only still only silences Ahead + upstream CI; dirty
   vendor trees (e.g. `odooplm` under `custom/`) need an explicit mute.
+- **Gen & push confirm (multi-repo)** — fleet **Gen & push** on two or more
+  dirty repos arms a confirm strip listing the targets (AI message → commit
+  all → push) before running. **Gen only** stays one-click; single-repo Gen &
+  push (drawer / one dirty target) stays one-click.
+- **Submodules empty→all cue** — idle empty selection shows **Submodules (N)**
+  for visible parents with nested checkouts; starting that path toasts
+  **Updating N visible parents…** before the progress counter.
 
 ### Fixed
 
@@ -40,6 +47,11 @@ versioned trees, including nested submodule parents).
   work-mode chip / header count only listable work. Host-only review/CI
   (no local checkout) still appears under Needs me instead of **All clear**
   with a non-zero badge.
+- **Push respects pull-only** — like Empty commit: Push drops pull-only paths
+  with **Skipped pull-only**; all–pull-only → Error and no run. **can_push** /
+  the Push button enable only when a *non–pull-only* selected repo is ahead
+  (vendor Ahead alone no longer lights Push). Mixed selection runs only on
+  pushable repos.
 
 ### Changed
 
@@ -55,7 +67,8 @@ versioned trees, including nested submodule parents).
   selected ∩ visible. Progress toast remains **Updating submodules** `N/…`.
 - **Gen commit without a popup** — Mission Control ops row and drawer Changes
   show side-by-side **Gen only** (AI message) and **Gen & push** (message →
-  commit all → push); no choice modal.
+  commit all → push); no choice modal (multi-repo Gen & push uses the confirm
+  strip above).
 - **Actions ▾ no longer duplicates ops-row sync** — Fetch / Pull / Push /
   Gen only / Gen & push / Empty commit stay on the selection primaries;
   **Submodules** is always-on next to Pull behind / Fetch all; the gear keeps
@@ -101,6 +114,10 @@ versioned trees, including nested submodule parents).
   glyphs); default accent aligned to harbor teal `#1dd3c4`.
 - **Docs shots** — removed Orrery-branded screenshots from `docs/public/shots/`
   and unlinked them from the guide (re-capture pending from the native app).
+- **Docs truth** — [Fleet](docs/guide/fleet.md), [Mission Control](docs/guide/mission-control.md),
+  and [Repo drawer](docs/guide/repo-drawer.md) match Gen only / Gen & push,
+  selection∩visible, Submodules empty→visible parents, slim Actions, and
+  pull-only Push (no stale Stash / Checkout default / Run command).
 
 ### Added
 

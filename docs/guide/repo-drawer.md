@@ -15,7 +15,7 @@ The home tab for a repo:
 Everything for turning working changes into a commit:
 
 - **Staged diff** — a syntax-aware view of what's staged.
-- **AI commit message** — draft a message from the staged diff, then commit inline. *(Shown when [AI](./local-ai) is on.)*
+- **Gen only / Gen & push** — side-by-side when [AI](./local-ai) is on: **Gen only** fills the commit composer from the staged/working diff (changelog-aware); **Gen & push** drafts, commits all, and pushes (single-repo, one-click from the drawer).
 - **Changelog** — summarise recent history into release-style notes.
 
 ## PRs

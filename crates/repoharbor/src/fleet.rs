@@ -115,11 +115,12 @@ pub enum FleetOp {
     /// Only started through the message strip ([`RepoHarborApp::confirm_fleet_commit`]).
     CommitAll,
     /// `git commit --allow-empty` with a default message (CI trigger).
-    /// Skips pull-only paths like Push.
+    /// Skips pull-only paths (same as Push).
     EmptyCommit,
     /// Per-repo AI message only — no commit/push (toast + Log).
     GenerateMessageOnly,
-    /// Per-repo AI message → `commit_all` → `push`.
+    /// Per-repo AI message → `commit_all` → `push`. Multi-repo fleet runs
+    /// start only through the confirm strip ([`RepoHarborApp::confirm_fleet_gen_push`]).
     GenerateCommitAndPush,
     /// Only ever started through the confirm strip
     /// ([`RepoHarborApp::confirm_fleet_prune`]) — never directly from a button.
@@ -222,6 +223,7 @@ impl RepoHarborApp {
         self.fleet_reset = None;
         self.fleet_discard = None;
         self.fleet_commit = None;
+        self.fleet_gen_push = None;
         if !self.selected.remove(&id) {
             self.selected.insert(id);
         }
@@ -235,6 +237,7 @@ impl RepoHarborApp {
             || self.fleet_reset.is_some()
             || self.fleet_discard.is_some()
             || self.fleet_commit.is_some()
+            || self.fleet_gen_push.is_some()
         {
             self.clear_selection_quiet();
             cx.notify();
@@ -249,6 +252,7 @@ impl RepoHarborApp {
         self.fleet_reset = None;
         self.fleet_discard = None;
         self.fleet_commit = None;
+        self.fleet_gen_push = None;
     }
 
     /// True when every currently visible/filtered row is in the selection
@@ -269,6 +273,7 @@ impl RepoHarborApp {
         self.fleet_reset = None;
         self.fleet_discard = None;
         self.fleet_commit = None;
+        self.fleet_gen_push = None;
         self.prune_selection_to_visible();
         for i in self.visible_rows() {
             let id = self.rows[i].id.clone();
@@ -303,6 +308,7 @@ impl RepoHarborApp {
             || self.fleet_reset.is_some()
             || self.fleet_discard.is_some()
             || self.fleet_commit.is_some()
+            || self.fleet_gen_push.is_some()
     }
 
     /// Idle = no run and no confirm strip (Actions menu items enabled).
@@ -312,6 +318,7 @@ impl RepoHarborApp {
             && self.fleet_reset.is_none()
             && self.fleet_discard.is_none()
             && self.fleet_commit.is_none()
+            && self.fleet_gen_push.is_none()
     }
 
     /// Replace the selection with the *currently visible* repos matching
@@ -345,6 +352,7 @@ impl RepoHarborApp {
         self.fleet_reset = None;
         self.fleet_discard = None;
         self.fleet_commit = None;
+        self.fleet_gen_push = None;
         self.selected = matched;
         cx.notify();
     }
@@ -374,6 +382,7 @@ impl RepoHarborApp {
             self.fleet_reset = None;
             self.fleet_discard = None;
             self.fleet_commit = None;
+            self.fleet_gen_push = None;
         }
     }
 
@@ -397,9 +406,10 @@ impl RepoHarborApp {
     /// checkouts (ops-row **Submodules** with an empty selection).
     pub fn run_submodule_update(&mut self, cx: &mut Context<Self>) {
         let visible = self.visible_rows();
+        let empty_selection = self.selected.is_empty();
         let repos = submodule_update_targets(&self.rows, &self.selected, &visible);
         if repos.is_empty() {
-            let detail = if self.selected.is_empty() {
+            let detail = if empty_selection {
                 "No visible repos declare nested checkouts."
             } else {
                 "Nothing selected is visible under the current filters."
@@ -411,6 +421,19 @@ impl RepoHarborApp {
                 cx,
             );
             return;
+        }
+        // Empty→all-visible cue: name the scope before the progress toast.
+        if empty_selection {
+            let n = repos.len();
+            self.push_toast(
+                ToastKind::Info,
+                format!(
+                    "Updating {n} visible {}",
+                    if n == 1 { "parent" } else { "parents" }
+                ),
+                Some("No selection — every visible parent with nested checkouts.".into()),
+                cx,
+            );
         }
         self.run_fleet_repos(FleetOp::SubmoduleUpdate, repos, cx);
     }
@@ -438,18 +461,25 @@ impl RepoHarborApp {
         if self.fleet_run.is_some() || repos.is_empty() {
             return;
         }
-        // Empty commit stays off vendor trees. Push does not: a selected repo
-        // that Needs me already marks "Not pushed" must be publishable.
-        if matches!(op, FleetOp::EmptyCommit) {
+        // Empty commit and Push stay off vendor / pull-only trees. Mixed
+        // selections drop those paths with an Info toast; all-pull-only → Error.
+        if matches!(op, FleetOp::EmptyCommit | FleetOp::Push) {
             let prefixes = &self.config.pull_only_prefixes;
             let before = repos.len();
             repos.retain(|r| !repoharbor_core::model::path_is_pull_only(r, prefixes));
             let blocked = before - repos.len();
-            let (blocked_title, blocked_detail, skip_detail) = (
-                "Empty commit blocked",
-                "Selected repos are pull-only (upstream / vendor). Empty commit is disabled.",
-                "skipped — empty commit runs only on digits / pushable paths.",
-            );
+            let (blocked_title, blocked_detail, skip_detail) = match op {
+                FleetOp::Push => (
+                    "Push blocked",
+                    "Selected repos are pull-only (upstream / vendor). Push is disabled.",
+                    "skipped — push runs only on digits / pushable paths.",
+                ),
+                _ => (
+                    "Empty commit blocked",
+                    "Selected repos are pull-only (upstream / vendor). Empty commit is disabled.",
+                    "skipped — empty commit runs only on digits / pushable paths.",
+                ),
+            };
             if repos.is_empty() {
                 self.push_toast(
                     ToastKind::Error,
@@ -493,6 +523,7 @@ impl RepoHarborApp {
         self.fleet_reset = None;
         self.fleet_discard = None;
         self.fleet_commit = None;
+        self.fleet_gen_push = None;
         let total = repos.len();
         self.fleet_seq += 1;
         let run_id = self.fleet_seq;
@@ -678,6 +709,7 @@ impl RepoHarborApp {
             || self.fleet_prune.is_some()
             || self.fleet_reset.is_some()
             || self.fleet_discard.is_some()
+            || self.fleet_gen_push.is_some()
         {
             return;
         }
@@ -721,6 +753,41 @@ impl RepoHarborApp {
         }
     }
 
+    /// Arm a Gen & push confirm for multiple dirty repos. Single-repo Gen &
+    /// push stays one-click via [`Self::run_generate_commit`]. Nothing runs
+    /// until [`Self::confirm_fleet_gen_push`].
+    pub fn start_fleet_gen_push(&mut self, repos: Vec<String>, cx: &mut Context<Self>) {
+        if self.fleet_run.is_some()
+            || self.fleet_gen_push.is_some()
+            || self.fleet_commit.is_some()
+            || self.fleet_prune.is_some()
+            || self.fleet_reset.is_some()
+            || self.fleet_discard.is_some()
+        {
+            return;
+        }
+        if repos.len() < 2 {
+            return;
+        }
+        self.fleet_gen_push = Some(repos);
+        cx.notify();
+    }
+
+    /// Confirm strip → AI message → commit all → push for the planned repos.
+    pub fn confirm_fleet_gen_push(&mut self, cx: &mut Context<Self>) {
+        let Some(repos) = self.fleet_gen_push.take() else {
+            return;
+        };
+        self.run_fleet_repos(FleetOp::GenerateCommitAndPush, repos, cx);
+    }
+
+    /// Drop the pending Gen & push confirm (strip Cancel, or Esc).
+    pub fn cancel_fleet_gen_push(&mut self, cx: &mut Context<Self>) {
+        if self.fleet_gen_push.take().is_some() {
+            cx.notify();
+        }
+    }
+
     /// The fleet bar's Prune button: scan the selected repos for prunable
     /// branches on the background executor (the Cleanup view's scan), then
     /// expand the bar into the confirm strip with the per-repo breakdown.
@@ -731,6 +798,7 @@ impl RepoHarborApp {
             || self.fleet_reset.is_some()
             || self.fleet_discard.is_some()
             || self.fleet_commit.is_some()
+            || self.fleet_gen_push.is_some()
         {
             return;
         }
@@ -833,6 +901,7 @@ impl RepoHarborApp {
             || self.fleet_discard.is_some()
             || self.fleet_prune.is_some()
             || self.fleet_commit.is_some()
+            || self.fleet_gen_push.is_some()
         {
             return;
         }
@@ -883,6 +952,7 @@ impl RepoHarborApp {
             || self.fleet_reset.is_some()
             || self.fleet_prune.is_some()
             || self.fleet_commit.is_some()
+            || self.fleet_gen_push.is_some()
         {
             return;
         }
@@ -959,8 +1029,8 @@ impl RepoHarborApp {
     }
 
     /// Slim bottom strip: in-flight progress / Cancel, plus confirm strips for
-    /// commit / discard / reset / prune. Bulk action buttons live in the top
-    /// Actions dropdown (and the repo context menu) — not here.
+    /// commit / Gen & push / discard / reset / prune. Bulk action buttons live
+    /// in the top Actions dropdown (and the repo context menu) — not here.
     pub fn fleet_bar(&self, t: &Theme, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
         if !self.fleet_strip_active() {
             return None;
@@ -1056,6 +1126,57 @@ impl RepoHarborApp {
                     false,
                     t,
                     cx.listener(|this, _e, _w, cx| this.cancel_fleet_commit(cx)),
+                ));
+            return Some(
+                div()
+                    .flex()
+                    .flex_col()
+                    .child(strip)
+                    .child(bar)
+                    .into_any_element(),
+            );
+        }
+        // Multi-repo Gen & push: list targets + commit-all+push warning.
+        if let Some(repos) = &self.fleet_gen_push {
+            let n = repos.len();
+            let names = gen_push_name_list(self, repos);
+            let strip = div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(10.))
+                .px(px(16.))
+                .py(px(10.))
+                .border_t_1()
+                .border_color(rgb(t.border_accent))
+                .bg(rgb(t.accent_wash))
+                .child(lucide("sparkles", 15., t.accent_bright))
+                .child(
+                    div()
+                        .flex_1()
+                        .text_size(px(t.text_small))
+                        .text_color(rgb(t.fg0))
+                        .child(SharedString::from(format!(
+                            "Gen & push {n} repos — AI message, commit all, then push: {names}"
+                        ))),
+                )
+                .child(bar_btn(
+                    "fleet-gen-push-confirm",
+                    "sparkles",
+                    "Confirm Gen & push",
+                    true,
+                    false,
+                    t,
+                    cx.listener(|this, _e, _w, cx| this.confirm_fleet_gen_push(cx)),
+                ))
+                .child(bar_btn(
+                    "fleet-gen-push-cancel",
+                    "x",
+                    "Cancel",
+                    true,
+                    false,
+                    t,
+                    cx.listener(|this, _e, _w, cx| this.cancel_fleet_gen_push(cx)),
                 ));
             return Some(
                 div()
@@ -1190,9 +1311,10 @@ impl RepoHarborApp {
     /// (**Submodules** lives on the always-on ops row next to Pull behind —
     /// empty selection updates every visible submodule parent.)
     /// Push and the Gen pair stay on the bar for every selection (a Needs-me
-    /// mix of vendor + digits must not drop them). Empty commit only when a
-    /// non–pull-only path is selected. Gen buttons dim unless something is
-    /// dirty and AI is ready.
+    /// mix of vendor + digits must not drop Gen). Push enables only when a
+    /// non–pull-only path is ahead; Empty commit only when a non–pull-only
+    /// path is selected. Gen buttons dim unless something is dirty and AI is
+    /// ready. Gen & push on N>1 arms a confirm strip first.
     pub fn fleet_primary_sync_buttons(
         &self,
         t: &Theme,
@@ -1247,7 +1369,7 @@ impl RepoHarborApp {
                         crate::toast::ToastKind::Info,
                         "Nothing to push",
                         Some(
-                            "Push enables when a selected repo has commits that are not on its upstream."
+                            "Push enables when a selected non–pull-only repo has commits that are not on its upstream."
                                 .into(),
                         ),
                         cx,
@@ -1494,6 +1616,27 @@ fn prune_title(branches: usize, repos: usize) -> String {
         if branches == 1 { "branch" } else { "branches" },
         if repos == 1 { "repo" } else { "repos" },
     )
+}
+
+/// Short display names for the Gen & push confirm strip (grid `name`, else
+/// path tail), capped like the prune breakdown.
+fn gen_push_name_list(app: &RepoHarborApp, repos: &[String]) -> String {
+    const MAX_SHOWN: usize = 5;
+    let mut names: Vec<String> = repos
+        .iter()
+        .take(MAX_SHOWN)
+        .map(|id| {
+            app.rows
+                .iter()
+                .find(|r| r.id.as_ref() == id.as_str())
+                .map(|r| r.name.to_string())
+                .unwrap_or_else(|| id.rsplit('/').next().unwrap_or(id).to_string())
+        })
+        .collect();
+    if repos.len() > MAX_SHOWN {
+        names.push(format!("+{} more", repos.len() - MAX_SHOWN));
+    }
+    names.join(", ")
 }
 
 /// The confirm strip's per-repo breakdown: "repoharbor ×3 · zed ×2 · +4 more",

@@ -482,6 +482,9 @@ pub struct RepoHarborApp {
     pub fleet_discard: Option<Vec<String>>,
     /// Pending bulk-commit message strip (one shared message for Commit All…).
     pub fleet_commit: Option<crate::fleet::CommitPlan>,
+    /// Pending Gen & push confirm (multi-repo only) — AI message → commit all
+    /// → push. Dropped on selection change / Esc / Cancel / another run.
+    pub fleet_gen_push: Option<Vec<String>>,
     /// Click-through detail panel for a toast / Log row.
     pub notice_detail: Option<crate::activity_log::LogEntry>,
     /// Files updated by the most recent successful Pull fast-forward(s) —
@@ -2174,7 +2177,9 @@ impl RepoHarborApp {
             .collect()
     }
 
-    /// Run a Generate outcome immediately (no popup) for `repos`.
+    /// Run a Generate outcome for `repos`. **Gen only** is always immediate.
+    /// **Gen & push** with more than one repo arms the fleet confirm strip
+    /// first; a single dirty target (drawer or fleet) stays one-click.
     /// `from_drawer` keeps MessageOnly in the open Changes tab.
     pub fn run_generate_commit(
         &mut self,
@@ -2218,7 +2223,11 @@ impl RepoHarborApp {
                 }
             }
             GenerateCommitChoice::CommitAndPush => {
-                self.run_fleet_repos(crate::fleet::FleetOp::GenerateCommitAndPush, repos, cx);
+                if repos.len() > 1 {
+                    self.start_fleet_gen_push(repos, cx);
+                } else {
+                    self.run_fleet_repos(crate::fleet::FleetOp::GenerateCommitAndPush, repos, cx);
+                }
             }
         }
     }
@@ -6591,10 +6600,23 @@ impl RepoHarborApp {
         ));
         // Always-on Submodules: empty selection → all visible parents with
         // nested checkouts; with a selection → selected ∩ visible only.
+        // Idle+empty: show the visible-parent count so empty→all is obvious.
+        let sub_label = if self.selected.is_empty() {
+            let visible = self.visible_rows();
+            let n =
+                crate::fleet::submodule_update_targets(&self.rows, &self.selected, &visible).len();
+            if n > 0 {
+                format!("Submodules ({n})")
+            } else {
+                "Submodules".into()
+            }
+        } else {
+            "Submodules".into()
+        };
         row = row.child(tool_btn(
             "tb-submodules",
             "box",
-            Some("Submodules"),
+            Some(sub_label.as_str()),
             Some(
                 "Update nested checkouts — selection when checked, else every visible parent with submodules",
             ),
@@ -6676,7 +6698,8 @@ impl RepoHarborApp {
             && self.fleet_prune.is_none()
             && self.fleet_reset.is_none()
             && self.fleet_discard.is_none()
-            && self.fleet_commit.is_none();
+            && self.fleet_commit.is_none()
+            && self.fleet_gen_push.is_none();
         let (border_c, bg_c) = if selected {
             (t.primary, t.primary)
         } else {
@@ -6984,6 +7007,8 @@ impl Render for RepoHarborApp {
                     this.cancel_fleet_discard(cx);
                 } else if this.fleet_reset.is_some() {
                     this.cancel_fleet_reset(cx);
+                } else if this.fleet_gen_push.is_some() {
+                    this.cancel_fleet_gen_push(cx);
                 } else if this.fleet_commit.is_some() {
                     this.cancel_fleet_commit(cx);
                 } else if this.fleet_prune.is_some() {

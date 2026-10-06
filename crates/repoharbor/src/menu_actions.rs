@@ -13,12 +13,12 @@ use crate::shell::RepoHarborApp;
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct FleetMenuCaps {
     pub has_dirty: bool,
-    /// At least one selected repo has commits that are not on its upstream.
-    /// Includes pull-only checkouts: Needs me already says "Not pushed", so
-    /// Push stays available instead of vanishing with the selection.
+    /// At least one *non–pull-only* selected repo is ahead of its upstream.
+    /// Vendor / `core` / `custom` Ahead alone must not enable Push (Needs me
+    /// already hides pull-only Ahead; the ops-row matches).
     pub can_push: bool,
     /// At least one selected repo is not under a pull-only prefix (Digits /
-    /// pushable path). Empty commit stays limited to these paths.
+    /// pushable path). Empty commit and Push stay limited to these paths.
     pub has_pushable_path: bool,
     pub has_submodules: bool,
     /// At least one target is not yet on `mute_attention_prefixes`.
@@ -41,9 +41,9 @@ pub(crate) fn fleet_menu_caps(app: &RepoHarborApp, targets: &[String]) -> FleetM
         let pull_only = app.is_pull_only(id);
         if !pull_only {
             caps.has_pushable_path = true;
-        }
-        if row.ahead > 0 {
-            caps.can_push = true;
+            if row.ahead > 0 {
+                caps.can_push = true;
+            }
         }
         if row.child_count > 0 {
             caps.has_submodules = true;
