@@ -233,18 +233,12 @@ pub fn seed_odoo_groups_if_empty(cfg: &mut AppConfig) -> bool {
     true
 }
 
-/// If `pull_only_prefixes` is empty, seed upstream / vendor trees:
-///
-/// - Odoo layout: `<root>/core` and `<root>/custom` when those dirs exist
-/// - Or the root itself when it already *is* a `core` / `custom` folder
-///
-/// Leaves `digits/` writable. Returns true when prefixes were added.
-pub fn seed_pull_only_if_empty(cfg: &mut AppConfig) -> bool {
-    if !cfg.pull_only_prefixes.is_empty() {
-        return false;
-    }
+/// Absolute paths that should be pull-only for the Odoo layout under `roots`:
+/// each root that *is* `core`/`custom`, plus `<root>/core` and `<root>/custom`
+/// when those directories exist. Leaves `digits/` writable.
+fn odoo_pull_only_candidates(roots: &[String]) -> Vec<String> {
     let mut prefixes = Vec::new();
-    for root in &cfg.roots {
+    for root in roots {
         let root_path = crate::scan::expand(root);
         let name = root_path
             .file_name()
@@ -263,11 +257,44 @@ pub fn seed_pull_only_if_empty(cfg: &mut AppConfig) -> bool {
             }
         }
     }
+    prefixes
+}
+
+/// If `pull_only_prefixes` is empty, seed upstream / vendor trees from the
+/// Odoo layout under each root. Returns true when prefixes were added.
+pub fn seed_pull_only_if_empty(cfg: &mut AppConfig) -> bool {
+    if !cfg.pull_only_prefixes.is_empty() {
+        return false;
+    }
+    let prefixes = odoo_pull_only_candidates(&cfg.roots);
     if prefixes.is_empty() {
         return false;
     }
     cfg.pull_only_prefixes = prefixes;
     true
+}
+
+/// Append missing Odoo `core` / `custom` pull-only prefixes when a root was
+/// added after the first seed (e.g. `odoo20` while 17–19 were already listed).
+/// Does not remove user edits. Returns true when anything was appended.
+pub fn heal_pull_only_odoo_trees(cfg: &mut AppConfig) -> bool {
+    let candidates = odoo_pull_only_candidates(&cfg.roots);
+    if candidates.is_empty() {
+        return false;
+    }
+    let mut changed = false;
+    for path in candidates {
+        let already = cfg.pull_only_prefixes.iter().any(|p| {
+            let a = p.trim_end_matches('/');
+            let b = path.trim_end_matches('/');
+            a == b
+        });
+        if !already {
+            cfg.pull_only_prefixes.push(path);
+            changed = true;
+        }
+    }
+    changed
 }
 
 /// Load config, falling back to (and writing) defaults if absent/invalid.
@@ -282,6 +309,9 @@ pub fn load() -> AppConfig {
         seeded = true;
     }
     if seed_pull_only_if_empty(&mut cfg) {
+        seeded = true;
+    }
+    if heal_pull_only_odoo_trees(&mut cfg) {
         seeded = true;
     }
     if heal_agent_command(&mut cfg) {
@@ -405,6 +435,34 @@ mod tests {
         assert_eq!(
             agent_launcher_label("ptyxis --new-window -d {path} -- opencode"),
             "Agent"
+        );
+    }
+
+    #[test]
+    fn heal_pull_only_adds_new_odoo_core_custom() {
+        let root = tempfile::tempdir().unwrap();
+        let odoo20 = root.path().join("odoo20");
+        std::fs::create_dir_all(odoo20.join("core")).unwrap();
+        std::fs::create_dir_all(odoo20.join("custom")).unwrap();
+        std::fs::create_dir_all(odoo20.join("digits")).unwrap();
+        let mut cfg = AppConfig {
+            roots: vec![odoo20.to_string_lossy().into_owned()],
+            // Already seeded for an older tree — new root must still heal in.
+            pull_only_prefixes: vec!["/home/u/odoo19/custom".into()],
+            ..AppConfig::default()
+        };
+        assert!(heal_pull_only_odoo_trees(&mut cfg));
+        let core = odoo20.join("core").to_string_lossy().into_owned();
+        let custom = odoo20.join("custom").to_string_lossy().into_owned();
+        assert!(cfg.pull_only_prefixes.iter().any(|p| p == &core));
+        assert!(cfg.pull_only_prefixes.iter().any(|p| p == &custom));
+        assert!(!cfg
+            .pull_only_prefixes
+            .iter()
+            .any(|p| p.ends_with("/digits")));
+        assert!(
+            !heal_pull_only_odoo_trees(&mut cfg),
+            "second heal is a no-op"
         );
     }
 

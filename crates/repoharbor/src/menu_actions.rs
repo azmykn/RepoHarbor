@@ -65,11 +65,29 @@ pub(crate) struct FleetMenuOpts {
     pub open_drawer: Option<SharedString>,
     /// Section label above the ops (e.g. `Selection (4)`).
     pub section_label: Option<String>,
+    /// Include Fetch / Pull / Push / Submodules / Gen only / Gen & push /
+    /// Empty commit. Mission Control's ops-row already paints those as
+    /// primaries beside Actions ▾ — pass `false` there to avoid duplication.
+    /// Card / TREE context menus pass `true` (no ops-row on those surfaces).
+    pub include_sync_primaries: bool,
 }
 
-/// Canonical action order (sync-first):
-/// Open drawer / Open on host → Fetch / Pull → Stage / Commit / Generate / Push / Empty commit
-/// → Update submodules → Discard / Prune / Reset → Open in IDE → Clear selection.
+/// Dirty subset of `targets` (grid rows), preserving order.
+fn dirty_targets(app: &RepoHarborApp, targets: &[String]) -> Vec<String> {
+    targets
+        .iter()
+        .filter(|id| {
+            app.rows
+                .iter()
+                .any(|r| r.id.as_ref() == id.as_str() && r.dirty > 0)
+        })
+        .cloned()
+        .collect()
+}
+
+/// Canonical action order (sync-first when `include_sync_primaries`):
+/// Open drawer / Open on host → [Fetch / Pull / Push / Submodules / Gen…] →
+/// Stage / Commit → Discard / Prune / Reset → Mute → Open in IDE → Clear.
 pub(crate) fn fill_fleet_actions_menu(
     menu: PopupMenu,
     app: Entity<RepoHarborApp>,
@@ -84,6 +102,8 @@ pub(crate) fn fill_fleet_actions_menu(
     let dirty_on = on && opts.caps.has_dirty;
     let push_on = on && opts.caps.can_push;
     let sub_on = on && opts.caps.has_submodules;
+    let gen_on = on && opts.ai_ready && opts.caps.has_dirty;
+    let empty_on = on && opts.caps.has_pushable_path;
     let mut m = menu;
 
     if let Some(label) = opts.section_label {
@@ -109,28 +129,101 @@ pub(crate) fn fill_fleet_actions_menu(
         m = m.separator();
     }
 
-    // ── Sync ───────────────────────────────────────────────────────────────
-    let (a, r) = (app.clone(), repos.clone());
-    m = m.item(
-        PopupMenuItem::new("Fetch")
-            .disabled(!on)
-            .on_click(move |_, _, cx| {
-                a.update(cx, |this, cx| {
-                    this.run_fleet_repos(FleetOp::Fetch, r.clone(), cx);
-                });
-            }),
-    );
-    let (a, r) = (app.clone(), repos.clone());
-    m = m.item(
-        PopupMenuItem::new("Pull")
-            .disabled(!on)
-            .on_click(move |_, _, cx| {
-                a.update(cx, |this, cx| {
-                    this.run_fleet_repos(FleetOp::Pull, r.clone(), cx);
-                });
-            }),
-    );
-    m = m.separator();
+    // ── Sync primaries (context menus only; ops-row owns these on MC) ───────
+    if opts.include_sync_primaries {
+        let (a, r) = (app.clone(), repos.clone());
+        m = m.item(
+            PopupMenuItem::new("Fetch")
+                .disabled(!on)
+                .on_click(move |_, _, cx| {
+                    a.update(cx, |this, cx| {
+                        this.run_fleet_repos(FleetOp::Fetch, r.clone(), cx);
+                    });
+                }),
+        );
+        let (a, r) = (app.clone(), repos.clone());
+        m = m.item(
+            PopupMenuItem::new("Pull")
+                .disabled(!on)
+                .on_click(move |_, _, cx| {
+                    a.update(cx, |this, cx| {
+                        this.run_fleet_repos(FleetOp::Pull, r.clone(), cx);
+                    });
+                }),
+        );
+        let (a, r) = (app.clone(), repos.clone());
+        m = m.item(
+            PopupMenuItem::new("Push")
+                .disabled(!push_on)
+                .on_click(move |_, _, cx| {
+                    a.update(cx, |this, cx| {
+                        this.run_fleet_repos(FleetOp::Push, r.clone(), cx);
+                    });
+                }),
+        );
+        let (a, r) = (app.clone(), repos.clone());
+        m = m.item(
+            PopupMenuItem::new("Update submodules")
+                .disabled(!sub_on)
+                .on_click(move |_, _, cx| {
+                    a.update(cx, |this, cx| {
+                        this.run_fleet_repos(FleetOp::SubmoduleUpdate, r.clone(), cx);
+                    });
+                }),
+        );
+        // Two flat choices (no modal).
+        {
+            let (a, r) = (app.clone(), repos.clone());
+            m = m.item(
+                PopupMenuItem::new("Gen only")
+                    .disabled(!gen_on)
+                    .on_click(move |_, window, cx| {
+                        a.update(cx, |this, cx| {
+                            let dirty = dirty_targets(this, &r);
+                            this.adopt_fleet_targets(&dirty);
+                            this.run_generate_commit(
+                                crate::views::generate_commit::GenerateCommitChoice::MessageOnly,
+                                dirty,
+                                false,
+                                window,
+                                cx,
+                            );
+                        });
+                    }),
+            );
+        }
+        {
+            let (a, r) = (app.clone(), repos.clone());
+            m = m.item(
+                PopupMenuItem::new("Gen & push")
+                    .disabled(!gen_on)
+                    .on_click(move |_, window, cx| {
+                        a.update(cx, |this, cx| {
+                            let dirty = dirty_targets(this, &r);
+                            this.adopt_fleet_targets(&dirty);
+                            this.run_generate_commit(
+                                crate::views::generate_commit::GenerateCommitChoice::CommitAndPush,
+                                dirty,
+                                false,
+                                window,
+                                cx,
+                            );
+                        });
+                    }),
+            );
+        }
+        let (a, r) = (app.clone(), repos.clone());
+        m = m.item(
+            PopupMenuItem::new("Empty commit")
+                .disabled(!empty_on)
+                .on_click(move |_, _, cx| {
+                    a.update(cx, |this, cx| {
+                        this.run_fleet_repos(FleetOp::EmptyCommit, r.clone(), cx);
+                    });
+                }),
+        );
+        m = m.separator();
+    }
 
     // ── Local changes ──────────────────────────────────────────────────────
     let (a, r) = (app.clone(), repos.clone());
@@ -151,53 +244,6 @@ pub(crate) fn fill_fleet_actions_menu(
                 a.update(cx, |this, cx| {
                     this.adopt_fleet_targets(&r);
                     this.start_fleet_commit(window, cx);
-                });
-            }),
-    );
-    // Always listed. AI-offline and clean selections toast from the handler
-    // instead of the item vanishing when a Needs-me selection is mixed.
-    {
-        let (a, r) = (app.clone(), repos.clone());
-        let gen_on = on && (opts.ai_ready || opts.caps.has_dirty);
-        m = m.item(
-            PopupMenuItem::new("Generate…")
-                .disabled(!gen_on)
-                .on_click(move |_, _, cx| {
-                    a.update(cx, |this, cx| {
-                        this.adopt_fleet_targets(&r);
-                        this.prompt_generate_commit_selected(cx);
-                    });
-                }),
-        );
-    }
-    let (a, r) = (app.clone(), repos.clone());
-    m = m.item(
-        PopupMenuItem::new("Push")
-            .disabled(!push_on)
-            .on_click(move |_, _, cx| {
-                a.update(cx, |this, cx| {
-                    this.run_fleet_repos(FleetOp::Push, r.clone(), cx);
-                });
-            }),
-    );
-    let empty_on = on && opts.caps.has_pushable_path;
-    let (a, r) = (app.clone(), repos.clone());
-    m = m.item(
-        PopupMenuItem::new("Empty commit")
-            .disabled(!empty_on)
-            .on_click(move |_, _, cx| {
-                a.update(cx, |this, cx| {
-                    this.run_fleet_repos(FleetOp::EmptyCommit, r.clone(), cx);
-                });
-            }),
-    );
-    let (a, r) = (app.clone(), repos.clone());
-    m = m.item(
-        PopupMenuItem::new("Update submodules")
-            .disabled(!sub_on)
-            .on_click(move |_, _, cx| {
-                a.update(cx, |this, cx| {
-                    this.run_fleet_repos(FleetOp::SubmoduleUpdate, r.clone(), cx);
                 });
             }),
     );

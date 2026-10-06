@@ -200,7 +200,6 @@ fn main() {
                             fleet_reset: None,
                             fleet_discard: None,
                             fleet_commit: None,
-                            generate_commit_prompt: None,
                             notice_detail: None,
                             last_pull: None,
                             toasts: Vec::new(),

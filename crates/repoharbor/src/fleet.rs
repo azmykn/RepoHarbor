@@ -1118,11 +1118,11 @@ impl RepoHarborApp {
     }
 
     /// Compact selection-scoped primaries beside Actions ▾:
-    /// Fetch / Pull / Push / Submodules / Gen commit / [Empty commit].
-    /// Push and Gen commit stay on the bar for every selection (a Needs-me
+    /// Fetch / Pull / Push / Submodules / Gen only / Gen & push / [Empty commit].
+    /// Push and the Gen pair stay on the bar for every selection (a Needs-me
     /// mix of vendor + digits must not drop them). Empty commit only when a
     /// non–pull-only path is selected. Submodules dim without nested checkouts;
-    /// Gen commit dims unless something is dirty and AI is ready.
+    /// Gen buttons dim unless something is dirty and AI is ready.
     pub fn fleet_primary_sync_buttons(
         &self,
         t: &Theme,
@@ -1203,12 +1203,12 @@ impl RepoHarborApp {
         ));
         let gen_enabled = idle && ai_ready && caps.has_dirty;
         row = row.child(bar_btn_explain(
-            "mc-fleet-gen",
+            "mc-fleet-gen-only",
             "sparkles",
-            "Gen commit",
+            "Gen only",
             gen_enabled,
             t,
-            cx.listener(move |this, _e, _w, cx| {
+            cx.listener(move |this, _e, window, cx| {
                 if !this.services.ai_ready {
                     this.push_toast(
                         crate::toast::ToastKind::Error,
@@ -1226,16 +1226,56 @@ impl RepoHarborApp {
                         crate::toast::ToastKind::Info,
                         "Nothing to generate",
                         Some(
-                            "Select dirty repos first (Gen commit dims when the selection is clean)."
+                            "Select dirty repos first (Gen only dims when the selection is clean)."
                                 .into(),
                         ),
                         cx,
                     );
                     return;
                 }
-                let repos = this.selected_repos_ordered();
-                this.adopt_fleet_targets(&repos);
-                this.prompt_generate_commit_selected(cx);
+                this.run_generate_commit_selected(
+                    crate::views::generate_commit::GenerateCommitChoice::MessageOnly,
+                    window,
+                    cx,
+                );
+            }),
+        ));
+        row = row.child(bar_btn_explain(
+            "mc-fleet-gen-push",
+            "sparkles",
+            "Gen & push",
+            gen_enabled,
+            t,
+            cx.listener(move |this, _e, window, cx| {
+                if !this.services.ai_ready {
+                    this.push_toast(
+                        crate::toast::ToastKind::Error,
+                        "AI unavailable",
+                        Some("Enable Ollama / AI in Settings first.".into()),
+                        cx,
+                    );
+                    return;
+                }
+                if !(this.fleet_actions_idle()
+                    && crate::menu_actions::fleet_menu_caps(this, &this.selected_repos_ordered())
+                        .has_dirty)
+                {
+                    this.push_toast(
+                        crate::toast::ToastKind::Info,
+                        "Nothing to generate",
+                        Some(
+                            "Select dirty repos first (Gen & push dims when the selection is clean)."
+                                .into(),
+                        ),
+                        cx,
+                    );
+                    return;
+                }
+                this.run_generate_commit_selected(
+                    crate::views::generate_commit::GenerateCommitChoice::CommitAndPush,
+                    window,
+                    cx,
+                );
             }),
         ));
         // Same pull-only gating as Push — hide when selection is entirely vendor.
@@ -1256,8 +1296,9 @@ impl RepoHarborApp {
         row
     }
 
-    /// Gear "Actions" dropdown for the Mission Control chip row — same fleet
-    /// ops as card/TREE right-click, scoped to the current selection.
+    /// Gear "Actions" dropdown for the Mission Control chip row — stage /
+    /// commit / discard / prune / reset / mute / IDE (sync primaries live on
+    /// the ops row beside this button).
     pub fn fleet_actions_button(&self, _t: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
         let app = cx.entity();
         let idle = self.fleet_actions_idle();
@@ -1308,6 +1349,8 @@ impl RepoHarborApp {
                             None
                         },
                         section_label: None,
+                        // Ops-row already has Fetch/Pull/Push/Subs/Gen/Empty.
+                        include_sync_primaries: false,
                     },
                 )
             })

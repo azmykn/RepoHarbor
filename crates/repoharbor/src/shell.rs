@@ -482,8 +482,6 @@ pub struct RepoHarborApp {
     pub fleet_discard: Option<Vec<String>>,
     /// Pending bulk-commit message strip (one shared message for Commit All…).
     pub fleet_commit: Option<crate::fleet::CommitPlan>,
-    /// Pending Generate… choice dialog (message only vs commit+push).
-    pub generate_commit_prompt: Option<crate::views::generate_commit::GenerateCommitPrompt>,
     /// Click-through detail panel for a toast / Log row.
     pub notice_detail: Option<crate::activity_log::LogEntry>,
     /// Files updated by the most recent successful Pull fast-forward(s) —
@@ -2160,13 +2158,26 @@ impl RepoHarborApp {
         .detach();
     }
 
-    /// Open the Generate… choice dialog for one or more dirty repos.
-    pub fn prompt_generate_commit(
+    /// Dirty repos in the current selection (grid order) — Gen only / Gen & push targets.
+    pub fn dirty_selected_repos(&self) -> Vec<String> {
+        self.rows
+            .iter()
+            .filter(|r| self.selected.contains(&r.id) && r.dirty > 0)
+            .map(|r| r.id.to_string())
+            .collect()
+    }
+
+    /// Run a Generate outcome immediately (no popup) for `repos`.
+    /// `from_drawer` keeps MessageOnly in the open Changes tab.
+    pub fn run_generate_commit(
         &mut self,
+        choice: crate::views::generate_commit::GenerateCommitChoice,
         repos: Vec<String>,
         from_drawer: bool,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        use crate::views::generate_commit::GenerateCommitChoice;
         if !self.services.ai_ready {
             self.push_toast(
                 ToastKind::Error,
@@ -2185,35 +2196,36 @@ impl RepoHarborApp {
             );
             return;
         }
-        self.generate_commit_prompt =
-            Some(crate::views::generate_commit::GenerateCommitPrompt { repos, from_drawer });
-        cx.notify();
+        match choice {
+            GenerateCommitChoice::MessageOnly => {
+                if from_drawer || repos.len() == 1 {
+                    let id = repos[0].clone();
+                    if !from_drawer {
+                        self.open_drawer_changes(SharedString::from(id), window, cx);
+                    } else {
+                        self.ensure_drawer_changes_inputs(window, cx);
+                    }
+                    self.drawer_generate_commit(window, cx);
+                } else {
+                    self.run_fleet_repos(crate::fleet::FleetOp::GenerateMessageOnly, repos, cx);
+                }
+            }
+            GenerateCommitChoice::CommitAndPush => {
+                self.run_fleet_repos(crate::fleet::FleetOp::GenerateCommitAndPush, repos, cx);
+            }
+        }
     }
 
-    /// Fleet Actions / selection: Generate… for every currently selected repo.
-    pub fn prompt_generate_commit_selected(&mut self, cx: &mut Context<Self>) {
-        let repos: Vec<String> = self
-            .rows
-            .iter()
-            .filter(|r| self.selected.contains(&r.id) && r.dirty > 0)
-            .map(|r| r.id.to_string())
-            .collect();
-        if repos.is_empty() {
-            self.push_toast(
-                ToastKind::Info,
-                "Nothing to generate",
-                Some("Select dirty repos first.".into()),
-                cx,
-            );
-            return;
-        }
-        self.prompt_generate_commit(repos, false, cx);
-    }
-
-    pub fn cancel_generate_commit_prompt(&mut self, cx: &mut Context<Self>) {
-        if self.generate_commit_prompt.take().is_some() {
-            cx.notify();
-        }
+    /// Fleet bar / Actions: Generate for every dirty selected repo.
+    pub fn run_generate_commit_selected(
+        &mut self,
+        choice: crate::views::generate_commit::GenerateCommitChoice,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let repos = self.dirty_selected_repos();
+        self.adopt_fleet_targets(&repos);
+        self.run_generate_commit(choice, repos, false, window, cx);
     }
 
     /// Store the files that arrived in the latest Pull for the sidebar PULLED
@@ -2271,46 +2283,6 @@ impl RepoHarborApp {
         if self.last_pull.take().is_some() {
             cx.notify();
         }
-    }
-
-    /// Run the chosen Generate… outcome and dismiss the dialog.
-    pub fn confirm_generate_commit(
-        &mut self,
-        choice: crate::views::generate_commit::GenerateCommitChoice,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        use crate::views::generate_commit::GenerateCommitChoice;
-        let Some(prompt) = self.generate_commit_prompt.take() else {
-            return;
-        };
-        match choice {
-            GenerateCommitChoice::MessageOnly => {
-                if prompt.from_drawer || prompt.repos.len() == 1 {
-                    let id = prompt.repos[0].clone();
-                    if !prompt.from_drawer {
-                        self.open_drawer_changes(SharedString::from(id), window, cx);
-                    } else {
-                        self.ensure_drawer_changes_inputs(window, cx);
-                    }
-                    self.drawer_generate_commit(window, cx);
-                } else {
-                    self.run_fleet_repos(
-                        crate::fleet::FleetOp::GenerateMessageOnly,
-                        prompt.repos,
-                        cx,
-                    );
-                }
-            }
-            GenerateCommitChoice::CommitAndPush => {
-                self.run_fleet_repos(
-                    crate::fleet::FleetOp::GenerateCommitAndPush,
-                    prompt.repos,
-                    cx,
-                );
-            }
-        }
-        cx.notify();
     }
 
     /// Open the repo drawer on the Changes tab (creates commit inputs).
@@ -6618,8 +6590,8 @@ impl RepoHarborApp {
                 cx.listener(|this, _ev, _w, cx| this.summarize_all(cx)),
             ));
         }
-        // Selection-scoped primaries: Fetch / Pull / [Push] / Submodules /
-        // [Gen commit] / [Empty commit] beside Actions ▾.
+        // Selection-scoped primaries: Fetch / Pull / Push / Submodules /
+        // Gen only / Gen & push / [Empty commit] beside Actions ▾.
         if !self.selected.is_empty() {
             row = row
                 .child(self.fleet_primary_sync_buttons(t, cx))
@@ -6972,18 +6944,14 @@ impl Render for RepoHarborApp {
                     ),
             );
 
-        // The shell, with overlays (drawer/palette/dialog) then generate-commit
-        // choice, then toasts on top so AI/fleet errors stay visible above the
-        // drawer (toasts are content-sized bottom-right — they don't block UI).
+        // The shell, with overlays (drawer/palette/dialog) then toasts on top
+        // so AI/fleet errors stay visible above the drawer (toasts are
+        // content-sized bottom-right — they don't block UI).
         let mut root = div()
             .track_focus(&self.focus)
             .on_action(cx.listener(|this, _: &crate::CloseOverlay, window, cx| {
                 if this.notice_detail.is_some() {
                     this.close_notice(cx);
-                    window.focus(&this.focus, cx);
-                    cx.notify();
-                } else if this.generate_commit_prompt.is_some() {
-                    this.cancel_generate_commit_prompt(cx);
                     window.focus(&this.focus, cx);
                     cx.notify();
                 } else if this.overlay.is_some() {
@@ -7056,11 +7024,6 @@ impl Render for RepoHarborApp {
             .child(shell);
         if let Some(overlay) = self.overlay_element(&t, cx) {
             root = root.child(overlay);
-        }
-        if let Some(prompt) = &self.generate_commit_prompt {
-            root = root.child(
-                crate::views::generate_commit::render(prompt, &t, &cx.entity()).into_any_element(),
-            );
         }
         if let Some(toasts) = self.toast_layer(&t, cx) {
             root = root.child(toasts);

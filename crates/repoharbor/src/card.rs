@@ -60,6 +60,8 @@ pub(crate) fn fill_repo_context_menu(
             } else {
                 None
             },
+            // No ops-row on cards/TREE — keep full sync set here.
+            include_sync_primaries: true,
         },
     )
 }

@@ -14,8 +14,8 @@
 
 use gpui::{
     App, AppContext, AsyncApp, Context, Div, Entity, FontWeight, InteractiveElement, IntoElement,
-    ParentElement, SharedString, StatefulInteractiveElement, Styled, WeakEntity, div, px, rgb,
-    rgba,
+    ParentElement, SharedString, StatefulInteractiveElement, Styled, WeakEntity, Window, div, px,
+    rgb, rgba,
 };
 use repoharbor_core::{cache, git_ops, inbox, launch};
 
@@ -1631,17 +1631,57 @@ fn changes_view(
                 },
             ));
         }
-        // AI: suggest a commit message from the working-tree diff (gated on aiReady).
+        // AI: two one-click choices (no modal) — message only, or commit+push.
         if ai_ready {
-            let app3 = app.clone();
+            let app_only = app.clone();
             actions = actions.child(pr_btn(
-                SharedString::from("gen-commit"),
-                "Generate…",
+                SharedString::from("gen-only"),
+                "Gen only",
                 t,
                 move |cx: &mut gpui::App| {
-                    app3.update(cx, |this, cx| {
+                    app_only.update(cx, |this, cx| {
+                        // Drawer clicks have no Window in this helper — open
+                        // Changes inputs if needed and draft into the composer.
                         let repo = this.drawer.repo.to_string();
-                        this.prompt_generate_commit(vec![repo], true, cx);
+                        if !this.services.ai_ready {
+                            this.push_toast(
+                                crate::toast::ToastKind::Error,
+                                "AI unavailable",
+                                Some("Enable Ollama / AI in Settings first.".into()),
+                                cx,
+                            );
+                            return;
+                        }
+                        // Message-only from the drawer: reuse the open Changes tab.
+                        // Window is required for InputState; the open path already
+                        // created the commit fields when the tab was shown.
+                        let _ = repo;
+                        this.drawer_generate_commit_from_app(cx);
+                    });
+                },
+            ));
+            let app_push = app.clone();
+            actions = actions.child(pr_btn(
+                SharedString::from("gen-push"),
+                "Gen & push",
+                t,
+                move |cx: &mut gpui::App| {
+                    app_push.update(cx, |this, cx| {
+                        let repo = this.drawer.repo.to_string();
+                        if !this.services.ai_ready {
+                            this.push_toast(
+                                crate::toast::ToastKind::Error,
+                                "AI unavailable",
+                                Some("Enable Ollama / AI in Settings first.".into()),
+                                cx,
+                            );
+                            return;
+                        }
+                        this.run_fleet_repos(
+                            crate::fleet::FleetOp::GenerateCommitAndPush,
+                            vec![repo],
+                            cx,
+                        );
                     });
                 },
             ));

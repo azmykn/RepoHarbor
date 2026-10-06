@@ -21,6 +21,11 @@ versioned trees, including nested submodule parents).
 
 ### Fixed
 
+- **Odoo `core`/`custom` pull-only heals when a version root is added later**
+  — e.g. adding `odoo20` while 17–19 were already listed no longer leaves
+  OCA vendor trees (like `odoo20/custom/l10n-*`) as pushable Needs-me CI.
+  Missing `<root>/core` and `<root>/custom` prefixes are appended on load;
+  `digits/` stays writable. Upstream CI on those paths stays out of Needs me.
 - **Needs me no longer lies about an empty list** — submodule children that
   need you (e.g. unpushed `digits_hr` under TREE parents) stay visible on
   **Needs me** even without a TREE focus, and the Mission Control badge /
