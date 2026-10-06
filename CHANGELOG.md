@@ -40,6 +40,12 @@ versioned trees, including nested submodule parents).
 
 ### Fixed
 
+- **Gen & push commit+push-fail toast** — when AI commit succeeds but push
+  fails (e.g. DNS `Temporary failure in name resolution`), the resolution
+  toast is titled **Committed, push failed** (not “Generate, commit & push
+  failed”), with hash/subject + an actionable network/DNS hint; notice/Log
+  totals likewise say committed locally. Mixed fleets report
+  **Committed, some pushes failed**.
 - **Submodules progress names parents** — the `done/total` counter is parent
   repos in the run (not nested children). Progress reads
   `Updating submodules — name (2/3)…` / `… 0/3 parents…`; start toasts list

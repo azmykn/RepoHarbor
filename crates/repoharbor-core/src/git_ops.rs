@@ -1635,22 +1635,44 @@ pub fn push(path: &str) -> Result<String, String> {
     Ok(format!("{branch} → {remote_name}"))
 }
 
-/// A clear message for a push failure: auth problems and non-fast-forward
-/// rejections get actionable phrasing instead of raw libgit2 text.
+/// A clear message for a push failure: auth, network/DNS, and non-fast-forward
+/// rejections get actionable phrasing instead of raw libgit2 text. The raw
+/// message is kept in parentheses so diagnostics stay available.
 fn push_error(e: &git2::Error) -> String {
-    let msg = e.message().to_string();
-    if msg.contains("authentication")
-        || msg.contains("credentials")
-        || e.class() == git2::ErrorClass::Ssh
-    {
+    classify_push_error(e.message(), e.class() == git2::ErrorClass::Ssh)
+}
+
+/// Pure classifier for push transport / policy errors (unit-tested).
+fn classify_push_error(msg: &str, is_ssh: bool) -> String {
+    let lower = msg.to_ascii_lowercase();
+    if lower.contains("authentication") || lower.contains("credentials") || is_ssh {
         return format!(
             "authentication failed — check your SSH agent or git credential helper ({msg})"
         );
     }
-    if msg.contains("non-fastforwardable") || msg.contains("non-fast-forward") {
-        return push_rejection(&msg);
+    if lower.contains("non-fastforwardable") || lower.contains("non-fast-forward") {
+        return push_rejection(msg);
     }
-    msg
+    if lower.contains("temporary failure in name resolution")
+        || lower.contains("name or service not known")
+        || lower.contains("could not resolve host")
+        || lower.contains("nodename nor servname provided")
+        || lower.contains("no address associated with hostname")
+    {
+        return format!("network/DNS failed — check network or DNS, then Push again ({msg})");
+    }
+    if lower.contains("network is unreachable")
+        || lower.contains("connection refused")
+        || lower.contains("connection reset")
+        || lower.contains("software caused connection abort")
+        || lower.contains("timed out")
+        || lower.contains("timeout")
+        || lower.contains("could not connect")
+        || lower.contains("failed to connect")
+    {
+        return format!("network error — check connectivity, then Push again ({msg})");
+    }
+    msg.to_string()
 }
 
 /// The non-fast-forward rejection message (RepoHarbor never force-pushes).
@@ -2392,6 +2414,29 @@ mod tests {
         let oid = repo.head().unwrap().target().unwrap();
         repo.set_head_detached(oid).unwrap();
         assert!(push(&path).unwrap_err().contains("detached"));
+    }
+
+    #[test]
+    fn classify_push_error_maps_dns_network_and_auth() {
+        let dns = classify_push_error(
+            "failed to resolve address for github.com: Temporary failure in name resolution",
+            false,
+        );
+        assert!(dns.starts_with("network/DNS failed"), "{dns}");
+        assert!(
+            dns.contains("Temporary failure in name resolution"),
+            "{dns}"
+        );
+
+        let net = classify_push_error("Failed to connect to github.com: Connection refused", false);
+        assert!(net.starts_with("network error"), "{net}");
+        assert!(net.contains("Connection refused"), "{net}");
+
+        let auth = classify_push_error("authentication required", false);
+        assert!(auth.starts_with("authentication failed"), "{auth}");
+
+        let plain = classify_push_error("something obscure from libgit2", false);
+        assert_eq!(plain, "something obscure from libgit2");
     }
 
     #[test]

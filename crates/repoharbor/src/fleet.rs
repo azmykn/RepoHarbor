@@ -59,6 +59,8 @@ use crate::toast::ToastKind;
 const MAX_FAILURES_SHOWN: usize = 4;
 /// Longest per-repo failure reason (chars) before it's clipped.
 const MAX_REASON_CHARS: usize = 60;
+/// Commit-landed / push-failed detail needs hash + subject + push reason.
+const MAX_COMMIT_PUSH_FAIL_CHARS: usize = 110;
 /// Per-repo entries shown in the prune confirm strip's breakdown before "+N more".
 const MAX_BREAKDOWN_SHOWN: usize = 6;
 /// Nothing-to-prune repo names listed in the breakdown before "+N more".
@@ -1883,20 +1885,12 @@ fn fleet_log_context(app: &RepoHarborApp, report: &FleetReport) -> crate::activi
     } else {
         LogContext::default()
     };
-    ctx = ctx.with_fact(
-        "Repos",
-        format!(
-            "{} ok · {} failed · {} skipped",
-            report.ok_count(),
-            report.failed_count(),
-            report.skipped_count()
-        ),
-    );
+    ctx = ctx.with_fact("Repos", fleet_totals_line(report));
     for r in report.results.iter().take(MAX_FACTS) {
         let name = r.repo.rsplit('/').next().unwrap_or(&r.repo);
         let val = match &r.outcome {
             Outcome::Ok(m) => m.clone(),
-            Outcome::Failed(m) => format!("failed: {m}"),
+            Outcome::Failed(m) => format_failed_log_value(m),
             Outcome::Skipped(m) => format!("skipped: {m}"),
         };
         ctx = ctx.with_fact(name.to_string(), crate::data::oneline(val));
@@ -1905,6 +1899,40 @@ fn fleet_log_context(app: &RepoHarborApp, report: &FleetReport) -> crate::activi
         ctx = ctx.with_fact("…", format!("+{} more", report.results.len() - MAX_FACTS));
     }
     ctx
+}
+
+/// Repos fact for the notice panel — call out commit-landed / push-failed
+/// so "failed" does not read as "never committed".
+fn fleet_totals_line(report: &FleetReport) -> String {
+    let (ok, failed, skipped, cpf) = (
+        report.ok_count(),
+        report.failed_count(),
+        report.skipped_count(),
+        commit_push_fail_count(report),
+    );
+    if cpf > 0 && cpf == failed {
+        if ok > 0 {
+            format!("{ok} ok · {cpf} committed, push failed · {skipped} skipped")
+        } else {
+            format!("{cpf} committed locally, push failed · {skipped} skipped")
+        }
+    } else if cpf > 0 {
+        format!("{ok} ok · {failed} failed ({cpf} committed, push failed) · {skipped} skipped")
+    } else {
+        format!("{ok} ok · {failed} failed · {skipped} skipped")
+    }
+}
+
+/// Per-repo Failed value for Log / notice facts.
+fn format_failed_log_value(why: &str) -> String {
+    if let Some((commit, push_err)) = split_commit_push_fail(why) {
+        format!(
+            "{commit}; push failed: {}",
+            humanize_push_fail_reason(push_err)
+        )
+    } else {
+        format!("failed: {why}")
+    }
 }
 
 /// One Log line per parent: `Submodules: parent — child1: ff; child2: skipped`.
@@ -1939,6 +1967,10 @@ fn push_submodule_log_lines(app: &mut RepoHarborApp, report: &FleetReport) {
 /// counters ("Pull: 1 ok") — success details name the repo and git outcome
 /// (e.g. "up to date"); any failure is an Error toast that persists until
 /// clicked so failed repos are never silently swept away.
+///
+/// Gen & push outcomes of the form `committed …; push failed: …` (local
+/// commit landed, remote publish failed) get a dedicated title so the toast
+/// never implies the whole generate→commit→push aborted before commit.
 fn resolve_toast(op: FleetOp, report: &FleetReport) -> (ToastKind, String, Option<SharedString>) {
     let (ok, failed, skipped) = (
         report.ok_count(),
@@ -1950,21 +1982,115 @@ fn resolve_toast(op: FleetOp, report: &FleetReport) -> (ToastKind, String, Optio
     } else {
         ToastKind::Success
     };
-    let title = if report.cancelled {
-        format!("{} cancelled", op.label())
-    } else if failed > 0 && ok == 0 {
-        format!("{} failed", op.label())
-    } else if failed > 0 {
-        format!("{} finished with errors", op.label())
-    } else {
-        format!("{} succeeded", op.label())
-    };
+    let title = resolve_toast_title(op, report, ok, failed, skipped);
     let detail = if failed > 0 {
         failure_detail(report)
     } else {
         success_detail(op, report, ok, skipped)
     };
     (kind, title, detail)
+}
+
+/// Title line for [`resolve_toast`] (pure — unit-tested).
+fn resolve_toast_title(
+    op: FleetOp,
+    report: &FleetReport,
+    ok: usize,
+    failed: usize,
+    _skipped: usize,
+) -> String {
+    if report.cancelled {
+        return format!("{} cancelled", op.label());
+    }
+    if failed == 0 {
+        return format!("{} succeeded", op.label());
+    }
+    let cpf = commit_push_fail_count(report);
+    // Every Failed outcome is commit-landed / push-failed — don't say the
+    // whole Gen & push (or similar) "failed" before commit.
+    if cpf == failed {
+        return if ok == 0 {
+            if failed == 1 {
+                "Committed, push failed".into()
+            } else {
+                format!("Committed, push failed ({failed} repos)")
+            }
+        } else {
+            "Committed, some pushes failed".into()
+        };
+    }
+    if ok == 0 {
+        format!("{} failed", op.label())
+    } else {
+        format!("{} finished with errors", op.label())
+    }
+}
+
+/// Marker inserted by [`finish_push`] when the local commit succeeded.
+const PUSH_FAIL_MARKER: &str = "; push failed: ";
+
+/// Split `committed …; push failed: …` from [`finish_push`].
+/// Returns `(commit_detail, push_err)` when the local commit landed.
+fn split_commit_push_fail(why: &str) -> Option<(&str, &str)> {
+    let (commit, push) = why.split_once(PUSH_FAIL_MARKER)?;
+    if !commit.starts_with("committed ") || push.is_empty() {
+        return None;
+    }
+    Some((commit, push))
+}
+
+fn is_commit_push_fail(why: &str) -> bool {
+    split_commit_push_fail(why).is_some()
+}
+
+fn commit_push_fail_count(report: &FleetReport) -> usize {
+    report
+        .results
+        .iter()
+        .filter(|r| matches!(&r.outcome, Outcome::Failed(w) if is_commit_push_fail(w)))
+        .count()
+}
+
+/// Friendlier one-liner for known network/DNS/auth push tails without hiding
+/// the raw message (kept in parentheses when we wrap). Pass-through when
+/// [`repoharbor_core::git_ops`] already classified the error.
+fn humanize_push_fail_reason(err: &str) -> String {
+    if err.starts_with("network/DNS failed")
+        || err.starts_with("network error")
+        || err.starts_with("authentication failed")
+        || err.starts_with("push rejected")
+    {
+        return err.to_string();
+    }
+    let lower = err.to_ascii_lowercase();
+    if lower.contains("temporary failure in name resolution")
+        || lower.contains("name or service not known")
+        || lower.contains("could not resolve host")
+        || lower.contains("nodename nor servname provided")
+        || lower.contains("no address associated with hostname")
+    {
+        return format!("network/DNS failed — check network or DNS, then Push ({err})");
+    }
+    if lower.contains("network is unreachable")
+        || lower.contains("connection refused")
+        || lower.contains("connection reset")
+        || lower.contains("timed out")
+        || lower.contains("timeout")
+        || lower.contains("could not connect")
+        || lower.contains("failed to connect")
+    {
+        return format!("network error — check connectivity, then Push ({err})");
+    }
+    err.to_string()
+}
+
+/// Toast/log body for a commit-landed / push-failed outcome.
+fn format_commit_push_fail_detail(commit: &str, push_err: &str) -> String {
+    let commit_body = commit.strip_prefix("committed ").unwrap_or(commit);
+    format!(
+        "{commit_body}; push: {}",
+        humanize_push_fail_reason(push_err)
+    )
 }
 
 /// Count line for cancelled / multi-repo success toasts, e.g. "2 ok, 1 skipped".
@@ -2052,9 +2178,23 @@ fn failure_detail(report: &FleetReport) -> Option<SharedString> {
         .iter()
         .take(MAX_FAILURES_SHOWN)
         .map(|(name, why)| {
+            let body = if let Some((commit, push_err)) = split_commit_push_fail(why) {
+                format_commit_push_fail_detail(commit, push_err)
+            } else {
+                why.to_string()
+            };
             format!(
                 "{name}: {}",
-                clip(&crate::data::oneline(why.to_string()), MAX_REASON_CHARS)
+                clip(
+                    &crate::data::oneline(body),
+                    // Commit hash + subject + push reason need a bit more room
+                    // than a short git skip reason.
+                    if is_commit_push_fail(why) {
+                        MAX_COMMIT_PUSH_FAIL_CHARS
+                    } else {
+                        MAX_REASON_CHARS
+                    }
+                )
             )
         })
         .collect();
@@ -2239,6 +2379,90 @@ mod tests {
         let (kind, title, _) = resolve_toast(FleetOp::Pull, &all_fail);
         assert!(kind == ToastKind::Error);
         assert_eq!(title, "Pull failed");
+    }
+
+    #[test]
+    fn commit_push_fail_toast_title_and_detail() {
+        let why = "committed a1b2c3d — fix toast; push failed: \
+                   failed to resolve address for github.com: Temporary failure in name resolution";
+        let r = report(vec![("/x/repoharbor", Outcome::Failed(why.into()))], false);
+        let (kind, title, detail) = resolve_toast(FleetOp::GenerateCommitAndPush, &r);
+        assert!(kind == ToastKind::Error);
+        assert_eq!(title, "Committed, push failed");
+        let detail = detail.expect("detail");
+        assert!(
+            detail.contains("a1b2c3d") && detail.contains("fix toast"),
+            "detail should keep hash/subject: {detail}"
+        );
+        assert!(
+            detail.contains("network/DNS") && detail.contains("then Push"),
+            "detail should humanize DNS: {detail}"
+        );
+        assert!(
+            !title.to_ascii_lowercase().contains("generate"),
+            "title must not imply Gen&push aborted before commit: {title}"
+        );
+
+        let mixed = report(
+            vec![
+                (
+                    "/x/ok",
+                    Outcome::Ok("committed deadbee — ok — pushed (main → origin)".into()),
+                ),
+                ("/x/bad", Outcome::Failed(why.into())),
+            ],
+            false,
+        );
+        let (_, title, _) = resolve_toast(FleetOp::GenerateCommitAndPush, &mixed);
+        assert_eq!(title, "Committed, some pushes failed");
+
+        let multi = report(
+            vec![
+                ("/x/a", Outcome::Failed(why.into())),
+                ("/x/b", Outcome::Failed(why.into())),
+            ],
+            false,
+        );
+        let (_, title, _) = resolve_toast(FleetOp::GenerateCommitAndPush, &multi);
+        assert_eq!(title, "Committed, push failed (2 repos)");
+
+        // Genuine generate failure still uses the op label.
+        let gen_fail = report(
+            vec![(
+                "/x/a",
+                Outcome::Failed("generate: no AI model installed".into()),
+            )],
+            false,
+        );
+        let (_, title, _) = resolve_toast(FleetOp::GenerateCommitAndPush, &gen_fail);
+        assert_eq!(title, "Generate, commit & push failed");
+    }
+
+    #[test]
+    fn commit_push_fail_notice_totals_and_log_value() {
+        let why = "committed a1b2c3d — subject; push failed: Temporary failure in name resolution";
+        let r = report(vec![("/x/repoharbor", Outcome::Failed(why.into()))], false);
+        assert_eq!(
+            fleet_totals_line(&r),
+            "1 committed locally, push failed · 0 skipped"
+        );
+        let val = format_failed_log_value(why);
+        assert!(val.starts_with("committed a1b2c3d"), "{val}");
+        assert!(val.contains("push failed:"), "{val}");
+        assert!(val.contains("network/DNS"), "{val}");
+        assert!(!val.starts_with("failed:"), "{val}");
+    }
+
+    #[test]
+    fn humanize_push_fail_reason_maps_dns_and_passthrough() {
+        let raw = "failed to resolve address: Temporary failure in name resolution";
+        let h = humanize_push_fail_reason(raw);
+        assert!(h.starts_with("network/DNS failed"), "{h}");
+        assert!(h.contains(raw), "raw tail kept: {h}");
+
+        let already =
+            "network/DNS failed — check network or DNS, then Push again (Temporary failure…)";
+        assert_eq!(humanize_push_fail_reason(already), already);
     }
 
     #[test]
