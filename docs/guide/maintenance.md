@@ -7,7 +7,7 @@ Two utility views for the housekeeping that piles up across a workspace.
 The **Cleanup** view (a branch janitor) scans every repo for branches that are safe to delete — ones that are **merged** or whose **upstream is gone** — and lets you prune them in bulk instead of `git branch -d`-ing repo by repo.
 
 - Branches are grouped by repo, with why each is prunable.
-- Nothing is deleted without your say-so; the current branch is never offered.
+- Nothing is deleted without your say-so; the current branch is never offered, and neither is a branch checked out in a linked worktree.
 - A clean workspace just says so — *"No merged or gone-upstream branches across your repos."*
 
 It pairs well with the per-repo branch list and [worktree manager](./repo-drawer) in the drawer.

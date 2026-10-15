@@ -4132,12 +4132,39 @@ impl RepoHarborApp {
         cx.notify();
         let path = id.to_string();
         cx.spawn(async move |this, cx| {
-            cx.background_executor()
-                .spawn(async move {
-                    let _ = repoharbor_core::git_ops::prune_branches(&path);
-                })
+            let pruned = cx
+                .background_executor()
+                .spawn(async move { repoharbor_core::git_ops::prune_branches(&path) })
                 .await;
-            let Ok(rows) = this.update(cx, |this, _| this.rows.clone()) else {
+            let Ok(rows) = this.update(cx, |this, cx| {
+                match &pruned {
+                    Ok(names) if names.is_empty() => {
+                        this.push_toast(
+                            ToastKind::Info,
+                            "Nothing to prune",
+                            Some("No merged or gone branch was free to delete.".into()),
+                            cx,
+                        );
+                    }
+                    Ok(names) => {
+                        this.push_toast(
+                            ToastKind::Success,
+                            "Pruned branches",
+                            Some(names.join(", ").into()),
+                            cx,
+                        );
+                    }
+                    Err(e) => {
+                        this.push_toast(
+                            ToastKind::Error,
+                            "Prune failed",
+                            Some(e.clone().into()),
+                            cx,
+                        );
+                    }
+                }
+                this.rows.clone()
+            }) else {
                 return;
             };
             let result = cx

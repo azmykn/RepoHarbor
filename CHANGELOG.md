@@ -12,6 +12,8 @@ versioned trees, including nested submodule parents).
 
 ### Added
 
+- **Stale settings are repaired on launch** — a missing IDE binary (for example `subl`) is rewritten to the first installed editor (`cursor`, `code`, `codium`, `zed`, `subl`, then `nvim` / `vim`, else `xdg-open`). A file-manager diff fallback is replaced when Cursor, VS Code, or Meld is installed. Scan roots whose directory no longer exists are dropped.
+- **Cleanup skips worktree checkouts** — a merged or gone branch that is checked out in a linked worktree is not offered for Prune (deleting it fails and the row used to stay with no error). A real delete failure now shows a toast.
 - **Repo workspace follow-ups** — History draws a vertical rail per lane. Work can stash the dirty tree. A conflict banner opens the IDE as well as the diff tool, and the card subtitle names the first conflicted path. Blame is one row per line (capped). The drawer opens on Work; About loads when that tab is selected.
 - **Repo workspace** — the drawer is three tabs. **Work** keeps stage, hunks, commit, and AI, and adds the stash list (apply / drop), a conflict-path banner that opens the external diff tool, and blame for the selected file. **History** draws a flat lane graph (first parent keeps the lane; merges open a side lane) and blames a file as of the selected commit. **About** stacks the old overview, pull requests, notes, and README on one scroll.
 - **Fleet job queue** — starting Fetch / Pull / Push / Submodules / … while a

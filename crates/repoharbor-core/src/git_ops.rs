@@ -978,27 +978,67 @@ fn protected_branches(repo: &Repository) -> Vec<String> {
         .collect()
 }
 
+/// Local branch names checked out by a linked worktree. Those refs cannot be
+/// deleted; offering them as prunable makes Prune look like a no-op.
+fn checked_out_in_worktrees(repo: &Repository) -> std::collections::HashSet<String> {
+    let mut names = std::collections::HashSet::new();
+    let Ok(worktrees) = repo.worktrees() else {
+        return names;
+    };
+    for name in worktrees.iter().flatten() {
+        let Ok(wt) = repo.find_worktree(name) else {
+            continue;
+        };
+        let Ok(linked) = Repository::open(wt.path()) else {
+            continue;
+        };
+        if let Some(branch) = linked
+            .head()
+            .ok()
+            .and_then(|h| h.shorthand().map(str::to_string))
+        {
+            names.insert(branch);
+        }
+    }
+    names
+}
+
 /// Branches that are safe to prune: merged into the default branch, or with a
-/// gone upstream — never HEAD, main, or master.
+/// gone upstream — never HEAD, main, or master, and never a branch checked out
+/// in a linked worktree.
 pub fn prunable(path: &str) -> Result<Vec<BranchInfo>, String> {
     let repo = Repository::open(path).map_err(|e| e.to_string())?;
     let protected = protected_branches(&repo);
+    let busy = checked_out_in_worktrees(&repo);
     Ok(branches(path)?
         .into_iter()
-        .filter(|b| !b.is_head && !protected.contains(&b.name) && (b.merged || b.gone))
+        .filter(|b| {
+            !b.is_head
+                && !protected.contains(&b.name)
+                && !busy.contains(&b.name)
+                && (b.merged || b.gone)
+        })
         .collect())
 }
 
 /// Delete the prunable branches (see `prunable`). Returns the names deleted.
+/// A branch that fails to delete (still checked out, missing ref) is an error
+/// so the UI can say why instead of leaving the row in place.
 pub fn prune_branches(path: &str) -> Result<Vec<String>, String> {
-    let repo = Repository::open(path).map_err(|e| e.to_string())?;
     let to_prune: Vec<String> = prunable(path)?.into_iter().map(|b| b.name).collect();
-    for name in &to_prune {
-        if let Ok(mut b) = repo.find_branch(name, BranchType::Local) {
-            b.delete().map_err(|e| e.to_string())?;
+    let mut deleted = Vec::new();
+    let mut errors = Vec::new();
+    for name in to_prune {
+        match delete_branch(path, &name) {
+            Ok(()) => deleted.push(name),
+            Err(e) => errors.push(format!("{name}: {e}")),
         }
     }
-    Ok(to_prune)
+    if errors.is_empty() {
+        Ok(deleted)
+    } else {
+        Err(errors.join("; "))
+    }
 }
 
 pub fn worktrees(path: &str) -> Result<Vec<WorktreeInfo>, String> {
@@ -2374,6 +2414,29 @@ mod tests {
             prunable(&path).unwrap().iter().all(|b| !b.is_head),
             "HEAD is never prunable"
         );
+
+        // The same merged branch, checked out in a worktree, is not prunable:
+        // deleting it would fail and the Cleanup row would sit there.
+        let dest = dir.path().join("feature-wt");
+        {
+            let repo = Repository::open(&path).unwrap();
+            let branch = repo.find_branch("feature", BranchType::Local).unwrap();
+            let reference = branch.into_reference();
+            let mut opts = git2::WorktreeAddOptions::new();
+            opts.reference(Some(&reference));
+            repo.worktree("feature-wt", &dest, Some(&opts)).unwrap();
+        }
+        let names: Vec<String> = prunable(&path)
+            .unwrap()
+            .into_iter()
+            .map(|b| b.name)
+            .collect();
+        assert!(
+            !names.iter().any(|n| n == "feature"),
+            "worktree checkout is not prunable: {names:?}"
+        );
+        remove_worktree(&path, "feature-wt").unwrap();
+        let _ = fs::remove_dir_all(&dest);
     }
 
     #[test]

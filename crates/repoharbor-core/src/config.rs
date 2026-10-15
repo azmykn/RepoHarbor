@@ -26,6 +26,55 @@ fn detect(candidates: &[&str], template: &str) -> Option<String> {
         .map(|c| template.replace("{cmd}", c))
 }
 
+/// GUI editors, then terminal editors. `{cmd}` is the binary name.
+fn detect_ide_command() -> String {
+    detect(&["cursor", "code", "codium", "zed", "subl"], "{cmd} {path}")
+        .or_else(|| detect(&["nvim", "vim"], "{cmd} {path}"))
+        .unwrap_or_else(|| "xdg-open {path}".to_string())
+}
+
+/// Drop scan roots whose directory is gone (for example a renamed checkout).
+/// Returns true when a root was removed.
+pub fn heal_missing_roots(cfg: &mut AppConfig) -> bool {
+    let before = cfg.roots.len();
+    cfg.roots.retain(|root| crate::scan::expand(root).is_dir());
+    cfg.roots.len() != before
+}
+
+/// Replace a missing diff tool, or the file-manager fallback, when a better
+/// tool is installed. Returns true when the config was changed.
+pub fn heal_diff_command(cfg: &mut AppConfig) -> bool {
+    let weak = cfg
+        .diff_command
+        .split_whitespace()
+        .next()
+        .is_some_and(|prog| prog == "xdg-open");
+    if !template_program_missing(&cfg.diff_command) && !weak {
+        return false;
+    }
+    let next = crate::model::default_diff_command();
+    if next == cfg.diff_command {
+        return false;
+    }
+    cfg.diff_command = next;
+    true
+}
+
+/// If a saved `ide_command` points at a missing binary (for example `subl`
+/// after Sublime was uninstalled), replace it with a detected editor.
+/// Returns true when the config was changed.
+pub fn heal_ide_command(cfg: &mut AppConfig) -> bool {
+    if !template_program_missing(&cfg.ide_command) {
+        return false;
+    }
+    let next = detect_ide_command();
+    if next == cfg.ide_command {
+        return false;
+    }
+    cfg.ide_command = next;
+    true
+}
+
 /// Program name of a whitespace-split command template (first token).
 fn template_program(cmd: &str) -> Option<&str> {
     cmd.split_whitespace().next()
@@ -156,10 +205,7 @@ impl Default for AppConfig {
             .map(|h| h.join("dev").to_string_lossy().into_owned())
             .unwrap_or_else(|| "~/dev".to_string());
 
-        // Prefer an installed GUI editor; fall back to a sensible default.
-        let ide_command = detect(&["code", "zed", "subl"], "{cmd} {path}")
-            .or_else(|| detect(&["nvim", "vim"], "{cmd} {path}"))
-            .unwrap_or_else(|| "xdg-open {path}".to_string());
+        let ide_command = detect_ide_command();
 
         let agent_command = detect_agent_command();
 
@@ -348,6 +394,15 @@ pub fn load() -> AppConfig {
         seeded = true;
     }
     if heal_agent_command(&mut cfg) {
+        seeded = true;
+    }
+    if heal_ide_command(&mut cfg) {
+        seeded = true;
+    }
+    if heal_diff_command(&mut cfg) {
+        seeded = true;
+    }
+    if heal_missing_roots(&mut cfg) {
         seeded = true;
     }
     if seeded {
@@ -545,6 +600,52 @@ mod tests {
         assert!(seed_pull_only_if_empty(&mut cfg));
         assert!(!cfg.pull_only_prefixes.iter().any(|p| p == &core));
         assert!(cfg.pull_only_prefixes.iter().any(|p| p == &custom));
+    }
+
+    #[test]
+    fn heal_drops_missing_roots() {
+        let mut cfg = AppConfig {
+            roots: vec!["/this/path/does/not/exist/repoharbor-heal".into()],
+            ..AppConfig::default()
+        };
+        assert!(heal_missing_roots(&mut cfg));
+        assert!(cfg.roots.is_empty());
+        assert!(!heal_missing_roots(&mut cfg));
+    }
+
+    #[test]
+    fn heal_replaces_xdg_open_diff_when_editor_exists() {
+        let mut cfg = AppConfig {
+            diff_command: "xdg-open {path}".into(),
+            ..AppConfig::default()
+        };
+        let better = crate::model::default_diff_command();
+        if better == "xdg-open {path}" {
+            assert!(!heal_diff_command(&mut cfg));
+        } else {
+            assert!(heal_diff_command(&mut cfg));
+            assert_eq!(cfg.diff_command, better);
+            assert!(!heal_diff_command(&mut cfg));
+        }
+    }
+
+    #[test]
+    fn heal_replaces_missing_ide_binary() {
+        let mut cfg = AppConfig {
+            ide_command: "definitely-not-an-editor-xyz {path}".into(),
+            ..AppConfig::default()
+        };
+        assert!(heal_ide_command(&mut cfg));
+        assert!(
+            !cfg.ide_command.contains("definitely-not-an-editor-xyz"),
+            "stale editor must be replaced: {}",
+            cfg.ide_command
+        );
+        assert!(cfg.ide_command.contains("{path}"));
+        if template_program_missing(&cfg.ide_command) {
+            assert_eq!(cfg.ide_command, "xdg-open {path}");
+        }
+        assert!(!heal_ide_command(&mut cfg));
     }
 
     #[test]

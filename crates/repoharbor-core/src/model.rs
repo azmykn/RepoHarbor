@@ -309,11 +309,13 @@ pub(crate) fn default_true() -> bool {
 }
 
 pub fn default_diff_command() -> String {
-    // Prefer a real folder diff tool; fall back to opening the path.
+    // Prefer a real folder diff tool, then an installed editor, then the file manager.
     if which::which("meld").is_ok() {
         "meld {path}".into()
+    } else if which::which("cursor").is_ok() {
+        "cursor {path}".into()
     } else if which::which("code").is_ok() {
-        "code --diff {path}".into()
+        "code {path}".into()
     } else {
         "xdg-open {path}".into()
     }
