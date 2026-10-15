@@ -330,14 +330,14 @@ pub enum Overlay {
     NewProject(crate::views::newproject::NewProjectData),
 }
 
-/// The RepoDrawer's tabs.
+/// The repo workspace tabs. Work is the old Changes tab plus stash and
+/// conflicts; History is the commit graph; About stacks the former Overview,
+/// PR, Notes, and Readme sections.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum DrawerTab {
-    Overview,
-    Changes,
-    Pr,
-    Notes,
-    Readme,
+    Work,
+    History,
+    About,
 }
 
 /// (view, lucide-icon, label) — labels match the real sidebar (route ≠ label).
@@ -902,7 +902,7 @@ impl RepoHarborApp {
     pub fn refresh_open_changes(&mut self, cx: &mut Context<Self>) {
         let Some(Overlay::Drawer {
             repo,
-            tab: DrawerTab::Changes,
+            tab: DrawerTab::Work,
         }) = &self.overlay
         else {
             return;
@@ -912,7 +912,8 @@ impl RepoHarborApp {
             return;
         }
         self.drawer.diff = crate::drawer::DiffState::Loading;
-        crate::drawer::load_changes(repo, cx);
+        crate::drawer::load_changes(repo.clone(), cx);
+        crate::drawer::load_work_meta(repo, cx);
     }
 
     /// Recompute the ranked attention list (and the per-repo severity lookup)
@@ -1083,7 +1084,7 @@ impl RepoHarborApp {
     pub fn open_drawer(&mut self, repo: SharedString, window: &mut Window, cx: &mut Context<Self>) {
         self.overlay = Some(Overlay::Drawer {
             repo: repo.clone(),
-            tab: DrawerTab::Overview,
+            tab: DrawerTab::About,
         });
         self.drawer = crate::drawer::DrawerData::loading(repo.clone());
         // The Overview's CI line: the repo's cached default-branch CI state
@@ -1109,7 +1110,25 @@ impl RepoHarborApp {
         self.drawer.dispatch_input = Some(cx.new(|cx| {
             gpui_component::input::InputState::new(window, cx).placeholder("Task for the agent…")
         }));
-        crate::drawer::load_overview(repo, cx);
+        crate::drawer::load_overview(repo.clone(), cx);
+        // About is the tab the drawer opens on, so seed its lazy sections now
+        // (the tab click handler only runs when the user switches).
+        self.drawer.readme = crate::drawer::ReadmeState::Loading;
+        crate::drawer::load_readme(repo.clone(), cx);
+        if let Some(row) = self.rows.iter().find(|r| r.id == repo).cloned()
+            && let Some(slug) = crate::drawer::github_slug(&row)
+        {
+            self.drawer.pr = crate::drawer::PrState::Loading;
+            crate::drawer::load_pr(repo.clone(), slug, cx);
+        }
+        crate::drawer::load_notes(repo.clone(), cx);
+        let initial = repoharbor_core::cache::note(&repo);
+        self.drawer.note_input = Some(cx.new(|cx| {
+            gpui_component::input::InputState::new(window, cx)
+                .multi_line(true)
+                .placeholder("Notes (markdown)…")
+                .default_value(initial)
+        }));
         cx.notify();
     }
 
@@ -2332,11 +2351,12 @@ impl RepoHarborApp {
     ) {
         self.open_drawer(repo.clone(), window, cx);
         if let Some(Overlay::Drawer { tab, .. }) = &mut self.overlay {
-            *tab = DrawerTab::Changes;
+            *tab = DrawerTab::Work;
         }
         self.drawer.diff = crate::drawer::DiffState::Loading;
         self.ensure_drawer_changes_inputs(window, cx);
-        crate::drawer::load_changes(repo, cx);
+        crate::drawer::load_changes(repo.clone(), cx);
+        crate::drawer::load_work_meta(repo, cx);
         cx.notify();
     }
 

@@ -572,6 +572,238 @@ pub fn stash(path: &str) -> Result<OpOutcome, String> {
     Ok(OpOutcome::Done("stashed".into()))
 }
 
+/// One stash entry, oldest index `0` is `stash@{0}` (the newest stash).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StashEntry {
+    pub index: usize,
+    pub id: String,
+    pub message: String,
+}
+
+/// List stash entries. An empty stash is an empty vec.
+pub fn stash_list(path: &str) -> Result<Vec<StashEntry>, String> {
+    let mut repo = Repository::open(path).map_err(|e| e.to_string())?;
+    let mut out = Vec::new();
+    repo.stash_foreach(|index, message, oid| {
+        out.push(StashEntry {
+            index,
+            id: short_oid(*oid),
+            message: message.to_string(),
+        });
+        true
+    })
+    .map_err(|e| e.to_string())?;
+    Ok(out)
+}
+
+/// Apply stash `index` onto the working tree. The stash entry stays.
+pub fn stash_apply(path: &str, index: usize) -> Result<(), String> {
+    let mut repo = Repository::open(path).map_err(|e| e.to_string())?;
+    repo.stash_apply(index, None).map_err(|e| e.to_string())
+}
+
+/// Drop stash `index` without applying it.
+pub fn stash_drop(path: &str, index: usize) -> Result<(), String> {
+    let mut repo = Repository::open(path).map_err(|e| e.to_string())?;
+    repo.stash_drop(index).map_err(|e| e.to_string())
+}
+
+/// One commit in [`history`], newest first. `lane` is the column the node
+/// occupies: the first parent keeps the lane, extra parents open a side lane
+/// until that commit is drawn.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HistoryCommit {
+    pub id: String,
+    pub summary: String,
+    pub author: String,
+    pub time_unix: i64,
+    /// Short ids of parents, first parent first.
+    pub parents: Vec<String>,
+    pub lane: u32,
+}
+
+/// Walk `limit` commits from HEAD and assign a simple lane to each.
+pub fn history(path: &str, limit: usize) -> Result<Vec<HistoryCommit>, String> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    let repo = Repository::open(path).map_err(|e| e.to_string())?;
+    let mut walk = repo.revwalk().map_err(|e| e.to_string())?;
+    walk.push_head().map_err(|e| e.to_string())?;
+    let mut raw = Vec::new();
+    for oid in walk.flatten().take(limit) {
+        let Ok(commit) = repo.find_commit(oid) else {
+            continue;
+        };
+        let parents: Vec<git2::Oid> = commit.parent_ids().collect();
+        raw.push((oid, parents, commit));
+    }
+    let parent_keys: Vec<Vec<git2::Oid>> = raw.iter().map(|(_, p, _)| p.clone()).collect();
+    let oids: Vec<git2::Oid> = raw.iter().map(|(oid, _, _)| *oid).collect();
+    let lanes = assign_lanes(&oids, &parent_keys);
+    let mut out = Vec::with_capacity(raw.len());
+    for ((oid, parents, commit), lane) in raw.into_iter().zip(lanes) {
+        out.push(HistoryCommit {
+            id: short_oid(oid),
+            summary: commit.summary().unwrap_or("").to_string(),
+            author: commit.author().name().unwrap_or("").to_string(),
+            time_unix: commit.time().seconds(),
+            parents: parents.into_iter().map(short_oid).collect(),
+            lane,
+        });
+    }
+    Ok(out)
+}
+
+/// Column assignment for a newest-first walk. `oids[i]`'s parents are
+/// `parents[i]`. The first parent continues the commit's lane; later parents
+/// open a free lane until that oid is drawn.
+pub(crate) fn assign_lanes(oids: &[git2::Oid], parents: &[Vec<git2::Oid>]) -> Vec<u32> {
+    let mut active: Vec<Option<git2::Oid>> = Vec::new();
+    let mut lanes = Vec::with_capacity(oids.len());
+    for (i, oid) in oids.iter().enumerate() {
+        let lane = if let Some(slot) = active.iter().position(|c| *c == Some(*oid)) {
+            slot
+        } else if let Some(slot) = active.iter().position(|c| c.is_none()) {
+            slot
+        } else {
+            active.push(None);
+            active.len() - 1
+        };
+        lanes.push(lane as u32);
+        active[lane] = None;
+        let folks = parents.get(i).map(Vec::as_slice).unwrap_or(&[]);
+        if let Some(first) = folks.first() {
+            if !active.contains(&Some(*first)) {
+                active[lane] = Some(*first);
+            }
+        }
+        for parent in folks.iter().skip(1) {
+            if active.contains(&Some(*parent)) {
+                continue;
+            }
+            if let Some(slot) = active.iter().position(|c| c.is_none()) {
+                active[slot] = Some(*parent);
+            } else {
+                active.push(Some(*parent));
+            }
+        }
+    }
+    lanes
+}
+
+/// Consecutive lines blamed to the same commit.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BlameSpan {
+    pub start_line: u32,
+    pub end_line: u32,
+    pub id: String,
+    pub author: String,
+    pub summary: String,
+}
+
+/// Blame `file` (repo-relative) against HEAD. See [`blame_file_at`].
+pub fn blame_file(path: &str, file: &str) -> Result<Vec<BlameSpan>, String> {
+    blame_file_at(path, file, None)
+}
+
+/// Blame `file` as of `newest` (a commit id or unique prefix). `None` blames
+/// HEAD, including uncommitted lines (`id` empty, summary `Not committed`).
+pub fn blame_file_at(
+    path: &str,
+    file: &str,
+    newest: Option<&str>,
+) -> Result<Vec<BlameSpan>, String> {
+    let repo = Repository::open(path).map_err(|e| e.to_string())?;
+    let mut opts = git2::BlameOptions::new();
+    if let Some(prefix) = newest {
+        opts.newest_commit(resolve_commit(&repo, prefix)?);
+    }
+    let blame = repo
+        .blame_file(std::path::Path::new(file), Some(&mut opts))
+        .map_err(|e| e.to_string())?;
+    let mut out = Vec::new();
+    for hunk in blame.iter() {
+        let start = hunk.final_start_line() as u32;
+        let lines = hunk.lines_in_hunk() as u32;
+        let end = start.saturating_add(lines.saturating_sub(1));
+        let oid = hunk.final_commit_id();
+        let (id, summary) = if oid.is_zero() {
+            (String::new(), "Not committed".to_string())
+        } else if let Ok(commit) = repo.find_commit(oid) {
+            (short_oid(oid), commit.summary().unwrap_or("").to_string())
+        } else {
+            (short_oid(oid), String::new())
+        };
+        out.push(BlameSpan {
+            start_line: start,
+            end_line: end,
+            id,
+            author: hunk.final_signature().name().unwrap_or("").to_string(),
+            summary,
+        });
+    }
+    Ok(out)
+}
+
+/// Paths with an unresolved merge/rebase conflict. Empty when the tree is clean.
+pub fn conflict_paths(path: &str) -> Result<Vec<String>, String> {
+    let repo = Repository::open(path).map_err(|e| e.to_string())?;
+    let mut opts = git2::StatusOptions::new();
+    opts.include_untracked(false)
+        .recurse_untracked_dirs(false)
+        .include_ignored(false);
+    let statuses = repo.statuses(Some(&mut opts)).map_err(|e| e.to_string())?;
+    let mut out = Vec::new();
+    for entry in statuses.iter() {
+        if entry.status().is_conflicted() {
+            if let Some(p) = entry.path() {
+                out.push(p.to_string());
+            }
+        }
+    }
+    out.sort();
+    Ok(out)
+}
+
+/// Paths touched by commit `id` (full id or a unique prefix), versus its first
+/// parent. A root commit is diffed against an empty tree.
+pub fn commit_files(path: &str, id: &str) -> Result<Vec<String>, String> {
+    let repo = Repository::open(path).map_err(|e| e.to_string())?;
+    let commit = repo
+        .find_commit(resolve_commit(&repo, id)?)
+        .map_err(|e| e.to_string())?;
+    let new_tree = commit.tree().map_err(|e| e.to_string())?;
+    let old_tree = commit.parent(0).ok().and_then(|p| p.tree().ok());
+    let diff = repo
+        .diff_tree_to_tree(old_tree.as_ref(), Some(&new_tree), None)
+        .map_err(|e| e.to_string())?;
+    let mut files = Vec::new();
+    for delta in diff.deltas() {
+        let path = delta.new_file().path().or_else(|| delta.old_file().path());
+        if let Some(p) = path {
+            files.push(p.to_string_lossy().into_owned());
+        }
+    }
+    files.sort();
+    files.dedup();
+    Ok(files)
+}
+
+fn resolve_commit(repo: &Repository, id: &str) -> Result<git2::Oid, String> {
+    repo.revparse_single(id)
+        .map(|obj| obj.id())
+        .map_err(|e| e.to_string())
+}
+
+fn short_oid(oid: git2::Oid) -> String {
+    let full = oid.to_string();
+    full[..7.min(full.len())].to_string()
+}
+
 /// The repo's default branch name (`origin/HEAD`, else a local main/master) —
 /// the base branch for "Open PR" and the merged checks.
 pub fn default_branch(path: &str) -> Option<String> {
@@ -1737,6 +1969,141 @@ mod tests {
         assert!(matches!(stash(&path), Ok(OpOutcome::Done(_))));
         // Tree is clean again after stashing.
         assert_eq!(status_of(&Repository::open(&path).unwrap()).dirty, 0);
+        let listed = stash_list(&path).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].index, 0);
+        assert!(listed[0].message.contains("repoharbor: fleet stash"));
+        stash_apply(&path, 0).unwrap();
+        assert!(status_of(&Repository::open(&path).unwrap()).dirty > 0);
+        // Apply keeps the entry; drop removes it.
+        assert_eq!(stash_list(&path).unwrap().len(), 1);
+        stash_drop(&path, 0).unwrap();
+        assert!(stash_list(&path).unwrap().is_empty());
+    }
+
+    fn checkout_branch(path: &str, branch: &str) {
+        let repo = Repository::open(path).unwrap();
+        let obj = repo
+            .revparse_single(&format!("refs/heads/{branch}"))
+            .unwrap();
+        repo.checkout_tree(&obj, Some(git2::build::CheckoutBuilder::new().force()))
+            .unwrap();
+        repo.set_head(&format!("refs/heads/{branch}")).unwrap();
+    }
+
+    #[test]
+    fn history_lanes_linear_then_merge() {
+        let (_dir, path) = init_repo();
+        let main = Repository::open(&path)
+            .unwrap()
+            .head()
+            .unwrap()
+            .shorthand()
+            .unwrap()
+            .to_string();
+        commit_file(&path, "README.md", "# two", "second");
+        commit_file(&path, "README.md", "# three", "third");
+        let linear = history(&path, 10).unwrap();
+        assert_eq!(linear.len(), 3);
+        assert!(linear.iter().all(|c| c.lane == 0));
+        assert_eq!(linear[0].summary, "third");
+        assert_eq!(linear[0].parents.len(), 1);
+        assert_eq!(linear[0].parents[0], linear[1].id);
+
+        {
+            let repo = Repository::open(&path).unwrap();
+            let head = repo.head().unwrap().peel_to_commit().unwrap();
+            repo.branch("side", &head, false).unwrap();
+        }
+        checkout_branch(&path, "side");
+        commit_file(&path, "side.txt", "side", "side commit");
+        checkout_branch(&path, &main);
+        commit_file(&path, "README.md", "# main", "main commit");
+        {
+            let repo = Repository::open(&path).unwrap();
+            let side = repo
+                .find_reference("refs/heads/side")
+                .unwrap()
+                .peel_to_commit()
+                .unwrap();
+            let ann = repo.find_annotated_commit(side.id()).unwrap();
+            repo.merge(&[&ann], None, None).unwrap();
+            let mut index = repo.index().unwrap();
+            assert!(!index.has_conflicts());
+            let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+            let sig = repo.signature().unwrap();
+            let head = repo.head().unwrap().peel_to_commit().unwrap();
+            repo.commit(
+                Some("HEAD"),
+                &sig,
+                &sig,
+                "merge side",
+                &tree,
+                &[&head, &side],
+            )
+            .unwrap();
+            repo.cleanup_state().unwrap();
+        }
+        let graph = history(&path, 20).unwrap();
+        let merge = graph
+            .iter()
+            .find(|c| c.summary == "merge side")
+            .expect("merge commit");
+        assert_eq!(merge.parents.len(), 2);
+        assert_eq!(merge.lane, 0);
+        let side = graph.iter().find(|c| c.summary == "side commit").unwrap();
+        assert_eq!(side.lane, 1);
+    }
+
+    #[test]
+    fn assign_lanes_opens_a_side_lane_for_the_second_parent() {
+        let a = git2::Oid::from_str("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap();
+        let b = git2::Oid::from_str("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb").unwrap();
+        let c = git2::Oid::from_str("cccccccccccccccccccccccccccccccccccccccc").unwrap();
+        let lanes = assign_lanes(&[a, b, c], &[vec![b, c], vec![], vec![]]);
+        assert_eq!(lanes, vec![0, 0, 1]);
+    }
+
+    #[test]
+    fn blame_groups_lines_by_commit() {
+        let (_dir, path) = init_repo();
+        commit_file(&path, "README.md", "# Test\nsecond line\n", "extend");
+        let spans = blame_file(&path, "README.md").unwrap();
+        assert!(!spans.is_empty());
+        assert!(spans
+            .iter()
+            .any(|s| s.summary == "extend" || s.summary == "init"));
+        assert!(spans.iter().all(|s| s.end_line >= s.start_line));
+        assert!(blame_file(&path, "missing.txt").is_err());
+    }
+
+    #[test]
+    fn conflict_paths_lists_unmerged_files() {
+        let (_dir, path) = init_repo();
+        assert!(conflict_paths(&path).unwrap().is_empty());
+        let repo = Repository::open(&path).unwrap();
+        let head = repo.head().unwrap().peel_to_commit().unwrap();
+        repo.branch("other", &head, false).unwrap();
+        let main = repo.head().unwrap().shorthand().unwrap().to_string();
+        commit_file(&path, "README.md", "on main\n", "main edit");
+        checkout_branch(&path, "other");
+        commit_file(&path, "README.md", "on other\n", "other edit");
+        checkout_branch(&path, &main);
+        {
+            let repo = Repository::open(&path).unwrap();
+            let other = repo
+                .find_reference("refs/heads/other")
+                .unwrap()
+                .peel_to_commit()
+                .unwrap();
+            let ann = repo.find_annotated_commit(other.id()).unwrap();
+            let _ = repo.merge(&[&ann], None, None);
+        }
+        let paths = conflict_paths(&path).unwrap();
+        assert!(
+            paths.iter().any(|p| p == "README.md"),
+            "expected README.md conflict, got {paths:?}"
+        );
     }
 
     #[test]

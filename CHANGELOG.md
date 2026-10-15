@@ -12,6 +12,7 @@ versioned trees, including nested submodule parents).
 
 ### Added
 
+- **Repo workspace** — the drawer is three tabs. **Work** keeps stage, hunks, commit, and AI, and adds the stash list (apply / drop), a conflict-path banner that opens the external diff tool, and blame for the selected file. **History** draws a flat lane graph (first parent keeps the lane; merges open a side lane) and blames a file as of the selected commit. **About** stacks the old overview, pull requests, notes, and README on one scroll.
 - **Fleet job queue** — starting Fetch / Pull / Push / Submodules / … while a
   fleet run is already active enqueues the next job (`Queued: Pull (3 repos)`)
   instead of a silent no-op. One job still executes at a time (same-repo writes

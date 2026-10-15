@@ -206,8 +206,7 @@ the `Theme` tokens. The catalog by source file:
   **ops row** (Refresh, Pull behind, Fetch all, Summarize, selection fleet).
 - **Repo card** (`card.rs`) — name/host/slug/description, git status row,
   language mark, the four launch actions, favourite + AI accents.
-- **Repo drawer** (`drawer.rs`) — the right sheet: Overview / Changes / PR / Notes
-  / Readme tabs.
+- **Repo drawer** (`drawer/`) — the right sheet: Work / History / About.
 - **Command palette** (`palette.rs`) — Ctrl+K overlay: actions + repos + code +
   semantic results.
 - **Views** (`views/`) — inbox, feed, explore, cleanup, agents, devtools,

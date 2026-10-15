@@ -4,7 +4,7 @@
 # The native GPUI app consumes it.
 [package]
 name = "repoharbor-platform"
-version = "2026.8.1"
+version = "2026.10.0"
 edition = "2021"
 authors = ["Azmy Karam <azmykn@gmail.com>"]
 license = "MIT"

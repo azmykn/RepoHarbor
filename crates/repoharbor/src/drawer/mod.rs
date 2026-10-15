@@ -1,16 +1,15 @@
-//! RepoDrawer — the right-anchored detail panel. Opens
-//! over the shell when a card is clicked; a scrim backdrop or the close button
-//! dismisses it. Tabs: Overview / Changes / PR / Notes / Readme.
+//! Repo workspace — the right-anchored detail panel. Opens over the shell when
+//! a card is clicked; a scrim backdrop or the close button dismisses it.
+//! Tabs: Work / History / About.
 //!
-//! This is the workhorse primitive — most journeys (catch-up, dive, commit, PR
-//! triage) live here. All five tabs are in: Overview (Row facts + async
-//! branches/commits/worktrees, with worktree add/remove), Readme (gpui-component
-//! markdown), PR (lazy, GitHub-only, via the `task` bridge — rollups, per-check
-//! breakdown + inline approve/merge), Changes (Unstaged/Staged file lists with
-//! per-file stage/unstage, a per-file diff pane, and a commit composer acting
-//! on the index, plus AI commit-message + changelog generation gated on
-//! aiReady), and Notes (catch-up + AI "what changed" narrative + an editable
-//! markdown note via gpui-component's multiline input).
+//! Work is the commit surface (stage, hunks, commit, AI) plus stash, conflict
+//! paths, and blame for the selected file ([`work`]). History is a flat lane
+//! graph ([`history`]). About stacks the former Overview, PR, Notes, and
+//! Readme sections ([`about`]) so those journeys stay on one scroll.
+
+mod about;
+mod history;
+mod work;
 
 use gpui::{
     App, AppContext, AsyncApp, ClipboardItem, Context, Div, Entity, FontWeight, InteractiveElement,
@@ -26,17 +25,15 @@ use crate::shell::{DrawerTab, Overlay, RepoHarborApp};
 use crate::theme::Theme;
 use crate::toast::ToastKind;
 
-const MONO: &str = "monospace";
-const PANEL_W: f32 = 560.;
-/// Recent commits shown in the Overview.
-const LOG_LIMIT: usize = 8;
+pub(super) const MONO: &str = "monospace";
+const PANEL_W: f32 = 720.;
+/// Commits drawn on the History tab.
+pub(crate) const HISTORY_LIMIT: usize = 80;
 
-const TABS: [(DrawerTab, &str); 5] = [
-    (DrawerTab::Overview, "Overview"),
-    (DrawerTab::Changes, "Changes"),
-    (DrawerTab::Pr, "PR"),
-    (DrawerTab::Notes, "Notes"),
-    (DrawerTab::Readme, "Readme"),
+const TABS: [(DrawerTab, &str); 3] = [
+    (DrawerTab::Work, "Work"),
+    (DrawerTab::History, "History"),
+    (DrawerTab::About, "About"),
 ];
 
 // ── async per-repo data ────────────────────────────────────────────────────
@@ -52,15 +49,41 @@ pub struct BranchRow {
     pub merged: bool,
 }
 
-pub struct CommitRow {
-    pub summary: SharedString,
-    pub author: SharedString,
-    pub age: SharedString,
-}
-
 pub struct WorktreeRow {
     pub name: SharedString,
     pub path: SharedString,
+}
+
+pub struct HistoryRow {
+    pub id: SharedString,
+    pub summary: SharedString,
+    pub author: SharedString,
+    pub age: SharedString,
+    pub parents: Vec<SharedString>,
+    pub lane: u32,
+}
+
+pub struct StashRow {
+    pub index: usize,
+    pub id: SharedString,
+    pub message: SharedString,
+}
+
+pub struct BlameSpanRow {
+    pub start_line: u32,
+    pub end_line: u32,
+    pub id: SharedString,
+    pub author: SharedString,
+    pub summary: SharedString,
+}
+
+#[derive(Default)]
+pub enum BlameState {
+    #[default]
+    Idle,
+    Loading,
+    Ready(Vec<BlameSpanRow>),
+    Failed(SharedString),
 }
 
 /// Lazy-loaded state for a drawer tab whose data is fetched on first view.
@@ -154,7 +177,6 @@ pub struct NotesData {
 pub struct DrawerData {
     pub repo: SharedString,
     pub branches: Option<Vec<BranchRow>>,
-    pub commits: Option<Vec<CommitRow>>,
     pub worktrees: Option<Vec<WorktreeRow>>,
     pub readme: ReadmeState,
     pub pr: PrState,
@@ -204,6 +226,20 @@ pub struct DrawerData {
     pub dispatch_input: Option<Entity<gpui_component::input::InputState>>,
     /// Whether "Dispatch" runs the agent on a fresh worktree (#185).
     pub dispatch_fresh: bool,
+    /// History tab graph; `None` until the tab first loads it.
+    pub history: Option<Vec<HistoryRow>>,
+    /// Index of the selected history row.
+    pub history_sel: Option<usize>,
+    /// Files touched by the selected history commit.
+    pub history_files: Option<Vec<SharedString>>,
+    /// Stash entries for the Work tab.
+    pub stash: Option<Vec<StashRow>>,
+    /// Unresolved conflict paths for the Work tab banner.
+    pub conflicts: Option<Vec<SharedString>>,
+    /// Blame for the file last requested from Work or History.
+    pub blame: BlameState,
+    /// Repo-relative path the blame pane is showing.
+    pub blame_file: Option<SharedString>,
 }
 
 impl DrawerData {
@@ -218,17 +254,15 @@ impl DrawerData {
 
 type Loaded = (
     Vec<git_ops::BranchInfo>,
-    Vec<git_ops::CommitInfo>,
     Vec<git_ops::WorktreeInfo>,
     Option<String>,
 );
 
-/// Read branches + recent log + worktrees + the default branch for `id` (all
-/// git-heavy — runs on the background pool).
+/// Read branches + worktrees + the default branch for `id` (all git-heavy —
+/// runs on the background pool). Commit history loads on the History tab.
 fn read_overview(id: &str) -> Loaded {
     (
         git_ops::branches(id).unwrap_or_default(),
-        git_ops::recent_log(id, LOG_LIMIT).unwrap_or_default(),
         git_ops::worktrees(id).unwrap_or_default(),
         git_ops::default_branch(id),
     )
@@ -241,31 +275,28 @@ fn store_overview(
     cx: &mut AsyncApp,
     repo: &SharedString,
     loaded: Loaded,
-    now: i64,
 ) {
-    let (branches, commits, worktrees, default_branch) = loaded;
+    let (branches, worktrees, default_branch) = loaded;
     let _ = this.update(cx, |this, cx| {
         if &this.drawer.repo != repo {
             return;
         }
         this.drawer.branches = Some(branches.into_iter().map(branch_row).collect());
-        this.drawer.commits = Some(commits.into_iter().map(|c| commit_row(c, now)).collect());
         this.drawer.worktrees = Some(worktrees.into_iter().map(worktree_row).collect());
         this.drawer.default_branch = default_branch.map(Into::into);
         cx.notify();
     });
 }
 
-/// Kick off the Overview load for `repo` (branches/commits/worktrees).
+/// Kick off the Overview load for `repo` (branches/worktrees).
 pub fn load_overview(repo: SharedString, cx: &mut Context<RepoHarborApp>) {
-    let now = data::now_unix();
     let id = repo.to_string();
     cx.spawn(async move |this, cx| {
         let loaded = cx
             .background_executor()
             .spawn(async move { read_overview(&id) })
             .await;
-        store_overview(&this, cx, &repo, loaded, now);
+        store_overview(&this, cx, &repo, loaded);
     })
     .detach();
 }
@@ -274,7 +305,6 @@ pub fn load_overview(repo: SharedString, cx: &mut Context<RepoHarborApp>) {
 /// already holding `&mut RepoHarborApp`, sets the loading state). The `.git/HEAD`
 /// change also trips the filesystem watcher, so the card row refreshes on its own.
 pub fn switch_branch(repo: SharedString, name: SharedString, cx: &mut Context<RepoHarborApp>) {
-    let now = data::now_unix();
     let (id, branch) = (repo.to_string(), name.to_string());
     cx.spawn(async move |this, cx| {
         let loaded = cx
@@ -284,7 +314,7 @@ pub fn switch_branch(repo: SharedString, name: SharedString, cx: &mut Context<Re
                 read_overview(&id)
             })
             .await;
-        store_overview(&this, cx, &repo, loaded, now);
+        store_overview(&this, cx, &repo, loaded);
     })
     .detach();
 }
@@ -328,6 +358,172 @@ pub fn load_changes(repo: SharedString, cx: &mut Context<RepoHarborApp>) {
             if this.drawer.repo == repo {
                 store_changes(this, list, cx);
             }
+        });
+    })
+    .detach();
+}
+
+/// Stash list + conflict paths for the Work tab. Runs beside [`load_changes`].
+pub fn load_work_meta(repo: SharedString, cx: &mut Context<RepoHarborApp>) {
+    let id = repo.to_string();
+    cx.spawn(async move |this, cx| {
+        let (stash, conflicts) = cx
+            .background_executor()
+            .spawn(async move {
+                (
+                    git_ops::stash_list(&id).unwrap_or_default(),
+                    git_ops::conflict_paths(&id).unwrap_or_default(),
+                )
+            })
+            .await;
+        let _ = this.update(cx, |this, cx| {
+            if this.drawer.repo != repo {
+                return;
+            }
+            this.drawer.stash = Some(
+                stash
+                    .into_iter()
+                    .map(|s| StashRow {
+                        index: s.index,
+                        id: s.id.into(),
+                        message: s.message.into(),
+                    })
+                    .collect(),
+            );
+            this.drawer.conflicts = Some(conflicts.into_iter().map(SharedString::from).collect());
+            cx.notify();
+        });
+    })
+    .detach();
+}
+
+/// Apply or drop stash `index`, then refresh Work.
+pub fn stash_op(repo: SharedString, index: usize, apply: bool, cx: &mut Context<RepoHarborApp>) {
+    cx.spawn(async move |this, cx| {
+        let id = repo.to_string();
+        let result = cx
+            .background_executor()
+            .spawn(async move {
+                if apply {
+                    git_ops::stash_apply(&id, index)
+                } else {
+                    git_ops::stash_drop(&id, index)
+                }
+            })
+            .await;
+        let _ = this.update(cx, |this, cx| {
+            if this.drawer.repo != repo {
+                return;
+            }
+            match result {
+                Ok(()) => {
+                    this.push_toast(
+                        ToastKind::Success,
+                        if apply {
+                            "Stash applied"
+                        } else {
+                            "Stash dropped"
+                        },
+                        None,
+                        cx,
+                    );
+                    load_work_meta(repo.clone(), cx);
+                    load_changes(repo, cx);
+                }
+                Err(e) => {
+                    this.push_toast(ToastKind::Error, "Stash failed", Some(e.into()), cx);
+                }
+            }
+            cx.notify();
+        });
+    })
+    .detach();
+}
+
+/// History graph for the open repo.
+pub fn load_history(repo: SharedString, cx: &mut Context<RepoHarborApp>) {
+    let id = repo.to_string();
+    cx.spawn(async move |this, cx| {
+        let now = data::now_unix();
+        let rows = cx
+            .background_executor()
+            .spawn(async move { git_ops::history(&id, HISTORY_LIMIT).unwrap_or_default() })
+            .await;
+        let _ = this.update(cx, |this, cx| {
+            if this.drawer.repo != repo {
+                return;
+            }
+            this.drawer.history = Some(
+                rows.into_iter()
+                    .map(|c| HistoryRow {
+                        id: c.id.into(),
+                        summary: c.summary.into(),
+                        author: c.author.into(),
+                        age: data::rel_age(c.time_unix, now).into(),
+                        parents: c.parents.into_iter().map(SharedString::from).collect(),
+                        lane: c.lane,
+                    })
+                    .collect(),
+            );
+            cx.notify();
+        });
+    })
+    .detach();
+}
+
+/// Files touched by history commit `id`, stored for the blame picker.
+pub fn load_history_files(repo: SharedString, id: SharedString, cx: &mut Context<RepoHarborApp>) {
+    let path = repo.to_string();
+    let prefix = id.to_string();
+    cx.spawn(async move |this, cx| {
+        let files = cx
+            .background_executor()
+            .spawn(async move { git_ops::commit_files(&path, &prefix).unwrap_or_default() })
+            .await;
+        let _ = this.update(cx, |this, cx| {
+            if this.drawer.repo != repo {
+                return;
+            }
+            this.drawer.history_files = Some(files.into_iter().map(SharedString::from).collect());
+            cx.notify();
+        });
+    })
+    .detach();
+}
+
+/// Blame `file`. `newest` is a commit prefix when blaming from History.
+pub fn load_blame(
+    repo: SharedString,
+    file: SharedString,
+    newest: Option<String>,
+    cx: &mut Context<RepoHarborApp>,
+) {
+    let path = repo.to_string();
+    let rel = file.to_string();
+    cx.spawn(async move |this, cx| {
+        let spans = cx
+            .background_executor()
+            .spawn(async move { git_ops::blame_file_at(&path, &rel, newest.as_deref()) })
+            .await;
+        let _ = this.update(cx, |this, cx| {
+            if this.drawer.repo != repo || this.drawer.blame_file.as_ref() != Some(&file) {
+                return;
+            }
+            this.drawer.blame = match spans {
+                Ok(rows) => BlameState::Ready(
+                    rows.into_iter()
+                        .map(|s| BlameSpanRow {
+                            start_line: s.start_line,
+                            end_line: s.end_line,
+                            id: s.id.into(),
+                            author: s.author.into(),
+                            summary: s.summary.into(),
+                        })
+                        .collect(),
+                ),
+                Err(e) => BlameState::Failed(e.into()),
+            };
+            cx.notify();
         });
     })
     .detach();
@@ -711,7 +907,6 @@ fn mark_seen(repo: SharedString, cx: &mut Context<RepoHarborApp>) {
 
 /// Create a worktree (+ branch) `name` in a sibling dir, then refresh Overview.
 fn add_worktree(repo: SharedString, name: String, cx: &mut Context<RepoHarborApp>) {
-    let now = data::now_unix();
     let id = repo.to_string();
     let dest = format!("{id}-{name}");
     cx.spawn(async move |this, cx| {
@@ -722,14 +917,13 @@ fn add_worktree(repo: SharedString, name: String, cx: &mut Context<RepoHarborApp
                 read_overview(&id)
             })
             .await;
-        store_overview(&this, cx, &repo, loaded, now);
+        store_overview(&this, cx, &repo, loaded);
     })
     .detach();
 }
 
 /// Unlink worktree `name` (leaves files on disk), then refresh Overview.
 fn remove_worktree(repo: SharedString, name: String, cx: &mut Context<RepoHarborApp>) {
-    let now = data::now_unix();
     let id = repo.to_string();
     cx.spawn(async move |this, cx| {
         let loaded = cx
@@ -739,7 +933,7 @@ fn remove_worktree(repo: SharedString, name: String, cx: &mut Context<RepoHarbor
                 read_overview(&id)
             })
             .await;
-        store_overview(&this, cx, &repo, loaded, now);
+        store_overview(&this, cx, &repo, loaded);
     })
     .detach();
 }
@@ -765,14 +959,6 @@ fn branch_row(b: git_ops::BranchInfo) -> BranchRow {
         current: b.is_head,
         gone: b.gone,
         merged: b.merged,
-    }
-}
-
-fn commit_row(c: git_ops::CommitInfo, now: i64) -> CommitRow {
-    CommitRow {
-        summary: c.summary.into(),
-        author: c.author.into(),
-        age: data::rel_age(c.time_unix, now).into(),
     }
 }
 
@@ -1088,22 +1274,8 @@ fn tab_bar(
                     if let Some(Overlay::Drawer { tab: cur, .. }) = &mut this.overlay {
                         *cur = tab;
                     }
-                    // Lazy-load the tab's data on first view.
-                    if tab == DrawerTab::Readme && this.drawer.readme == ReadmeState::Idle {
-                        this.drawer.readme = ReadmeState::Loading;
-                        load_readme(repo, cx);
-                    } else if tab == DrawerTab::Pr && matches!(this.drawer.pr, PrState::Idle) {
-                        match pr_slug {
-                            Some(slug) => {
-                                this.drawer.pr = PrState::Loading;
-                                load_pr(repo, slug, cx);
-                            }
-                            None => {
-                                this.drawer.pr = PrState::Error("PR triage is GitHub-only.".into());
-                            }
-                        }
-                    } else if tab == DrawerTab::Changes {
-                        // Always re-read status when entering Changes so nested
+                    if tab == DrawerTab::Work {
+                        // Always re-read status when entering Work so nested
                         // deletions/edits that landed while another tab was open
                         // (or before a watcher rescan) still appear.
                         this.drawer.diff = DiffState::Loading;
@@ -1120,12 +1292,24 @@ fn tab_bar(
                                     .placeholder("Body (optional)…")
                             }));
                         }
-                        load_changes(repo, cx);
-                    } else if tab == DrawerTab::Notes {
+                        load_changes(repo.clone(), cx);
+                        load_work_meta(repo, cx);
+                    } else if tab == DrawerTab::History && this.drawer.history.is_none() {
+                        load_history(repo, cx);
+                    } else if tab == DrawerTab::About {
+                        if this.drawer.readme == ReadmeState::Idle {
+                            this.drawer.readme = ReadmeState::Loading;
+                            load_readme(repo.clone(), cx);
+                        }
+                        if matches!(this.drawer.pr, PrState::Idle)
+                            && let Some(slug) = pr_slug
+                        {
+                            this.drawer.pr = PrState::Loading;
+                            load_pr(repo.clone(), slug, cx);
+                        }
                         if this.drawer.notes.is_none() {
                             load_notes(repo.clone(), cx);
                         }
-                        // Seed the editable note field from the saved note (sync).
                         if this.drawer.note_input.is_none() {
                             let initial = cache::note(&repo);
                             this.drawer.note_input = Some(cx.new(|cx| {
@@ -1155,13 +1339,11 @@ fn body(
     github_authed: bool,
 ) -> impl IntoElement {
     let content = match tab {
-        DrawerTab::Overview => overview(row, t, data, app).into_any_element(),
-        DrawerTab::Readme => readme_view(data, t).into_any_element(),
-        DrawerTab::Pr => pr_view(row, data, t, app).into_any_element(),
-        DrawerTab::Changes => {
-            changes_view(row, data, t, app, ai_ready, github_authed).into_any_element()
+        DrawerTab::Work => {
+            work::view(row, data, t, app, ai_ready, github_authed).into_any_element()
         }
-        DrawerTab::Notes => notes_view(row, data, t, app, ai_ready).into_any_element(),
+        DrawerTab::History => history::view(data, t, app).into_any_element(),
+        DrawerTab::About => about::view(row, data, t, app, ai_ready).into_any_element(),
     };
     div()
         .id("drawer-body")
@@ -1177,7 +1359,7 @@ fn body(
 
 /// Overview: the synchronous `Row` facts up top, then the async git data
 /// (branches / recent commits / worktrees) loaded via [`load_overview`].
-fn overview(
+pub(super) fn overview(
     row: &Row,
     t: &Theme,
     data: &DrawerData,
@@ -1310,7 +1492,6 @@ fn overview(
 
     // Async git data.
     col = col.child(branches_section(data, t, app));
-    col = col.child(commits_section(data, t));
     col = col.child(worktrees_section(data, t, app));
     col.child(dispatch_section(data, t, app))
 }
@@ -1389,7 +1570,7 @@ fn dispatch_section(data: &DrawerData, t: &Theme, app: &Entity<RepoHarborApp>) -
 }
 
 /// Section wrapper: an uppercase label (+ optional count) over a list.
-fn section(t: &Theme, title: &str, count: Option<usize>) -> Div {
+pub(super) fn section(t: &Theme, title: &str, count: Option<usize>) -> Div {
     let mut head = div()
         .flex()
         .flex_row()
@@ -1406,7 +1587,7 @@ fn section(t: &Theme, title: &str, count: Option<usize>) -> Div {
 }
 
 /// A muted "Loading…" / empty / error placeholder line.
-fn placeholder(text: impl Into<SharedString>, t: &Theme) -> impl IntoElement {
+pub(super) fn placeholder(text: impl Into<SharedString>, t: &Theme) -> impl IntoElement {
     div()
         .py(px(3.))
         .text_size(px(t.text_data_sm))
@@ -1493,40 +1674,6 @@ fn branch_item(
             });
     }
     item
-}
-
-fn commits_section(data: &DrawerData, t: &Theme) -> impl IntoElement {
-    let mut s = section(t, "Recent commits", data.commits.as_ref().map(|c| c.len()));
-    match &data.commits {
-        None => s = s.child(placeholder("Loading…", t)),
-        Some(list) if list.is_empty() => s = s.child(placeholder("No commits.", t)),
-        Some(list) => {
-            for c in list {
-                s = s.child(
-                    div()
-                        .flex()
-                        .flex_col()
-                        .gap(px(1.))
-                        .py(px(4.))
-                        .child(
-                            div()
-                                .truncate()
-                                .text_size(px(t.text_small))
-                                .text_color(rgb(t.fg1))
-                                .child(c.summary.clone()),
-                        )
-                        .child(
-                            div()
-                                .font_family(MONO)
-                                .text_size(px(t.text_data_sm))
-                                .text_color(rgb(t.fg3))
-                                .child(SharedString::from(format!("{} · {}", c.author, c.age))),
-                        ),
-                );
-            }
-        }
-    }
-    s
 }
 
 fn worktrees_section(
@@ -1623,7 +1770,7 @@ fn worktrees_section(
 /// Changes tab: a commit composer acting on the index, a push / open-PR row
 /// closing the commit → push → PR loop, the Unstaged/Staged file lists with
 /// per-file stage/unstage, then the selected file's diff.
-fn changes_view(
+pub(super) fn changes_view(
     row: &Row,
     data: &DrawerData,
     t: &Theme,
@@ -2376,7 +2523,7 @@ fn state_color(s: &str, t: &Theme) -> u32 {
 
 /// PR tab: the open pull requests with checks/review/mergeable rollups and inline
 /// approve / merge actions.
-fn pr_view(
+pub(super) fn pr_view(
     row: &Row,
     data: &DrawerData,
     t: &Theme,
@@ -2583,7 +2730,7 @@ fn pr_card(
 
 /// A small PR action button. Passes `Window` so callers that need InputState
 /// (e.g. Gen only → drawer_generate_commit) can use it.
-fn pr_btn(
+pub(super) fn pr_btn(
     id: SharedString,
     label: &str,
     t: &Theme,
@@ -2637,7 +2784,7 @@ fn seg_str(icon: &str, label: &str, color: u32) -> impl IntoElement {
 }
 
 /// Readme tab: the rendered README, or a placeholder while loading / when absent.
-fn readme_view(data: &DrawerData, t: &Theme) -> impl IntoElement {
+pub(super) fn readme_view(data: &DrawerData, t: &Theme) -> impl IntoElement {
     match &data.readme {
         ReadmeState::Ready(Some(src)) => {
             // Reflow soft-wrapped lines first — gpui-component's renderer panics
@@ -2651,7 +2798,7 @@ fn readme_view(data: &DrawerData, t: &Theme) -> impl IntoElement {
 
 /// Notes tab: a "resume where I left off" catch-up + an editable markdown note
 /// (gpui-component multiline input) with Save.
-fn notes_view(
+pub(super) fn notes_view(
     row: &Row,
     data: &DrawerData,
     t: &Theme,
