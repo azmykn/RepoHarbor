@@ -36,6 +36,9 @@ pub struct GitStatus {
     /// Paths currently in an unresolved merge/rebase conflict.
     #[serde(default)]
     pub conflicts: u32,
+    /// First conflicted path, for the card subtitle. `None` when `conflicts` is 0.
+    #[serde(default)]
+    pub conflict_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

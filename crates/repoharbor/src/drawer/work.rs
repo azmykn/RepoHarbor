@@ -7,7 +7,9 @@ use crate::icon::lucide;
 use crate::shell::RepoHarborApp;
 use crate::theme::Theme;
 
-use super::{BlameState, DrawerData, MONO, load_blame, placeholder, pr_btn, section, stash_op};
+use super::{
+    BlameState, DrawerData, MONO, load_blame, placeholder, pr_btn, section, stash_op, stash_save,
+};
 
 pub(super) fn view(
     row: &crate::data::Row,
@@ -33,7 +35,7 @@ pub(super) fn view(
         ai_ready,
         github_authed,
     ));
-    col = col.child(stash_section(data, t, app));
+    col = col.child(stash_section(row, data, t, app));
     if let Some((path, _)) = &data.change_sel {
         let (app, repo, file) = (app.clone(), data.repo.clone(), path.clone());
         col = col.child(pr_btn(
@@ -67,6 +69,8 @@ fn conflict_banner(data: &DrawerData, t: &Theme, app: &Entity<RepoHarborApp>) ->
     let repo = data.repo.clone();
     let first = paths.first().map(|p| p.to_string()).unwrap_or_default();
     let app_b = app.clone();
+    let app_ide = app.clone();
+    let repo_ide = repo.clone();
     let mut body = div()
         .flex()
         .flex_col()
@@ -100,29 +104,61 @@ fn conflict_banner(data: &DrawerData, t: &Theme, app: &Entity<RepoHarborApp>) ->
                 .child(path.clone()),
         );
     }
-    body.child(pr_btn(
-        SharedString::from("conflict-diff"),
-        "Open in diff tool",
-        t,
-        move |_win, cx: &mut App| {
-            let (repo, file) = (repo.clone(), first.clone());
-            app_b.update(cx, |this, cx| {
-                this.open_external_diff(
-                    &repo,
-                    if file.is_empty() {
-                        None
-                    } else {
-                        Some(file.as_str())
-                    },
-                    cx,
-                );
-            });
-        },
-    ))
+    body.child(
+        div()
+            .flex()
+            .flex_row()
+            .gap(px(6.))
+            .child(pr_btn(
+                SharedString::from("conflict-diff"),
+                "Open in diff tool",
+                t,
+                move |_win, cx: &mut App| {
+                    let (repo, file) = (repo.clone(), first.clone());
+                    app_b.update(cx, |this, cx| {
+                        this.open_external_diff(
+                            &repo,
+                            if file.is_empty() {
+                                None
+                            } else {
+                                Some(file.as_str())
+                            },
+                            cx,
+                        );
+                    });
+                },
+            ))
+            .child(pr_btn(
+                SharedString::from("conflict-ide"),
+                "Open in IDE",
+                t,
+                move |_win, cx: &mut App| {
+                    let repo = repo_ide.clone();
+                    app_ide.update(cx, |this, cx| this.open_in_ide(&repo, cx));
+                },
+            )),
+    )
 }
 
-fn stash_section(data: &DrawerData, t: &Theme, app: &Entity<RepoHarborApp>) -> impl IntoElement {
+fn stash_section(
+    row: &crate::data::Row,
+    data: &DrawerData,
+    t: &Theme,
+    app: &Entity<RepoHarborApp>,
+) -> impl IntoElement {
     let mut s = section(t, "Stash", data.stash.as_ref().map(|rows| rows.len()));
+    if row.dirty > 0 {
+        let (app_s, repo_s) = (app.clone(), data.repo.clone());
+        s = s.child(pr_btn(
+            SharedString::from("stash-save"),
+            "Stash changes",
+            t,
+            move |_win, cx: &mut App| {
+                let repo = repo_s.clone();
+                app_s.update(cx, |_this, cx| stash_save(repo, cx));
+            },
+        ));
+    }
     match &data.stash {
         None => s = s.child(placeholder("Loading…", t)),
         Some(list) if list.is_empty() => s = s.child(placeholder("Nothing stashed.", t)),
@@ -200,40 +236,51 @@ pub(super) fn blame_pane(data: &DrawerData, t: &Theme) -> impl IntoElement {
     match &data.blame {
         BlameState::Idle | BlameState::Loading => s = s.child(placeholder("Loading…", t)),
         BlameState::Failed(err) => s = s.child(placeholder(err.clone(), t)),
-        BlameState::Ready(spans) if spans.is_empty() => {
-            s = s.child(placeholder("No blame hunks.", t));
+        BlameState::Ready {
+            lines,
+            truncated: _,
+        } if lines.is_empty() => {
+            s = s.child(placeholder("No blame lines.", t));
         }
-        BlameState::Ready(spans) => {
-            for span in spans {
-                let range = if span.start_line == span.end_line {
-                    format!("L{}", span.start_line)
+        BlameState::Ready { lines, truncated } => {
+            if *truncated {
+                s = s.child(placeholder(
+                    format!("Showing the first {} lines.", lines.len()),
+                    t,
+                ));
+            }
+            for line in lines {
+                let who = if line.id.is_empty() {
+                    line.author.to_string()
                 } else {
-                    format!("L{}–{}", span.start_line, span.end_line)
-                };
-                let who = if span.id.is_empty() {
-                    span.author.to_string()
-                } else {
-                    format!("{} {}", span.id, span.author)
+                    format!("{} {}", line.id, line.author)
                 };
                 s = s.child(
                     div()
                         .flex()
-                        .flex_col()
-                        .gap(px(1.))
-                        .py(px(3.))
+                        .flex_row()
+                        .items_center()
+                        .gap(px(8.))
+                        .py(px(1.))
                         .child(
                             div()
+                                .w(px(108.))
+                                .flex_shrink_0()
                                 .truncate()
-                                .text_size(px(t.text_small))
-                                .text_color(rgb(t.fg1))
-                                .child(span.summary.clone()),
-                        )
-                        .child(
-                            div()
                                 .font_family(MONO)
                                 .text_size(px(t.text_data_sm))
                                 .text_color(rgb(t.fg3))
-                                .child(SharedString::from(format!("{range} · {who}"))),
+                                .child(SharedString::from(format!("L{} {who}", line.number))),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w(px(0.))
+                                .truncate()
+                                .font_family(MONO)
+                                .text_size(px(t.text_data_sm))
+                                .text_color(rgb(t.fg1))
+                                .child(line.text.clone()),
                         ),
                 );
             }

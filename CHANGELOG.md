@@ -12,6 +12,7 @@ versioned trees, including nested submodule parents).
 
 ### Added
 
+- **Repo workspace follow-ups** — History draws a vertical rail per lane. Work can stash the dirty tree. A conflict banner opens the IDE as well as the diff tool, and the card subtitle names the first conflicted path. Blame is one row per line (capped). The drawer opens on Work; About loads when that tab is selected.
 - **Repo workspace** — the drawer is three tabs. **Work** keeps stage, hunks, commit, and AI, and adds the stash list (apply / drop), a conflict-path banner that opens the external diff tool, and blame for the selected file. **History** draws a flat lane graph (first parent keeps the lane; merges open a side lane) and blames a file as of the selected commit. **About** stacks the old overview, pull requests, notes, and README on one scroll.
 - **Fleet job queue** — starting Fetch / Pull / Push / Submodules / … while a
   fleet run is already active enqueues the next job (`Queued: Pull (3 repos)`)

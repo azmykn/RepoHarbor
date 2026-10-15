@@ -136,6 +136,7 @@ pub(crate) fn status_of(repo: &Repository) -> GitStatus {
     let mut staged = 0u32;
     let mut unstaged = 0u32;
     let mut conflicts = 0u32;
+    let mut conflict_path = None;
     if let Ok(statuses) = repo.statuses(Some(&mut opts)) {
         for e in statuses.iter() {
             let s = e.status();
@@ -145,6 +146,9 @@ pub(crate) fn status_of(repo: &Repository) -> GitStatus {
             dirty += 1;
             if s.is_conflicted() {
                 conflicts += 1;
+                if conflict_path.is_none() {
+                    conflict_path = e.path().map(str::to_string);
+                }
             }
             let index_change = s.is_index_new()
                 || s.is_index_modified()
@@ -172,6 +176,7 @@ pub(crate) fn status_of(repo: &Repository) -> GitStatus {
         staged,
         unstaged,
         conflicts,
+        conflict_path,
     }
 }
 
@@ -747,6 +752,72 @@ pub fn blame_file_at(
         });
     }
     Ok(out)
+}
+
+/// How many blamed lines the drawer renders. Longer files stop here.
+pub const BLAME_LINE_CAP: usize = 400;
+
+/// One source line with the commit that last touched it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BlameLine {
+    pub number: u32,
+    pub text: String,
+    pub id: String,
+    pub author: String,
+}
+
+/// Expand [`blame_file_at`] into source lines, capped at [`BLAME_LINE_CAP`].
+/// The bool is true when the file was cut off.
+pub fn blame_lines(
+    path: &str,
+    file: &str,
+    newest: Option<&str>,
+) -> Result<(Vec<BlameLine>, bool), String> {
+    let spans = blame_file_at(path, file, newest)?;
+    let repo = Repository::open(path).map_err(|e| e.to_string())?;
+    let text = blame_source(&repo, path, file, newest)?;
+    let source: Vec<&str> = text.lines().collect();
+    let mut out = Vec::new();
+    for span in spans {
+        for n in span.start_line..=span.end_line {
+            if out.len() >= BLAME_LINE_CAP {
+                return Ok((out, true));
+            }
+            let text = source
+                .get(n.saturating_sub(1) as usize)
+                .copied()
+                .unwrap_or("")
+                .to_string();
+            out.push(BlameLine {
+                number: n,
+                text,
+                id: span.id.clone(),
+                author: span.author.clone(),
+            });
+        }
+    }
+    Ok((out, false))
+}
+
+fn blame_source(
+    repo: &Repository,
+    path: &str,
+    file: &str,
+    newest: Option<&str>,
+) -> Result<String, String> {
+    if let Some(id) = newest {
+        let oid = resolve_commit(repo, id)?;
+        let commit = repo.find_commit(oid).map_err(|e| e.to_string())?;
+        let entry = commit
+            .tree()
+            .map_err(|e| e.to_string())?
+            .get_path(std::path::Path::new(file))
+            .map_err(|e| e.to_string())?;
+        let blob = repo.find_blob(entry.id()).map_err(|e| e.to_string())?;
+        return Ok(String::from_utf8_lossy(blob.content()).into_owned());
+    }
+    std::fs::read_to_string(std::path::Path::new(path).join(file)).map_err(|e| e.to_string())
 }
 
 /// Paths with an unresolved merge/rebase conflict. Empty when the tree is clean.
@@ -2075,6 +2146,9 @@ mod tests {
             .any(|s| s.summary == "extend" || s.summary == "init"));
         assert!(spans.iter().all(|s| s.end_line >= s.start_line));
         assert!(blame_file(&path, "missing.txt").is_err());
+        let (lines, truncated) = blame_lines(&path, "README.md", None).unwrap();
+        assert!(!truncated);
+        assert!(lines.iter().any(|l| l.text.contains("second")));
     }
 
     #[test]
@@ -2103,6 +2177,12 @@ mod tests {
         assert!(
             paths.iter().any(|p| p == "README.md"),
             "expected README.md conflict, got {paths:?}"
+        );
+        assert_eq!(
+            status_of(&Repository::open(&path).unwrap())
+                .conflict_path
+                .as_deref(),
+            Some("README.md")
         );
     }
 

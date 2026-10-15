@@ -20,6 +20,54 @@ const LANE_COLORS: [fn(&Theme) -> u32; 6] = [
     |t| t.clean,
 ];
 
+fn lane_color(lane: u32, t: &Theme) -> u32 {
+    LANE_COLORS[lane as usize % LANE_COLORS.len()](t)
+}
+
+/// One column per lane. A 1px rail runs through a column when that lane is
+/// used both above and below this row, and the commit's own lane gets a dot.
+fn rails(
+    list: &[super::HistoryRow],
+    ix: usize,
+    lane: u32,
+    max_lane: u32,
+    t: &Theme,
+) -> impl IntoElement {
+    let mut gutter = div().flex().flex_row().flex_shrink_0();
+    for col in 0..=max_lane {
+        let color = lane_color(col, t);
+        let above = list[..ix].iter().any(|c| c.lane == col);
+        let below = list[ix + 1..].iter().any(|c| c.lane == col);
+        let here = lane == col;
+        let stem = (here && (above || below)) || (above && below);
+        let mut cell = div()
+            .relative()
+            .w(px(14.))
+            .h_full()
+            .min_h(px(22.))
+            .flex()
+            .items_center()
+            .justify_center()
+            .flex_shrink_0();
+        if stem {
+            cell = cell.child(
+                div()
+                    .absolute()
+                    .top(px(0.))
+                    .bottom(px(0.))
+                    .left(px(6.))
+                    .w(px(2.))
+                    .bg(rgb(color)),
+            );
+        }
+        if here {
+            cell = cell.child(div().w(px(8.)).h(px(8.)).rounded(px(4.)).bg(rgb(color)));
+        }
+        gutter = gutter.child(cell);
+    }
+    gutter
+}
+
 pub(super) fn view(data: &DrawerData, t: &Theme, app: &Entity<RepoHarborApp>) -> impl IntoElement {
     let mut col = div().flex().flex_col().gap(px(12.));
     col = col.child(graph(data, t, app));
@@ -35,20 +83,20 @@ fn graph(data: &DrawerData, t: &Theme, app: &Entity<RepoHarborApp>) -> impl Into
         None => s = s.child(placeholder("Loading…", t)),
         Some(list) if list.is_empty() => s = s.child(placeholder("No commits.", t)),
         Some(list) => {
+            let max_lane = list.iter().map(|c| c.lane).max().unwrap_or(0);
+            let mut rows = div().flex().flex_col();
             for (ix, commit) in list.iter().enumerate() {
                 let selected = data.history_sel == Some(ix);
-                let color = LANE_COLORS[commit.lane as usize % LANE_COLORS.len()](t);
                 let (app, repo, id) = (app.clone(), data.repo.clone(), commit.id.clone());
                 let mut row = div()
                     .id(SharedString::from(format!("hist-{ix}")))
                     .flex()
                     .flex_row()
-                    .items_center()
+                    .items_stretch()
                     .gap(px(8.))
                     .px(px(6.))
                     .py(px(4.))
                     .rounded(px(t.r_sm))
-                    .ml(px(commit.lane as f32 * 14.))
                     .cursor_pointer()
                     .hover(|style| style.bg(rgb(t.surface_hover)))
                     .on_click(move |_ev, _win, cx| {
@@ -62,14 +110,7 @@ fn graph(data: &DrawerData, t: &Theme, app: &Entity<RepoHarborApp>) -> impl Into
                             cx.notify();
                         });
                     })
-                    .child(
-                        div()
-                            .w(px(8.))
-                            .h(px(8.))
-                            .rounded(px(4.))
-                            .bg(rgb(color))
-                            .flex_shrink_0(),
-                    )
+                    .child(rails(list, ix, commit.lane, max_lane, t))
                     .child(
                         div()
                             .flex_1()
@@ -111,8 +152,9 @@ fn graph(data: &DrawerData, t: &Theme, app: &Entity<RepoHarborApp>) -> impl Into
                             ))),
                     );
                 }
-                s = s.child(row);
+                rows = rows.child(row);
             }
+            s = s.child(rows);
         }
     }
     if data.history_sel.is_some() {

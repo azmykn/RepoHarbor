@@ -69,12 +69,11 @@ pub struct StashRow {
     pub message: SharedString,
 }
 
-pub struct BlameSpanRow {
-    pub start_line: u32,
-    pub end_line: u32,
+pub struct BlameLineRow {
+    pub number: u32,
+    pub text: SharedString,
     pub id: SharedString,
     pub author: SharedString,
-    pub summary: SharedString,
 }
 
 #[derive(Default)]
@@ -82,7 +81,10 @@ pub enum BlameState {
     #[default]
     Idle,
     Loading,
-    Ready(Vec<BlameSpanRow>),
+    Ready {
+        lines: Vec<BlameLineRow>,
+        truncated: bool,
+    },
     Failed(SharedString),
 }
 
@@ -440,6 +442,37 @@ pub fn stash_op(repo: SharedString, index: usize, apply: bool, cx: &mut Context<
     .detach();
 }
 
+/// Stash uncommitted changes, then refresh Work.
+pub fn stash_save(repo: SharedString, cx: &mut Context<RepoHarborApp>) {
+    cx.spawn(async move |this, cx| {
+        let id = repo.to_string();
+        let result = cx
+            .background_executor()
+            .spawn(async move { git_ops::stash(&id) })
+            .await;
+        let _ = this.update(cx, |this, cx| {
+            if this.drawer.repo != repo {
+                return;
+            }
+            match result {
+                Ok(git_ops::OpOutcome::Skipped(why)) => {
+                    this.push_toast(ToastKind::Info, "Nothing to stash", Some(why.into()), cx);
+                }
+                Ok(git_ops::OpOutcome::Done(_)) => {
+                    this.push_toast(ToastKind::Success, "Changes stashed", None, cx);
+                    load_work_meta(repo.clone(), cx);
+                    load_changes(repo, cx);
+                }
+                Err(e) => {
+                    this.push_toast(ToastKind::Error, "Stash failed", Some(e.into()), cx);
+                }
+            }
+            cx.notify();
+        });
+    })
+    .detach();
+}
+
 /// History graph for the open repo.
 pub fn load_history(repo: SharedString, cx: &mut Context<RepoHarborApp>) {
     let id = repo.to_string();
@@ -501,26 +534,27 @@ pub fn load_blame(
     let path = repo.to_string();
     let rel = file.to_string();
     cx.spawn(async move |this, cx| {
-        let spans = cx
+        let lines = cx
             .background_executor()
-            .spawn(async move { git_ops::blame_file_at(&path, &rel, newest.as_deref()) })
+            .spawn(async move { git_ops::blame_lines(&path, &rel, newest.as_deref()) })
             .await;
         let _ = this.update(cx, |this, cx| {
             if this.drawer.repo != repo || this.drawer.blame_file.as_ref() != Some(&file) {
                 return;
             }
-            this.drawer.blame = match spans {
-                Ok(rows) => BlameState::Ready(
-                    rows.into_iter()
-                        .map(|s| BlameSpanRow {
-                            start_line: s.start_line,
-                            end_line: s.end_line,
+            this.drawer.blame = match lines {
+                Ok((rows, truncated)) => BlameState::Ready {
+                    lines: rows
+                        .into_iter()
+                        .map(|s| BlameLineRow {
+                            number: s.number,
+                            text: s.text.into(),
                             id: s.id.into(),
                             author: s.author.into(),
-                            summary: s.summary.into(),
                         })
                         .collect(),
-                ),
+                    truncated,
+                },
                 Err(e) => BlameState::Failed(e.into()),
             };
             cx.notify();

@@ -238,11 +238,15 @@ pub fn compute(
     for repo in repos {
         let on_branch = || Some(format!("on {}", repo.git.branch));
         if repo.git.conflicts > 0 {
+            let detail = match &repo.git.conflict_path {
+                Some(path) => Some(format!("on {} · {path}", repo.git.branch)),
+                None => on_branch(),
+            };
             items.push(item(
                 local_ref(repo),
                 AttentionKind::MergeConflict,
                 count(repo.git.conflicts, "merge conflict", "merge conflicts"),
-                on_branch(),
+                detail,
             ));
         }
         if repo.git.dirty > 0 {
