@@ -52,7 +52,8 @@ actions!(
         PaletteDown,
         PaletteConfirm,
         FleetFetchSelected,
-        FleetPullSelected
+        FleetPullSelected,
+        FocusSearch
     ]
 );
 
@@ -110,6 +111,10 @@ fn main() {
                 KeyBinding::new("ctrl-shift-f", FleetFetchSelected, None),
                 KeyBinding::new("cmd-shift-p", FleetPullSelected, None),
                 KeyBinding::new("ctrl-shift-p", FleetPullSelected, None),
+                // Focus Mission Control repo search
+                KeyBinding::new("cmd-f", FocusSearch, None),
+                KeyBinding::new("ctrl-f", FocusSearch, None),
+                KeyBinding::new("/", FocusSearch, None),
             ]);
 
             // Restore size if the user un-maximizes; open maximized (not exclusive

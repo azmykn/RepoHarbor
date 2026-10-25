@@ -719,6 +719,170 @@ fn host_only_needs_me(items: &[AttentionItem]) -> Vec<&AttentionItem> {
         .collect()
 }
 
+/// Parsed filter terms from a search query string.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct SearchQueryFilter {
+    /// Plain free-text substring terms (lowercased) to match against name, slug, or path.
+    pub terms: Vec<String>,
+    /// `is:` filters, e.g. "dirty", "clean", "behind", "ahead", "pushable", "staged", "attention", "starred", "public", "private".
+    pub is_filters: Vec<String>,
+    /// `lang:` or `language:` values (lowercased).
+    pub languages: Vec<String>,
+    /// `host:` values (lowercased), e.g. "github", "gitlab".
+    pub hosts: Vec<String>,
+    /// `root:` values (lowercased).
+    pub roots: Vec<String>,
+}
+
+impl SearchQueryFilter {
+    /// Parse a query string into free text and structured filters (`is:`, `lang:`, `host:`, `root:`).
+    pub(crate) fn parse(query: &str) -> Self {
+        let mut filter = SearchQueryFilter::default();
+        for token in query.split_whitespace() {
+            let token_lower = token.to_lowercase();
+            if let Some(val) = token_lower.strip_prefix("is:") {
+                if !val.is_empty() {
+                    filter.is_filters.push(val.to_string());
+                }
+            } else if let Some(val) = token_lower.strip_prefix("lang:") {
+                if !val.is_empty() {
+                    filter.languages.push(val.to_string());
+                }
+            } else if let Some(val) = token_lower.strip_prefix("language:") {
+                if !val.is_empty() {
+                    filter.languages.push(val.to_string());
+                }
+            } else if let Some(val) = token_lower.strip_prefix("host:") {
+                if !val.is_empty() {
+                    filter.hosts.push(val.to_string());
+                }
+            } else if let Some(val) = token_lower.strip_prefix("root:") {
+                if !val.is_empty() {
+                    filter.roots.push(val.to_string());
+                }
+            } else {
+                filter.terms.push(token_lower);
+            }
+        }
+        filter
+    }
+
+    /// Check if a query filter has any active criteria.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.terms.is_empty()
+            && self.is_filters.is_empty()
+            && self.languages.is_empty()
+            && self.hosts.is_empty()
+            && self.roots.is_empty()
+    }
+
+    /// Check whether a single Row matches this parsed query.
+    pub(crate) fn matches_row(
+        &self,
+        r: &Row,
+        attention_by_repo: &std::collections::HashMap<SharedString, Severity>,
+    ) -> bool {
+        // Free text terms must all be contained somewhere in name, slug, or path.
+        for term in &self.terms {
+            let in_name = r.name.to_lowercase().contains(term);
+            let in_slug = r.slug.to_lowercase().contains(term);
+            let in_path = r.path.to_lowercase().contains(term);
+            if !(in_name || in_slug || in_path) {
+                return false;
+            }
+        }
+
+        // Language filters (must match any specified)
+        if !self.languages.is_empty() {
+            let row_lang = r.language.to_lowercase();
+            if !self.languages.iter().any(|l| row_lang.contains(l)) {
+                return false;
+            }
+        }
+
+        // Host filters
+        if !self.hosts.is_empty() {
+            let row_host = r.host.to_lowercase();
+            if !self.hosts.iter().any(|h| row_host.contains(h)) {
+                return false;
+            }
+        }
+
+        // Root filters
+        if !self.roots.is_empty() {
+            let row_root = r.root.to_lowercase();
+            if !self.roots.iter().any(|root| row_root.contains(root)) {
+                return false;
+            }
+        }
+
+        // `is:` predicates
+        for is_val in &self.is_filters {
+            match is_val.as_str() {
+                "dirty" => {
+                    if r.dirty == 0 {
+                        return false;
+                    }
+                }
+                "clean" => {
+                    if r.dirty > 0 {
+                        return false;
+                    }
+                }
+                "behind" => {
+                    if r.behind == 0 {
+                        return false;
+                    }
+                }
+                "ahead" | "pushable" => {
+                    if r.ahead == 0 {
+                        return false;
+                    }
+                }
+                "staged" => {
+                    if r.staged == 0 {
+                        return false;
+                    }
+                }
+                "unstaged" | "stageable" => {
+                    if r.unstaged == 0 {
+                        return false;
+                    }
+                }
+                "attention" | "needs-me" | "needs_me" => {
+                    if !attention_by_repo.contains_key(&r.id) {
+                        return false;
+                    }
+                }
+                "starred" | "favorite" => {
+                    if !r.favorite {
+                        return false;
+                    }
+                }
+                "public" => {
+                    if r.private {
+                        return false;
+                    }
+                }
+                "private" => {
+                    if !r.private {
+                        return false;
+                    }
+                }
+                "stale" => {
+                    if r.activity != repoharbor_core::model::Activity::Stale {
+                        return false;
+                    }
+                }
+                // Unknown `is:` values don't match
+                _ => return false,
+            }
+        }
+
+        true
+    }
+}
+
 /// TREE / submodule visibility. By default submodule children stay off the
 /// flat grid; Needs me reveals children that are in the attention index so
 /// the chip/badge never claim work the list hides.
@@ -4776,7 +4940,7 @@ impl RepoHarborApp {
     /// Sidebar TREE: top-level repos with expandable submodule children.
     fn repo_tree_section(&self, t: &Theme, cx: &mut Context<Self>) -> gpui::AnyElement {
         let hov = t.surface_hover;
-        let q = self.grid.query.trim().to_lowercase();
+        let q_filter = SearchQueryFilter::parse(&self.grid.query);
         let mut parents: Vec<&Row> = self
             .rows
             .iter()
@@ -4790,21 +4954,17 @@ impl RepoHarborApp {
                 if !(self_chip || child_chip) {
                     return false;
                 }
-                if q.is_empty() {
+                if q_filter.is_empty() {
                     return true;
                 }
-                let self_match = r.name.to_lowercase().contains(&q)
-                    || r.slug.to_lowercase().contains(&q)
-                    || r.path.to_lowercase().contains(&q);
+                let self_match = q_filter.matches_row(r, &self.attention_by_repo);
                 if self_match {
                     return true;
                 }
                 // Keep parent if any child matches the query.
                 self.rows.iter().any(|c| {
                     c.parent_id.as_ref() == Some(&r.id)
-                        && (c.name.to_lowercase().contains(&q)
-                            || c.slug.to_lowercase().contains(&q)
-                            || c.path.to_lowercase().contains(&q))
+                        && q_filter.matches_row(c, &self.attention_by_repo)
                 })
             })
             .collect();
@@ -5032,7 +5192,7 @@ impl RepoHarborApp {
     /// Absolute row indices passing every active filter (chip AND root AND
     /// language AND name query), in the active sort order.
     pub(crate) fn visible_rows(&self) -> Vec<usize> {
-        let q = self.grid.query.trim().to_lowercase();
+        let q_filter = SearchQueryFilter::parse(&self.grid.query);
         let mut v: Vec<usize> = self
             .rows
             .iter()
@@ -5056,12 +5216,10 @@ impl RepoHarborApp {
                     .is_some_and(|g| Self::group_matches_path(g, r.id.as_ref()))
             })
             .filter(|(_, r)| {
-                if q.is_empty() {
+                if q_filter.is_empty() {
                     return true;
                 }
-                r.name.to_lowercase().contains(&q)
-                    || r.slug.to_lowercase().contains(&q)
-                    || r.path.to_lowercase().contains(&q)
+                q_filter.matches_row(r, &self.attention_by_repo)
             })
             .filter(|(_, r)| {
                 // Default: hide submodule children. Focusing a parent in TREE
@@ -5110,7 +5268,9 @@ impl RepoHarborApp {
         if self.repo_search.is_some() {
             return;
         }
-        let input = cx.new(|cx| InputState::new(window, cx).placeholder("Filter repos by name…"));
+        let input = cx.new(|cx| {
+            InputState::new(window, cx).placeholder("Filter repos (e.g. is:dirty lang:rust)…")
+        });
         let sub = cx.observe(&input, |this, input, cx| {
             this.grid.query = input.read(cx).value().to_string();
             // Name filter is orthogonal to chips — prune (don't clear) so
@@ -5120,6 +5280,15 @@ impl RepoHarborApp {
         });
         self.repo_search = Some(input);
         self._repo_search_sub = Some(sub);
+    }
+
+    /// Focus the Mission Control name/filter input (shortcut `/` or `Ctrl+F`).
+    pub fn focus_repo_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.ensure_repo_search(window, cx);
+        if let Some(input) = &self.repo_search {
+            let fh = input.read(cx).focus_handle(cx);
+            window.focus(&fh, cx);
+        }
     }
 
     /// Clear the Mission Control name filter (Esc when nothing else is open).
@@ -6538,7 +6707,7 @@ impl RepoHarborApp {
                     .child(SharedString::from(title)),
             );
         if let Some(search) = &self.repo_search {
-            bar = bar.child(div().w(px(260.)).child(Input::new(search)));
+            bar = bar.child(div().w(px(310.)).child(Input::new(search)));
         }
         bar = bar.child(div().flex_1()).child(self.mode_segments(t, cx));
         // Always-visible filter chips in the upper toolbar (every work mode).
@@ -7097,6 +7266,9 @@ impl Render for RepoHarborApp {
                     this.clear_selection(cx);
                 }
             }))
+            .on_action(cx.listener(|this, _: &crate::FocusSearch, window, cx| {
+                this.focus_repo_search(window, cx);
+            }))
             .on_action(cx.listener(|this, _: &crate::OpenPalette, window, cx| {
                 this.open_palette(window, cx);
             }))
@@ -7639,5 +7811,61 @@ mod tests {
         assert_eq!(kind, ToastKind::Success);
         assert_eq!(title.as_ref(), "Summaries ready");
         assert_eq!(detail.as_deref(), Some("3 new summaries"));
+    }
+
+    #[test]
+    fn search_query_filter_parsing() {
+        let q = SearchQueryFilter::parse("is:dirty is:behind lang:rust host:github my-repo");
+        assert_eq!(q.terms, vec!["my-repo"]);
+        assert_eq!(q.is_filters, vec!["dirty", "behind"]);
+        assert_eq!(q.languages, vec!["rust"]);
+        assert_eq!(q.hosts, vec!["github"]);
+        assert!(!q.is_empty());
+    }
+
+    #[test]
+    fn search_query_filter_matching() {
+        let q = SearchQueryFilter::parse("is:dirty lang:rust");
+        let attention = std::collections::HashMap::new();
+
+        let mut row = crate::data::Row {
+            id: "/path/to/my-repo".into(),
+            url: "".into(),
+            name: "my-repo".into(),
+            slug: "user/my-repo".into(),
+            root: "/path".into(),
+            path: "/path/to/my-repo".into(),
+            description: "".into(),
+            language: "Rust".into(),
+            branch: "main".into(),
+            age: "1d ago".into(),
+            release: "".into(),
+            ai_summary: "".into(),
+            ahead: 0,
+            behind: 0,
+            dirty: 2,
+            staged: 0,
+            unstaged: 2,
+            stars: "".into(),
+            host: "github".into(),
+            private: false,
+            favorite: false,
+            activity: repoharbor_core::model::Activity::Active,
+            last_commit_unix: 1000,
+            parent_id: None,
+            submodule_path: None,
+            child_count: 0,
+        };
+
+        assert!(q.matches_row(&row, &attention));
+
+        // When clean, it should fail is:dirty
+        row.dirty = 0;
+        assert!(!q.matches_row(&row, &attention));
+
+        // When not rust, it should fail
+        row.dirty = 1;
+        row.language = "Python".into();
+        assert!(!q.matches_row(&row, &attention));
     }
 }
