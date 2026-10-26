@@ -1792,6 +1792,12 @@ impl RepoHarborApp {
             PaletteItem::Action(PaletteAction::SelectBehind) => {
                 self.select_where(|r| r.behind > 0, "behind their upstream", cx)
             }
+            PaletteItem::Action(PaletteAction::SelectAll) => {
+                self.toggle_select_all_visible(cx);
+            }
+            PaletteItem::Action(PaletteAction::ClearSelection) => {
+                self.clear_selection(cx);
+            }
             PaletteItem::Repo(i) | PaletteItem::Recall { row: i, .. } => {
                 if let Some(r) = self.rows.get(i) {
                     let _ = repoharbor_core::launch::launch(&self.config.ide_command, &r.id);

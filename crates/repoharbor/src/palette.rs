@@ -89,6 +89,10 @@ pub enum PaletteAction {
     SelectDirty,
     /// Replace the selection with the repos behind their upstream.
     SelectBehind,
+    /// Select all visible repos in Mission Control.
+    SelectAll,
+    /// Clear current fleet selection.
+    ClearSelection,
 }
 
 impl PaletteAction {
@@ -102,6 +106,8 @@ impl PaletteAction {
             PaletteAction::PullSelected => "Pull selected repositories",
             PaletteAction::SelectDirty => "Select dirty repos",
             PaletteAction::SelectBehind => "Select repos behind upstream",
+            PaletteAction::SelectAll => "Select all visible repos",
+            PaletteAction::ClearSelection => "Clear selection",
         }
     }
 
@@ -111,7 +117,10 @@ impl PaletteAction {
             PaletteAction::Settings => "settings",
             PaletteAction::FetchAll | PaletteAction::FetchSelected => "refresh-cw",
             PaletteAction::PullBehind | PaletteAction::PullSelected => "cloud-download",
-            PaletteAction::SelectDirty | PaletteAction::SelectBehind => "circle-check",
+            PaletteAction::SelectDirty | PaletteAction::SelectBehind | PaletteAction::SelectAll => {
+                "circle-check"
+            }
+            PaletteAction::ClearSelection => "x",
         }
     }
 }
@@ -197,10 +206,12 @@ fn actions(has_selection: bool, query: &str) -> Vec<PaletteAction> {
             PaletteAction::Settings,
             PaletteAction::SelectDirty,
             PaletteAction::SelectBehind,
+            PaletteAction::SelectAll,
         ];
         if has_selection {
             out.push(PaletteAction::FetchSelected);
             out.push(PaletteAction::PullSelected);
+            out.push(PaletteAction::ClearSelection);
         }
     } else {
         // Dedup while preserving order (keyword branches can overlap).
@@ -214,13 +225,17 @@ fn actions(has_selection: bool, query: &str) -> Vec<PaletteAction> {
             PaletteAction::PullBehind,
             PaletteAction::SelectDirty,
             PaletteAction::SelectBehind,
+            PaletteAction::SelectAll,
+            PaletteAction::ClearSelection,
             PaletteAction::FetchSelected,
             PaletteAction::PullSelected,
         ] {
             if (!has_selection
                 && matches!(
                     a,
-                    PaletteAction::FetchSelected | PaletteAction::PullSelected
+                    PaletteAction::FetchSelected
+                        | PaletteAction::PullSelected
+                        | PaletteAction::ClearSelection
                 ))
                 || seen.contains(&a)
             {
