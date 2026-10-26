@@ -2652,6 +2652,46 @@ impl RepoHarborApp {
         .detach();
     }
 
+    /// Drawer: generate a Conventional Commit message instantly via local changelog / diff heuristics.
+    /// Zero latency, zero network or LLM dependency.
+    pub fn drawer_fast_commit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let repo = self.drawer.repo.clone();
+        let id = repo.to_string();
+        let full = repoharbor_core::git_ops::working_diff(&id).unwrap_or_default();
+        let diff = if !full.trim().is_empty() {
+            full
+        } else {
+            repoharbor_core::git_ops::staged_diff(&id).unwrap_or_default()
+        };
+
+        if diff.trim().is_empty() {
+            self.push_toast(
+                ToastKind::Info,
+                "Working tree clean",
+                Some("No changes to commit.".into()),
+                cx,
+            );
+            return;
+        }
+
+        let (subject, body) = repoharbor_core::ai::fallback_commit_message_parts(&diff, &id);
+        let subject = crate::data::oneline(subject);
+        if let Some(input) = &self.drawer.commit_input {
+            input.update(cx, |st, cx| st.set_value(subject.clone(), window, cx));
+        }
+        if let Some(input) = &self.drawer.commit_body_input {
+            input.update(cx, |st, cx| st.set_value(body.clone(), window, cx));
+        }
+        self.drawer.commit_suggestion = Some((subject.into(), body.into()));
+        self.push_toast(
+            ToastKind::Success,
+            "Fast commit ready",
+            Some("Review subject and commit.".into()),
+            cx,
+        );
+        cx.notify();
+    }
+
     /// Drawer: generate a markdown changelog from recent commits (gated on
     /// `aiReady`). Lands in `drawer.changelog`.
     pub fn drawer_generate_changelog(&mut self, cx: &mut Context<Self>) {

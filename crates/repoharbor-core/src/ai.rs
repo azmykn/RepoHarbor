@@ -65,7 +65,8 @@ pub async fn installed_models() -> Vec<(String, u64)> {
 /// Default token budget for short generations (summaries, ping, resume, …).
 const DEFAULT_NUM_PREDICT: u32 = 120;
 /// Token budget for Conventional Commit messages (subject + real body).
-const COMMIT_NUM_PREDICT: u32 = 384;
+/// Kept tight (160) so local and cloud LLMs finish generation rapidly and avoid babbling.
+const COMMIT_NUM_PREDICT: u32 = 160;
 /// Max diff characters fed into the commit prompt (keeps context bounded).
 const COMMIT_DIFF_CLAMP: usize = 10_000;
 /// Tighter budget when staged changelog hunks already explain the change —
@@ -692,29 +693,188 @@ fn strip_changelog_files_from_diff(diff: &str) -> String {
     out
 }
 
+/// Returns true for files that are typically noisy/generated/asset/lockfiles:
+/// e.g. lockfiles, compiled bundles, source maps, binary assets, translation dumps.
+pub fn is_noisy_diff_path(path: &str) -> bool {
+    let p = path.trim();
+    if p.is_empty() {
+        return false;
+    }
+    let filename = p.rsplit('/').next().unwrap_or(p);
+    match filename {
+        "Cargo.lock" | "package-lock.json" | "pnpm-lock.yaml" | "yarn.lock" | "composer.lock"
+        | "Gemfile.lock" | "poetry.lock" | "flake.lock" | "bun.lockb" | "shrinkwrap.yaml" => {
+            return true
+        }
+        _ => {}
+    }
+    let lower = filename.to_ascii_lowercase();
+    let noisy_exts = [
+        ".min.js",
+        ".min.css",
+        ".bundle.js",
+        ".map",
+        ".po",
+        ".pot",
+        ".mo",
+        ".svg",
+        ".png",
+        ".jpg",
+        ".jpeg",
+        ".gif",
+        ".ico",
+        ".webp",
+        ".woff",
+        ".woff2",
+        ".ttf",
+        ".eot",
+        ".wasm",
+    ];
+    for ext in noisy_exts {
+        if lower.ends_with(ext) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Compact a unified git diff for AI generation by filtering out noisy diff hunks
+/// (lockfiles, minified bundles, asset files) while preserving substantive code diffs.
+/// Returns the compacted diff string along with any omitted noisy paths.
+pub fn compact_diff_for_ai(diff: &str) -> (String, Vec<String>) {
+    let mut out = String::new();
+    let mut omitted_noisy: Vec<String> = Vec::new();
+    let mut current_is_noisy = false;
+    let mut substantive_lines_found = false;
+
+    for line in diff.lines() {
+        if let Some(rest) = line.strip_prefix("diff --git ") {
+            let part = rest.split_whitespace().next().unwrap_or("");
+            let path = part
+                .strip_prefix("a/")
+                .or_else(|| part.strip_prefix("b/"))
+                .unwrap_or(part);
+            if is_noisy_diff_path(path) {
+                current_is_noisy = true;
+                if !omitted_noisy.iter().any(|x| x == path) {
+                    omitted_noisy.push(path.to_string());
+                }
+                continue;
+            } else {
+                current_is_noisy = false;
+            }
+        } else if let Some(rest) = line.strip_prefix("+++ b/") {
+            let path = rest.split('\t').next().unwrap_or(rest).trim();
+            if is_noisy_diff_path(path) {
+                current_is_noisy = true;
+                if !omitted_noisy.iter().any(|x| x == path) {
+                    omitted_noisy.push(path.to_string());
+                }
+                continue;
+            }
+        }
+
+        if !current_is_noisy {
+            out.push_str(line);
+            out.push('\n');
+            if (line.starts_with('+') && !line.starts_with("+++"))
+                || (line.starts_with('-') && !line.starts_with("---"))
+            {
+                substantive_lines_found = true;
+            }
+        }
+    }
+
+    if !substantive_lines_found && !omitted_noisy.is_empty() {
+        return (clamp_chars(diff, 1_500), omitted_noisy);
+    }
+
+    (out, omitted_noisy)
+}
+
+/// Heuristic extraction of a Conventional Commit scope from changed paths in the diff.
+pub fn extract_diff_scope(diff: &str) -> Option<String> {
+    let paths = changed_paths_in_diff(diff);
+    if paths.is_empty() {
+        return None;
+    }
+    let scopes: Vec<String> = paths.iter().filter_map(|p| scope_from_path(p)).collect();
+    if scopes.is_empty() {
+        return None;
+    }
+    let first = &scopes[0];
+    if scopes.iter().all(|s| s == first) {
+        Some(first.clone())
+    } else {
+        None
+    }
+}
+
+fn scope_from_path(path: &str) -> Option<String> {
+    let p = path.trim().trim_start_matches('/');
+    if let Some(rest) = p.strip_prefix("crates/") {
+        let segs: Vec<&str> = rest.split('/').collect();
+        if !segs.is_empty() {
+            let name = segs[0].strip_prefix("repoharbor-").unwrap_or(segs[0]);
+            return Some(name.to_string());
+        }
+    }
+    if p.starts_with("docs/") {
+        return Some("docs".to_string());
+    }
+    if p.starts_with("tests/") {
+        return Some("test".to_string());
+    }
+    if let Some(rest) = p.strip_prefix("addons/") {
+        let segs: Vec<&str> = rest.split('/').collect();
+        if !segs.is_empty() {
+            return Some(segs[0].to_string());
+        }
+    }
+    if let Some(rest) = p.strip_prefix("src/") {
+        let segs: Vec<&str> = rest.split('/').collect();
+        if segs.len() > 1 {
+            return Some(segs[0].to_string());
+        }
+    }
+    None
+}
+
 /// Diff text embedded in the commit prompt: full clamp by default; when
 /// `rich_changelog_prior` the changelog file hunks are omitted and the remaining
 /// code diff is clamped tightly (or replaced with a file list).
 pub fn commit_prompt_diff(diff: &str, rich_changelog_prior: bool) -> String {
-    if !rich_changelog_prior {
-        return clamp_chars(diff, COMMIT_DIFF_CLAMP);
-    }
-    let slim = strip_changelog_files_from_diff(diff);
-    if slim.trim().is_empty() {
-        let paths = changed_paths_in_diff(diff);
-        if paths.is_empty() {
-            return String::new();
+    let (compacted, noisy_paths) = compact_diff_for_ai(diff);
+    let mut diff_block = if rich_changelog_prior {
+        let slim = strip_changelog_files_from_diff(&compacted);
+        if slim.trim().is_empty() {
+            let paths = changed_paths_in_diff(diff);
+            if paths.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    "Changed files (changelog already describes the change):\n{}",
+                    paths
+                        .iter()
+                        .map(|p| format!("- {p}"))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                )
+            }
+        } else {
+            clamp_chars(&slim, COMMIT_DIFF_CLAMP_WITH_PRIOR)
         }
-        return format!(
-            "Changed files (changelog already describes the change):\n{}",
-            paths
-                .iter()
-                .map(|p| format!("- {p}"))
-                .collect::<Vec<_>>()
-                .join("\n")
-        );
+    } else {
+        clamp_chars(&compacted, COMMIT_DIFF_CLAMP)
+    };
+
+    if !noisy_paths.is_empty() && !diff_block.trim().is_empty() {
+        diff_block.push_str(&format!(
+            "\n\n[Omitted hunks for generated/lock/asset files: {}]",
+            noisy_paths.join(", ")
+        ));
     }
-    clamp_chars(&slim, COMMIT_DIFF_CLAMP_WITH_PRIOR)
+    diff_block
 }
 
 /// True for a `## Unreleased` / `## [Unreleased]` heading (Keep a Changelog).
@@ -1045,10 +1205,14 @@ use the diff only for scope / file names.\n"
     let hint = version_hint.map(|h| format!("\n{h}\n")).unwrap_or_default();
     let hint = format!("{hint}{}", extras_block(extras, rich_prior));
     let diff_block = commit_prompt_diff(diff, rich_prior);
+    let scope_hint = extract_diff_scope(diff)
+        .map(|s| format!("- Suggested Conventional Commit scope: `{s}`\n"))
+        .unwrap_or_default();
     format!(
         "Write a Conventional Commit message for these staged changes.\n\n\
 Requirements:\n\
 - Subject line in Conventional Commit form (e.g. `feat(scope): summary`), under ~72 characters.\n\
+{scope_hint}\
 - Then a blank line, then a real body of 2–5 short sentences or bullets explaining WHAT changed and WHY — not a subject-only one-liner.\n\
 - Do not invent version numbers, issue ids or file names that are not in the input.\n\
 {version_rule}\
@@ -1146,11 +1310,10 @@ pub fn split_pr_draft(text: &str) -> Option<(String, String)> {
     Some((title, body))
 }
 
-/// Non-AI Conventional Commit when generation is unreachable. Prefers the
+/// Non-AI Conventional Commit with both subject and body. Prefers the
 /// first changelog bullet near the changed files; otherwise names the files.
-/// Same degrade-gracefully contract as [`fallback_pr_draft`]: the git write the
-/// user asked for still happens.
-pub fn fallback_commit_message(diff: &str, repo_path: &str) -> String {
+/// Generates a structured (subject, body) tuple instantly with zero network/AI dependency.
+pub fn fallback_commit_message_parts(diff: &str, repo_path: &str) -> (String, String) {
     let extras = if repo_path.is_empty() {
         CommitExtras::default()
     } else {
@@ -1161,7 +1324,52 @@ pub fn fallback_commit_message(diff: &str, repo_path: &str) -> String {
         .iter()
         .find_map(|(_, excerpt)| excerpt.lines().find_map(changelog_line_as_subject))
         .unwrap_or_else(|| files_subject(diff));
-    append_odoo_version(subject, diff, repo_path)
+    let subject = append_odoo_version(subject, diff, repo_path);
+
+    let mut changelog_bullets = Vec::new();
+    for (_, excerpt) in &extras.changelogs {
+        for line in excerpt.lines() {
+            let t = line.trim();
+            if t.starts_with('-') || t.starts_with('*') || t.starts_with('+') {
+                let bullet = t.trim_start_matches(['-', '*', '+']).trim();
+                if !bullet.is_empty() {
+                    changelog_bullets.push(bullet.to_string());
+                }
+            }
+        }
+    }
+
+    let body = if !changelog_bullets.is_empty() {
+        changelog_bullets
+            .iter()
+            .take(6)
+            .map(|b| format!("- {b}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    } else {
+        let paths = changed_paths_in_diff(diff);
+        if paths.is_empty() {
+            String::new()
+        } else {
+            paths
+                .iter()
+                .take(8)
+                .map(|p| format!("- Update {p}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
+    };
+
+    (subject, body)
+}
+
+/// Non-AI Conventional Commit when generation is unreachable. Prefers the
+/// first changelog bullet near the changed files; otherwise names the files.
+/// Same degrade-gracefully contract as [`fallback_pr_draft`]: the git write the
+/// user asked for still happens.
+pub fn fallback_commit_message(diff: &str, repo_path: &str) -> String {
+    let (subject, _) = fallback_commit_message_parts(diff, repo_path);
+    subject
 }
 
 fn changelog_line_as_subject(line: &str) -> Option<String> {
@@ -1841,5 +2049,67 @@ diff --git a/CHANGELOG.md b/CHANGELOG.md
         let paths = manifest_paths_in_diff(diff);
         assert!(paths.iter().any(|p| p == "m/__manifest__.py"));
         assert!(paths.iter().any(|p| p == "m/__openerp__.py"));
+    }
+
+    #[test]
+    fn is_noisy_diff_path_matches_lockfiles_and_assets() {
+        assert!(is_noisy_diff_path("Cargo.lock"));
+        assert!(is_noisy_diff_path("sub/package-lock.json"));
+        assert!(is_noisy_diff_path("pnpm-lock.yaml"));
+        assert!(is_noisy_diff_path("assets/icon.svg"));
+        assert!(is_noisy_diff_path("dist/bundle.min.js"));
+        assert!(is_noisy_diff_path("i18n/ar.po"));
+        assert!(!is_noisy_diff_path("src/main.rs"));
+        assert!(!is_noisy_diff_path("Cargo.toml"));
+    }
+
+    #[test]
+    fn compact_diff_for_ai_removes_noisy_sections() {
+        let diff = "\
+diff --git a/Cargo.lock b/Cargo.lock
+index 111..222 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -1,3 +1,3 @@
+-foo = 1
++foo = 2
+diff --git a/src/lib.rs b/src/lib.rs
+index 333..444 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -1,2 +1,3 @@
+ pub fn hello() {}
++pub fn world() {}
+";
+        let (compacted, noisy) = compact_diff_for_ai(diff);
+        assert_eq!(noisy, vec!["Cargo.lock"]);
+        assert!(!compacted.contains("foo = 2"), "{compacted}");
+        assert!(compacted.contains("pub fn world()"), "{compacted}");
+    }
+
+    #[test]
+    fn extract_diff_scope_finds_component() {
+        let diff_core = "\
+diff --git a/crates/repoharbor-core/src/ai.rs b/crates/repoharbor-core/src/ai.rs
++++ b/crates/repoharbor-core/src/ai.rs
+";
+        assert_eq!(extract_diff_scope(diff_core), Some("core".to_string()));
+
+        let diff_docs = "\
+diff --git a/docs/index.md b/docs/index.md
++++ b/docs/index.md
+";
+        assert_eq!(extract_diff_scope(diff_docs), Some("docs".to_string()));
+    }
+
+    #[test]
+    fn fallback_commit_message_parts_yields_subject_and_bullets() {
+        let diff = "\
+diff --git a/src/main.rs b/src/main.rs
++++ b/src/main.rs
+";
+        let (subject, body) = fallback_commit_message_parts(diff, "");
+        assert_eq!(subject, "chore: update main.rs");
+        assert!(body.contains("- Update src/main.rs"));
     }
 }

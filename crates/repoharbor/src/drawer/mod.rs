@@ -1938,6 +1938,19 @@ pub(super) fn changes_view(
                 },
             ));
         }
+        if has_changes {
+            let app_fast = app.clone();
+            actions = actions.child(pr_btn(
+                SharedString::from("fast-commit"),
+                "Fast commit",
+                t,
+                move |window, cx: &mut gpui::App| {
+                    app_fast.update(cx, |this, cx| {
+                        this.drawer_fast_commit(window, cx);
+                    });
+                },
+            ));
+        }
         actions = actions.child(div().flex_1());
         if has_changes {
             let repo = row.id.clone();
