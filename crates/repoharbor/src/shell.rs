@@ -6869,51 +6869,6 @@ impl RepoHarborApp {
             cx.listener(|this, _ev, _w, cx| this.rescan(cx)),
         ));
 
-        // Git Fetch & Pull: scope-aware (selected when checked, else every visible repository)
-        let selected_ordered = self.selected_repos_ordered();
-        let empty_selection = selected_ordered.is_empty();
-        let visible_count = self.visible_rows().len();
-
-        let fetch_label = if empty_selection {
-            if visible_count > 0 {
-                format!("Fetch ({visible_count})")
-            } else {
-                "Fetch".into()
-            }
-        } else {
-            format!("Fetch ({})", selected_ordered.len())
-        };
-
-        let pull_label = if empty_selection {
-            if visible_count > 0 {
-                format!("Pull ({visible_count})")
-            } else {
-                "Pull".into()
-            }
-        } else {
-            format!("Pull ({})", selected_ordered.len())
-        };
-
-        row = row.child(tool_btn(
-            "tb-fleet-fetch",
-            "cloud-download",
-            Some(fetch_label.as_str()),
-            Some("Fetch git remotes — selection when checked, else every visible repository"),
-            false,
-            t,
-            cx.listener(|this, _ev, _w, cx| this.run_fleet_fetch_scope(cx)),
-        ));
-
-        row = row.child(tool_btn(
-            "tb-fleet-pull",
-            "arrow-down",
-            Some(pull_label.as_str()),
-            Some("Pull changes from upstream — selection when checked, else every visible repository"),
-            false,
-            t,
-            cx.listener(|this, _ev, _w, cx| this.run_fleet_pull_scope(cx)),
-        ));
-
         // One-click Pull for every repo behind its upstream (vendor trees).
         row = row.child(tool_btn(
             "tb-pull-behind",
@@ -6973,21 +6928,20 @@ impl RepoHarborApp {
                 cx.listener(|this, _ev, _w, cx| this.summarize_all(cx)),
             ));
         }
-        // Selection-scoped primaries: Fetch / Pull / Push / Gen only /
-        // Gen & push / [Empty commit] beside Actions ▾. Count only repos
-        // still visible under the active Mission Control filters.
+        // Fleet sync primaries (Fetch, Pull, and selection actions).
+        // Fetch and Pull are scope-aware: operate on all visible repos when
+        // empty selection, or on selected repos when checked.
+        row = row.child(self.fleet_primary_sync_buttons(t, cx));
+
         let selected_n = self.selected_repos_ordered().len();
         if selected_n > 0 {
-            row = row
-                .child(self.fleet_primary_sync_buttons(t, cx))
-                .child(self.fleet_actions_button(t, cx))
-                .child(
-                    div()
-                        .font_family("monospace")
-                        .text_size(px(t.text_data_sm))
-                        .text_color(rgb(t.fg2))
-                        .child(SharedString::from(format!("{selected_n} selected"))),
-                );
+            row = row.child(self.fleet_actions_button(t, cx)).child(
+                div()
+                    .font_family("monospace")
+                    .text_size(px(t.text_data_sm))
+                    .text_color(rgb(t.fg2))
+                    .child(SharedString::from(format!("{selected_n} selected"))),
+            );
         }
         row
     }

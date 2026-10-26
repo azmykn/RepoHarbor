@@ -5,6 +5,15 @@ All notable changes to [RepoHarbor](https://github.com/azmykn/RepoHarbor) by Dig
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project (upstream) uses calendar versioning (`YYYY.M.P`).
 
+## [2026.10.6] - 2026-10-26
+
+DigitsCode RepoHarbor — multi-repo workspaces (hundreds of checkouts across
+versioned trees, including nested submodule parents).
+
+### Fixed
+
+- **Consolidated duplicate Fetch & Pull buttons** — removed the redundant Fetch and Pull buttons from the left toolbar, retaining the single, scope-aware action buttons at the end alongside the fleet actions. When no repositories are selected, they show `Fetch (N)` / `Pull (N)` and target all visible repositories; when repositories are selected, they show `Fetch (N)` / `Pull (N)` for the exact selection.
+
 ## [2026.10.5] - 2026-10-26
 
 DigitsCode RepoHarbor — multi-repo workspaces (hundreds of checkouts across

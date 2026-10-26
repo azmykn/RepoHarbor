@@ -1628,6 +1628,30 @@ impl RepoHarborApp {
         let idle = self.fleet_actions_idle();
         let ai_ready = self.services.ai_ready;
         let repos = self.selected_repos_ordered();
+        let selected_n = repos.len();
+        let empty_selection = repos.is_empty();
+        let visible_count = self.visible_rows().len();
+
+        let fetch_label = if empty_selection {
+            if visible_count > 0 {
+                format!("Fetch ({visible_count})")
+            } else {
+                "Fetch".into()
+            }
+        } else {
+            format!("Fetch ({selected_n})")
+        };
+
+        let pull_label = if empty_selection {
+            if visible_count > 0 {
+                format!("Pull ({visible_count})")
+            } else {
+                "Pull".into()
+            }
+        } else {
+            format!("Pull ({selected_n})")
+        };
+
         let caps = crate::menu_actions::fleet_menu_caps(self, &repos);
         let mut row = div()
             .id("mc-fleet-primaries")
@@ -1638,7 +1662,7 @@ impl RepoHarborApp {
         row = row.child(bar_btn(
             "mc-fleet-fetch",
             "refresh-cw",
-            "Fetch",
+            &fetch_label,
             idle,
             false,
             t,
@@ -1649,7 +1673,7 @@ impl RepoHarborApp {
         row = row.child(bar_btn(
             "mc-fleet-pull",
             "arrow-down",
-            "Pull",
+            &pull_label,
             idle,
             false,
             t,
@@ -1657,123 +1681,125 @@ impl RepoHarborApp {
                 this.run_fleet_pull_scope(cx);
             }),
         ));
-        let push_enabled = idle && caps.can_push;
-        row = row.child(bar_btn_explain(
-            "mc-fleet-push",
-            "arrow-up",
-            "Push",
-            push_enabled,
-            t,
-            cx.listener(move |this, _e, _w, cx| {
-                let repos = this.selected_repos_ordered();
-                let caps = crate::menu_actions::fleet_menu_caps(this, &repos);
-                if !(this.fleet_actions_idle() && caps.can_push) {
-                    this.push_toast(
-                        crate::toast::ToastKind::Info,
-                        "Nothing to push",
-                        Some(
-                            "Push enables when a selected non–pull-only repo has commits that are not on its upstream."
-                                .into(),
-                        ),
-                        cx,
-                    );
-                    return;
-                }
-                this.run_fleet_repos(FleetOp::Push, repos, cx);
-            }),
-        ));
-        let gen_only_enabled = idle && ai_ready && caps.has_dirty;
-        let gen_push_enabled = idle && ai_ready && caps.has_dirty_pushable;
-        row = row.child(bar_btn_explain(
-            "mc-fleet-gen-only",
-            "sparkles",
-            "Gen only",
-            gen_only_enabled,
-            t,
-            cx.listener(move |this, _e, window, cx| {
-                if !this.services.ai_ready {
-                    this.push_toast(
-                        crate::toast::ToastKind::Error,
-                        "AI unavailable",
-                        Some("Enable Ollama / AI in Settings first.".into()),
-                        cx,
-                    );
-                    return;
-                }
-                if !(this.fleet_actions_idle()
-                    && crate::menu_actions::fleet_menu_caps(this, &this.selected_repos_ordered())
-                        .has_dirty)
-                {
-                    this.push_toast(
-                        crate::toast::ToastKind::Info,
-                        "Nothing to generate",
-                        Some(
-                            "Select dirty repos first (Gen only dims when the selection is clean)."
-                                .into(),
-                        ),
-                        cx,
-                    );
-                    return;
-                }
-                this.run_generate_commit_selected(
-                    crate::views::generate_commit::GenerateCommitChoice::MessageOnly,
-                    window,
-                    cx,
-                );
-            }),
-        ));
-        row = row.child(bar_btn_explain(
-            "mc-fleet-gen-push",
-            "sparkles",
-            "Gen & push",
-            gen_push_enabled,
-            t,
-            cx.listener(move |this, _e, window, cx| {
-                if !this.services.ai_ready {
-                    this.push_toast(
-                        crate::toast::ToastKind::Error,
-                        "AI unavailable",
-                        Some("Enable Ollama / AI in Settings first.".into()),
-                        cx,
-                    );
-                    return;
-                }
-                if !(this.fleet_actions_idle()
-                    && crate::menu_actions::fleet_menu_caps(this, &this.selected_repos_ordered())
-                        .has_dirty_pushable)
-                {
-                    this.push_toast(
-                        crate::toast::ToastKind::Info,
-                        "Nothing to generate",
-                        Some(
-                            "Select dirty non–pull-only repos first (Gen & push skips upstream / vendor paths)."
-                                .into(),
-                        ),
-                        cx,
-                    );
-                    return;
-                }
-                this.run_generate_commit_selected(
-                    crate::views::generate_commit::GenerateCommitChoice::CommitAndPush,
-                    window,
-                    cx,
-                );
-            }),
-        ));
-        // Same pull-only gating as Push — hide when selection is entirely vendor.
-        if caps.has_pushable_path {
-            row = row.child(bar_btn(
-                "mc-fleet-empty-commit",
-                "git-commit",
-                "Empty commit",
-                idle,
-                false,
+        if selected_n > 0 {
+            let push_enabled = idle && caps.can_push;
+            row = row.child(bar_btn_explain(
+                "mc-fleet-push",
+                "arrow-up",
+                "Push",
+                push_enabled,
                 t,
-                cx.listener(|this, _e, _w, cx| {
+                cx.listener(move |this, _e, _w, cx| {
                     let repos = this.selected_repos_ordered();
-                    this.run_fleet_repos(FleetOp::EmptyCommit, repos, cx);
+                    let caps = crate::menu_actions::fleet_menu_caps(this, &repos);
+                    if !(this.fleet_actions_idle() && caps.can_push) {
+                        this.push_toast(
+                            crate::toast::ToastKind::Info,
+                            "Nothing to push",
+                            Some(
+                                "Push enables when a selected non–pull-only repo has commits that are not on its upstream."
+                                    .into(),
+                            ),
+                            cx,
+                        );
+                        return;
+                    }
+                    this.run_fleet_repos(FleetOp::Push, repos, cx);
                 }),
             ));
+            let gen_only_enabled = idle && ai_ready && caps.has_dirty;
+            let gen_push_enabled = idle && ai_ready && caps.has_dirty_pushable;
+            row = row.child(bar_btn_explain(
+                "mc-fleet-gen-only",
+                "sparkles",
+                "Gen only",
+                gen_only_enabled,
+                t,
+                cx.listener(move |this, _e, window, cx| {
+                    if !this.services.ai_ready {
+                        this.push_toast(
+                            crate::toast::ToastKind::Error,
+                            "AI unavailable",
+                            Some("Enable Ollama / AI in Settings first.".into()),
+                            cx,
+                        );
+                        return;
+                    }
+                    if !(this.fleet_actions_idle()
+                        && crate::menu_actions::fleet_menu_caps(this, &this.selected_repos_ordered())
+                            .has_dirty)
+                    {
+                        this.push_toast(
+                            crate::toast::ToastKind::Info,
+                            "Nothing to generate",
+                            Some(
+                                "Select dirty repos first (Gen only dims when the selection is clean)."
+                                    .into(),
+                            ),
+                            cx,
+                        );
+                        return;
+                    }
+                    this.run_generate_commit_selected(
+                        crate::views::generate_commit::GenerateCommitChoice::MessageOnly,
+                        window,
+                        cx,
+                    );
+                }),
+            ));
+            row = row.child(bar_btn_explain(
+                "mc-fleet-gen-push",
+                "sparkles",
+                "Gen & push",
+                gen_push_enabled,
+                t,
+                cx.listener(move |this, _e, window, cx| {
+                    if !this.services.ai_ready {
+                        this.push_toast(
+                            crate::toast::ToastKind::Error,
+                            "AI unavailable",
+                            Some("Enable Ollama / AI in Settings first.".into()),
+                            cx,
+                        );
+                        return;
+                    }
+                    if !(this.fleet_actions_idle()
+                        && crate::menu_actions::fleet_menu_caps(this, &this.selected_repos_ordered())
+                            .has_dirty_pushable)
+                    {
+                        this.push_toast(
+                            crate::toast::ToastKind::Info,
+                            "Nothing to generate",
+                            Some(
+                                "Select dirty non–pull-only repos first (Gen & push skips upstream / vendor paths)."
+                                    .into(),
+                            ),
+                            cx,
+                        );
+                        return;
+                    }
+                    this.run_generate_commit_selected(
+                        crate::views::generate_commit::GenerateCommitChoice::CommitAndPush,
+                        window,
+                        cx,
+                    );
+                }),
+            ));
+            // Same pull-only gating as Push — hide when selection is entirely vendor.
+            if caps.has_pushable_path {
+                row = row.child(bar_btn(
+                    "mc-fleet-empty-commit",
+                    "git-commit",
+                    "Empty commit",
+                    idle,
+                    false,
+                    t,
+                    cx.listener(|this, _e, _w, cx| {
+                        let repos = this.selected_repos_ordered();
+                        this.run_fleet_repos(FleetOp::EmptyCommit, repos, cx);
+                    }),
+                ));
+            }
         }
         row
     }
