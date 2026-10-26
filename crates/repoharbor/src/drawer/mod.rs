@@ -1195,6 +1195,14 @@ fn header(row: &Row, t: &Theme, app: &Entity<RepoHarborApp>) -> impl IntoElement
     if !row.host.is_empty() {
         title = title.child(brand(&row.host, 15., t.fg2));
     }
+    if row.last_commit_unix > 0 {
+        let now = crate::data::now_unix();
+        title = title.child(crate::heatmap::render_mini_pulse(
+            &[row.last_commit_unix],
+            now,
+            t,
+        ));
+    }
 
     let mut trailing = div()
         .flex()

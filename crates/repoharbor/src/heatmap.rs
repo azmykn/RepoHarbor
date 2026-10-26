@@ -172,6 +172,33 @@ pub fn render(activity: &Activity, t: &Theme, app: &Entity<RepoHarborApp>) -> im
         )
 }
 
+/// Render a lightweight 14-day commit pulse (mini sparkline) for the repo drawer.
+pub fn render_mini_pulse(commit_timestamps: &[i64], now: i64, t: &Theme) -> impl IntoElement {
+    let mut day_counts = [0u32; 14];
+    for &ts in commit_timestamps {
+        let age_secs = now.saturating_sub(ts);
+        let day_idx = (age_secs / 86400) as usize;
+        if day_idx < 14 {
+            // Index 13 is today, index 0 is 13 days ago
+            day_counts[13 - day_idx] += 1;
+        }
+    }
+
+    let mut row = div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(2.5))
+        .py(px(4.));
+
+    for &cnt in &day_counts {
+        let color = heat_color(Some(cnt), t);
+        row = row.child(div().w(px(7.)).h(px(14.)).rounded(px(1.5)).bg(rgb(color)));
+    }
+
+    row
+}
+
 #[cfg(test)]
 mod tests {
     use super::commas;
