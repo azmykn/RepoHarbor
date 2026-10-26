@@ -617,6 +617,86 @@ impl RepoHarborApp {
         self.run_fleet_repos(op, repos, cx);
     }
 
+    /// Fetch git remotes for the current scope — selected ∩ visible when
+    /// something is checked; otherwise every visible repo (Submodules pattern).
+    pub fn run_fleet_fetch_scope(&mut self, cx: &mut Context<Self>) {
+        if !self.ensure_fleet_actions_idle(cx) {
+            return;
+        }
+        self.prune_selection_to_visible();
+        let empty_selection = self.selected.is_empty();
+        let repos: Vec<String> = if empty_selection {
+            self.visible_rows()
+                .into_iter()
+                .filter_map(|idx| self.rows.get(idx).map(|r| r.id.to_string()))
+                .collect()
+        } else {
+            self.selected_repos_ordered()
+        };
+        if repos.is_empty() {
+            self.push_toast(
+                ToastKind::Info,
+                "Nothing to fetch",
+                Some("No visible repositories to fetch.".into()),
+                cx,
+            );
+            return;
+        }
+        let n = repos.len();
+        let detail = if empty_selection {
+            format!("Fetching every visible repository ({n} total)")
+        } else {
+            format!("Fetching {n} selected repository(ies)")
+        };
+        self.push_toast(
+            ToastKind::Info,
+            format!("Fetch ({n})"),
+            Some(detail.into()),
+            cx,
+        );
+        self.run_fleet_repos(FleetOp::Fetch, repos, cx);
+    }
+
+    /// Pull git remotes for the current scope — selected ∩ visible when
+    /// something is checked; otherwise every visible repo (Submodules pattern).
+    pub fn run_fleet_pull_scope(&mut self, cx: &mut Context<Self>) {
+        if !self.ensure_fleet_actions_idle(cx) {
+            return;
+        }
+        self.prune_selection_to_visible();
+        let empty_selection = self.selected.is_empty();
+        let repos: Vec<String> = if empty_selection {
+            self.visible_rows()
+                .into_iter()
+                .filter_map(|idx| self.rows.get(idx).map(|r| r.id.to_string()))
+                .collect()
+        } else {
+            self.selected_repos_ordered()
+        };
+        if repos.is_empty() {
+            self.push_toast(
+                ToastKind::Info,
+                "Nothing to pull",
+                Some("No visible repositories to pull.".into()),
+                cx,
+            );
+            return;
+        }
+        let n = repos.len();
+        let detail = if empty_selection {
+            format!("Pulling every visible repository ({n} total)")
+        } else {
+            format!("Pulling {n} selected repository(ies)")
+        };
+        self.push_toast(
+            ToastKind::Info,
+            format!("Pull ({n})"),
+            Some(detail.into()),
+            cx,
+        );
+        self.run_fleet_repos(FleetOp::Pull, repos, cx);
+    }
+
     /// Update submodules for the current scope — selected ∩ visible when
     /// something is checked; otherwise every visible parent with nested
     /// checkouts (ops-row **Submodules** with an empty selection).
@@ -1563,8 +1643,7 @@ impl RepoHarborApp {
             false,
             t,
             cx.listener(|this, _e, _w, cx| {
-                let repos = this.selected_repos_ordered();
-                this.run_fleet_repos(FleetOp::Fetch, repos, cx);
+                this.run_fleet_fetch_scope(cx);
             }),
         ));
         row = row.child(bar_btn(
@@ -1575,8 +1654,7 @@ impl RepoHarborApp {
             false,
             t,
             cx.listener(|this, _e, _w, cx| {
-                let repos = this.selected_repos_ordered();
-                this.run_fleet_repos(FleetOp::Pull, repos, cx);
+                this.run_fleet_pull_scope(cx);
             }),
         ));
         let push_enabled = idle && caps.can_push;

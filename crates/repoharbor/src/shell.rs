@@ -6868,12 +6868,58 @@ impl RepoHarborApp {
             t,
             cx.listener(|this, _ev, _w, cx| this.rescan(cx)),
         ));
+
+        // Git Fetch & Pull: scope-aware (selected when checked, else every visible repository)
+        let selected_ordered = self.selected_repos_ordered();
+        let empty_selection = selected_ordered.is_empty();
+        let visible_count = self.visible_rows().len();
+
+        let fetch_label = if empty_selection {
+            if visible_count > 0 {
+                format!("Fetch ({visible_count})")
+            } else {
+                "Fetch".into()
+            }
+        } else {
+            format!("Fetch ({})", selected_ordered.len())
+        };
+
+        let pull_label = if empty_selection {
+            if visible_count > 0 {
+                format!("Pull ({visible_count})")
+            } else {
+                "Pull".into()
+            }
+        } else {
+            format!("Pull ({})", selected_ordered.len())
+        };
+
+        row = row.child(tool_btn(
+            "tb-fleet-fetch",
+            "cloud-download",
+            Some(fetch_label.as_str()),
+            Some("Fetch git remotes — selection when checked, else every visible repository"),
+            false,
+            t,
+            cx.listener(|this, _ev, _w, cx| this.run_fleet_fetch_scope(cx)),
+        ));
+
+        row = row.child(tool_btn(
+            "tb-fleet-pull",
+            "arrow-down",
+            Some(pull_label.as_str()),
+            Some("Pull changes from upstream — selection when checked, else every visible repository"),
+            false,
+            t,
+            cx.listener(|this, _ev, _w, cx| this.run_fleet_pull_scope(cx)),
+        ));
+
         // One-click Pull for every repo behind its upstream (vendor trees).
         row = row.child(tool_btn(
             "tb-pull-behind",
-            "cloud-download",
+            "download",
             Some("Pull behind"),
-            None,
+            Some("Pull only the repositories that are behind upstream"),
             false,
             t,
             cx.listener(|this, _ev, _w, cx| this.pull_behind_repos(cx)),
@@ -6882,8 +6928,8 @@ impl RepoHarborApp {
         row = row.child(tool_btn(
             "tb-fetch-all",
             "globe",
-            Some("Fetch all"),
-            None,
+            Some("Enrich hosts"),
+            Some("Refresh GitHub / GitLab host enrichment data (pull requests, CI status, issues)"),
             false,
             t,
             cx.listener(|this, _ev, _w, cx| this.fetch_all_hosts(cx)),
@@ -7239,6 +7285,22 @@ impl Render for RepoHarborApp {
                             .text_size(px(12.))
                             .text_color(rgb(t.fg1))
                             .child("RepoHarbor"),
+                    )
+                    .child(
+                        div()
+                            .px(px(5.))
+                            .py(px(1.))
+                            .rounded(px(t.r_xs))
+                            .bg(rgb(t.surface))
+                            .border_1()
+                            .border_color(rgb(t.border))
+                            .font_family("monospace")
+                            .text_size(px(t.text_data_sm))
+                            .text_color(rgb(t.fg2))
+                            .child(SharedString::from(format!(
+                                "v{}",
+                                crate::identity::APP_VERSION
+                            ))),
                     )
                     .child(
                         div()

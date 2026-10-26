@@ -136,7 +136,7 @@ fn main() {
                     ..Default::default()
                 },
                 |window, cx| {
-                    window.set_window_title("RepoHarbor");
+                    window.set_window_title(&format!("RepoHarbor v{}", identity::APP_VERSION));
                     // Second zoom pass helps some Wayland CSD compositors that
                     // ignore the initial Maximized hint on first map.
                     if !window.is_maximized() {

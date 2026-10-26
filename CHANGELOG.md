@@ -5,13 +5,15 @@ All notable changes to [RepoHarbor](https://github.com/azmykn/RepoHarbor) by Dig
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project (upstream) uses calendar versioning (`YYYY.M.P`).
 
-## [2026.10.4] - 2026-10-26
+## [2026.10.5] - 2026-10-26
 
 DigitsCode RepoHarbor — multi-repo workspaces (hundreds of checkouts across
 versioned trees, including nested submodule parents).
 
 ### Added
 
+- **Scope-aware Fetch and Pull** — applied the Submodules empty→all pattern to git Fetch and Pull buttons: when no repos are selected, Fetch and Pull target all visible repositories (`Fetch (N)` / `Pull (N)`); when repos are selected, they target only the checked repositories (`Fetch (N)` / `Pull (N)`).
+- **In-app version pill in top TitleBar** — displayed the application version number (`vYYYY.M.P`) in the top window title bar right beside the RepoHarbor logo and name.
 - **Quick branch switcher & checkout on branch badges** — clicking the branch badge next to the repo name (in the drawer header or on cards in grid/list views) opens an instant branch switcher dropdown with explicit `checkout` buttons to switch branches seamlessly.
 - **Commit generation acceleration and Fast commit** — added smart diff compaction to strip noisy lockfiles/assets from AI context, lowered token generation budget to 160 tokens for 2x faster LLM responses, added automatic Conventional Commit scope extraction, and added a 0ms "Fast commit" button in the Changes drawer.
 - **Explicit checkout on branches** — added direct Checkout action to non-current branches in the drawer branch list.
