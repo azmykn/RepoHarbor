@@ -6,7 +6,7 @@ use git2::{
     BranchType, Cred, CredentialType, DiffOptions, FetchOptions, RemoteCallbacks, Repository,
     RepositoryState,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::model::GitStatus;
 
@@ -964,6 +964,224 @@ pub fn run_command(path: &str, command: &str) -> Result<CmdResult, String> {
         ok: output.status.success(),
         output_tail: tail_lines(&combined, 6),
     })
+}
+
+/// Run `git` in a repo's directory with literal arguments, preserving quotes and spaces.
+pub fn run_git(path: &str, args: &[&str]) -> Result<CmdResult, String> {
+    let output = std::process::Command::new("git")
+        .args(args)
+        .current_dir(path)
+        .output()
+        .map_err(|e| format!("git {}: {e}", args.first().unwrap_or(&"")))?;
+    let mut combined = String::from_utf8_lossy(&output.stdout).into_owned();
+    combined.push_str(&String::from_utf8_lossy(&output.stderr));
+    Ok(CmdResult {
+        code: output.status.code(),
+        ok: output.status.success(),
+        output_tail: tail_lines(&combined, 6),
+    })
+}
+
+/// Strategy for merging a source branch into HEAD.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum MergeStrategy {
+    /// Fast-forward if possible, else create a standard merge commit.
+    Auto,
+    /// Fast-forward only; fails if histories have diverged.
+    FfOnly,
+    /// Always create a merge commit even if fast-forward is possible.
+    NoFf,
+    /// Collapse all commits from source into staged index changes without committing.
+    Squash,
+}
+
+/// Outcome of a merge operation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum MergeOutcome {
+    FastForwarded { commits: usize },
+    Merged { summary: String },
+    Squashed { commits: usize },
+    UpToDate,
+    Conflict { files: Vec<String> },
+}
+
+/// Inspection preview of what merging `source` into HEAD would do.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MergePreview {
+    pub head_branch: String,
+    pub source_branch: String,
+    pub ahead: usize,
+    pub behind: usize,
+    pub can_fast_forward: bool,
+    pub is_up_to_date: bool,
+    pub is_dirty: bool,
+}
+
+/// Inspect what would happen if `source` is merged into HEAD.
+pub fn merge_preview(path: &str, source: &str) -> Result<MergePreview, String> {
+    let repo = Repository::open(path).map_err(|e| e.to_string())?;
+    let head = repo.head().map_err(|e| e.to_string())?;
+    let head_branch = head.shorthand().unwrap_or("HEAD").to_string();
+    let head_oid = head.target().ok_or("HEAD has no target OID")?;
+    let (source_obj, _) = repo
+        .revparse_ext(source)
+        .map_err(|e| format!("branch '{source}' not found: {e}"))?;
+    let source_oid = source_obj.id();
+    let is_dirty = status_of(&repo).dirty > 0;
+
+    if head_oid == source_oid {
+        return Ok(MergePreview {
+            head_branch,
+            source_branch: source.to_string(),
+            ahead: 0,
+            behind: 0,
+            can_fast_forward: true,
+            is_up_to_date: true,
+            is_dirty,
+        });
+    }
+
+    let (ahead, behind) = repo
+        .graph_ahead_behind(head_oid, source_oid)
+        .map_err(|e| e.to_string())?;
+    let can_fast_forward = ahead == 0;
+    let is_up_to_date = behind == 0;
+
+    Ok(MergePreview {
+        head_branch,
+        source_branch: source.to_string(),
+        ahead,
+        behind,
+        can_fast_forward,
+        is_up_to_date,
+        is_dirty,
+    })
+}
+
+/// Merge `source` branch into HEAD using the specified `strategy`.
+///
+/// Safety guarantees:
+/// 1. Rejects if working tree is dirty (`status.dirty > 0`).
+/// 2. Rejects if merge/rebase is already in progress.
+/// 3. If conflicts occur, leaves working tree with conflict markers so diff/IDE tools can resolve,
+///    and returns `MergeOutcome::Conflict { files }`.
+/// 4. Does not prompt interactively for commit message — uses `custom_message` or sensible default.
+pub fn merge_branch(
+    path: &str,
+    source: &str,
+    strategy: MergeStrategy,
+    custom_message: Option<&str>,
+) -> Result<MergeOutcome, String> {
+    let repo = Repository::open(path).map_err(|e| e.to_string())?;
+    if status_of(&repo).dirty > 0 {
+        return Err("uncommitted changes: please stash or commit changes before merging".into());
+    }
+    if repo.state() != RepositoryState::Clean {
+        return Err(
+            "a merge or rebase is already in progress — resolve or abort before merging".into(),
+        );
+    }
+
+    let (ahead, behind) = {
+        let head = repo.head().map_err(|e| e.to_string())?;
+        let head_oid = head.target().ok_or("HEAD has no target OID")?;
+        let (source_obj, _) = repo
+            .revparse_ext(source)
+            .map_err(|e| format!("branch '{source}' not found: {e}"))?;
+        let source_oid = source_obj.id();
+
+        if head_oid == source_oid {
+            return Ok(MergeOutcome::UpToDate);
+        }
+
+        repo.graph_ahead_behind(head_oid, source_oid)
+            .map_err(|e| e.to_string())?
+    };
+
+    if behind == 0 {
+        return Ok(MergeOutcome::UpToDate);
+    }
+
+    if ahead > 0 && strategy == MergeStrategy::FfOnly {
+        return Err(format!(
+            "fast-forward not possible: branches have diverged ({ahead} ahead, {behind} behind)"
+        ));
+    }
+
+    drop(repo); // Release repo lock before running git CLI
+
+    let default_msg;
+    let msg_str;
+    let mut args = vec!["merge"];
+
+    match strategy {
+        MergeStrategy::FfOnly => {
+            args.push("--ff-only");
+        }
+        MergeStrategy::NoFf => {
+            args.push("--no-ff");
+            args.push("-m");
+            if let Some(m) = custom_message {
+                msg_str = m;
+            } else {
+                default_msg = format!("Merge branch '{source}'");
+                msg_str = &default_msg;
+            }
+            args.push(msg_str);
+        }
+        MergeStrategy::Squash => {
+            args.push("--squash");
+        }
+        MergeStrategy::Auto => {
+            if ahead > 0 {
+                args.push("-m");
+                if let Some(m) = custom_message {
+                    msg_str = m;
+                } else {
+                    default_msg = format!("Merge branch '{source}'");
+                    msg_str = &default_msg;
+                }
+                args.push(msg_str);
+            }
+        }
+    }
+
+    args.push(source);
+
+    let res = run_git(path, &args)?;
+
+    let conflicts = conflict_paths(path).unwrap_or_default();
+    if !conflicts.is_empty() {
+        return Ok(MergeOutcome::Conflict { files: conflicts });
+    }
+
+    if !res.ok {
+        return Err(format!("merge failed: {}", res.output_tail.trim()));
+    }
+
+    if strategy == MergeStrategy::Squash {
+        return Ok(MergeOutcome::Squashed { commits: behind });
+    }
+
+    if ahead == 0 && strategy != MergeStrategy::NoFf {
+        Ok(MergeOutcome::FastForwarded { commits: behind })
+    } else {
+        Ok(MergeOutcome::Merged {
+            summary: format!("merged '{source}' ({behind} commits)"),
+        })
+    }
+}
+
+/// Abort an in-progress merge, restoring working tree and index to pre-merge HEAD.
+pub fn abort_merge(path: &str) -> Result<(), String> {
+    let res = run_git(path, &["merge", "--abort"])?;
+    if !res.ok {
+        return Err(format!("failed to abort merge: {}", res.output_tail.trim()));
+    }
+    Ok(())
 }
 
 fn protected_branches(repo: &Repository) -> Vec<String> {
@@ -3211,5 +3429,88 @@ mod tests {
             !checkout.join("remote.txt").is_file(),
             "dirty submodule must not be overwritten"
         );
+    }
+
+    #[test]
+    fn merge_branch_fast_forward_and_preview() {
+        let (_dir, path) = init_repo();
+        {
+            let repo = Repository::open(&path).unwrap();
+            let head_commit = repo.head().unwrap().peel_to_commit().unwrap();
+            repo.branch("feature", &head_commit, false).unwrap();
+        }
+
+        switch_branch(&path, "feature").unwrap();
+        fs::write(std::path::Path::new(&path).join("feature.txt"), "hello").unwrap();
+        stage_all(&path).unwrap();
+        commit(&path, "feat: new file").unwrap();
+
+        let default_br = {
+            let r = Repository::open(&path).unwrap();
+            default_branch_name(&r).unwrap()
+        };
+        switch_branch(&path, &default_br).unwrap();
+
+        let preview = merge_preview(&path, "feature").unwrap();
+        assert_eq!(preview.ahead, 0);
+        assert_eq!(preview.behind, 1);
+        assert!(preview.can_fast_forward);
+        assert!(!preview.is_up_to_date);
+
+        let outcome = merge_branch(&path, "feature", MergeStrategy::Auto, None).unwrap();
+        assert_eq!(outcome, MergeOutcome::FastForwarded { commits: 1 });
+        assert!(std::path::Path::new(&path).join("feature.txt").exists());
+
+        let outcome2 = merge_branch(&path, "feature", MergeStrategy::Auto, None).unwrap();
+        assert_eq!(outcome2, MergeOutcome::UpToDate);
+    }
+
+    #[test]
+    fn merge_branch_rejects_dirty() {
+        let (_dir, path) = init_repo();
+        fs::write(
+            std::path::Path::new(&path).join("dirty.txt"),
+            "uncommitted",
+        )
+        .unwrap();
+        let err = merge_branch(&path, "feature", MergeStrategy::Auto, None).unwrap_err();
+        assert!(err.contains("uncommitted changes"));
+    }
+
+    #[test]
+    fn merge_branch_conflict_and_abort() {
+        let (_dir, path) = init_repo();
+        {
+            let repo = Repository::open(&path).unwrap();
+            let head_commit = repo.head().unwrap().peel_to_commit().unwrap();
+            repo.branch("side", &head_commit, false).unwrap();
+        }
+
+        fs::write(std::path::Path::new(&path).join("README.md"), "# Master edit").unwrap();
+        stage_all(&path).unwrap();
+        commit(&path, "edit on master").unwrap();
+
+        switch_branch(&path, "side").unwrap();
+        fs::write(std::path::Path::new(&path).join("README.md"), "# Side edit").unwrap();
+        stage_all(&path).unwrap();
+        commit(&path, "edit on side").unwrap();
+
+        let default_br = {
+            let r = Repository::open(&path).unwrap();
+            default_branch_name(&r).unwrap()
+        };
+        switch_branch(&path, &default_br).unwrap();
+
+        let outcome = merge_branch(&path, "side", MergeStrategy::Auto, None).unwrap();
+        match outcome {
+            MergeOutcome::Conflict { files } => {
+                assert!(files.contains(&"README.md".to_string()));
+            }
+            other => panic!("expected conflict, got {other:?}"),
+        }
+
+        abort_merge(&path).unwrap();
+        let r = Repository::open(&path).unwrap();
+        assert_eq!(r.state(), RepositoryState::Clean);
     }
 }
