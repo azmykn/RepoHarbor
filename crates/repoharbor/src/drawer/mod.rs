@@ -1699,7 +1699,40 @@ fn branch_item(
     if b.gone {
         item = item.child(tag("gone", t.behind, t));
     }
-    // Only non-current branches are switchable.
+    if b.current {
+        item = item.child(tag("current", t.accent_bright, t));
+    } else {
+        let (checkout_bg, checkout_border, checkout_fg) = (t.button_bg, t.border, t.fg1);
+        let (hov_border, hov_fg) = (t.accent_bright, t.fg0);
+        let name = b.name.clone();
+        let app2 = app.clone();
+        let repo2 = repo.clone();
+        item = item.child(
+            div()
+                .id(SharedString::from(format!("br-btn-{}", b.name)))
+                .px(px(7.))
+                .py(px(2.))
+                .rounded(px(t.r_xs))
+                .bg(rgb(checkout_bg))
+                .border_1()
+                .border_color(rgb(checkout_border))
+                .font_family(MONO)
+                .text_size(px(t.text_data_sm))
+                .text_color(rgb(checkout_fg))
+                .cursor_pointer()
+                .hover(move |s| s.border_color(rgb(hov_border)).text_color(rgb(hov_fg)))
+                .on_click(move |_ev, _win, cx| {
+                    let (repo, name) = (repo2.clone(), name.clone());
+                    app2.update(cx, |this, cx| {
+                        this.drawer.branches = None; // optimistic loading state
+                        switch_branch(repo, name, cx);
+                        cx.notify();
+                    });
+                })
+                .child("checkout"),
+        );
+    }
+    // Clicking anywhere on the row also switches branch.
     if !b.current {
         let name = b.name.clone();
         let app = app.clone();
