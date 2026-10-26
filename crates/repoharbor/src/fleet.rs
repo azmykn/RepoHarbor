@@ -2129,6 +2129,7 @@ fn humanize_push_fail_reason(err: &str) -> String {
     if err.starts_with("network/DNS failed")
         || err.starts_with("network error")
         || err.starts_with("authentication failed")
+        || err.starts_with("permission denied")
         || err.starts_with("push rejected")
     {
         return err.to_string();

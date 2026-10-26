@@ -1988,6 +1988,11 @@ fn push_error(e: &git2::Error) -> String {
 /// Pure classifier for push transport / policy errors (unit-tested).
 fn classify_push_error(msg: &str, is_ssh: bool) -> String {
     let lower = msg.to_ascii_lowercase();
+    if lower.contains("permission to ") && lower.contains("denied to ") {
+        return format!(
+            "permission denied — you do not have write access to this upstream repository ({msg})"
+        );
+    }
     if lower.contains("authentication") || lower.contains("credentials") || is_ssh {
         return format!(
             "authentication failed — check your SSH agent or git credential helper ({msg})"
@@ -2944,6 +2949,9 @@ mod tests {
 
         let auth = classify_push_error("authentication required", false);
         assert!(auth.starts_with("authentication failed"), "{auth}");
+
+        let perm = classify_push_error("ERROR: Permission to owner/repo.git denied to user.", true);
+        assert!(perm.starts_with("permission denied"), "{perm}");
 
         let plain = classify_push_error("something obscure from libgit2", false);
         assert_eq!(plain, "something obscure from libgit2");
