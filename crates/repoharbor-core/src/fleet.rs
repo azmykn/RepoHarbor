@@ -257,6 +257,34 @@ pub fn push_op() -> impl Fn(&str) -> Outcome + Sync {
     }
 }
 
+/// Fleet merge: merge `branch` into HEAD using Auto strategy.
+pub fn merge_branch_op(branch: String) -> impl Fn(&str) -> Outcome + Sync {
+    move |path| {
+        match git_ops::merge_branch(path, &branch, git_ops::MergeStrategy::Auto, None) {
+            Ok(git_ops::MergeOutcome::FastForwarded { commits }) => {
+                Outcome::Ok(format!("fast-forwarded {commits}"))
+            }
+            Ok(git_ops::MergeOutcome::Merged { summary }) => Outcome::Ok(summary),
+            Ok(git_ops::MergeOutcome::Squashed { commits }) => {
+                Outcome::Ok(format!("squashed {commits}"))
+            }
+            Ok(git_ops::MergeOutcome::UpToDate) => Outcome::Skipped("up to date".into()),
+            Ok(git_ops::MergeOutcome::Conflict { files }) => {
+                Outcome::Failed(format!("conflict in {} file(s)", files.len()))
+            }
+            Err(e) => {
+                if e.contains("uncommitted changes") {
+                    Outcome::Skipped("uncommitted changes".into())
+                } else if e.contains("not found") {
+                    Outcome::Skipped(format!("no branch '{branch}'"))
+                } else {
+                    Outcome::Failed(e)
+                }
+            }
+        }
+    }
+}
+
 /// Discover each parent's submodules and fast-forward-pull on the configured /
 /// current branch. Repos without a `.gitmodules` skip (not fail).
 pub fn submodule_update_op() -> impl Fn(&str) -> Outcome + Sync {

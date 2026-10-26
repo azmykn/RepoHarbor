@@ -181,6 +181,8 @@ pub enum FleetOp {
     /// ([`RepoHarborApp::confirm_fleet_discard`]) — discard uncommitted changes
     /// relative to HEAD (`reset --hard HEAD` + `clean -fd`). Keeps commits.
     DiscardChanges,
+    /// Merge a specified branch into HEAD across the selection.
+    MergeBranch,
 }
 
 impl FleetOp {
@@ -201,6 +203,7 @@ impl FleetOp {
             FleetOp::Prune => "Pruning",
             FleetOp::ResetHard => "Resetting",
             FleetOp::DiscardChanges => "Discarding",
+            FleetOp::MergeBranch => "Merging",
         }
     }
 
@@ -236,8 +239,15 @@ impl FleetOp {
             FleetOp::Prune => "Prune",
             FleetOp::ResetHard => "Reset hard",
             FleetOp::DiscardChanges => "Discard changes",
+            FleetOp::MergeBranch => "Merge branch",
         }
     }
+}
+
+/// Pending bulk-merge branch strip.
+pub struct MergePlan {
+    pub repos: Vec<String>,
+    pub input: gpui::Entity<gpui_component::input::InputState>,
 }
 
 /// Pending bulk-commit message prompt on the fleet bar. Dropped on selection

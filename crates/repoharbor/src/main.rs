@@ -206,6 +206,7 @@ fn main() {
                             fleet_reset: None,
                             fleet_discard: None,
                             fleet_commit: None,
+                            fleet_merge: None,
                             fleet_gen_push: None,
                             notice_detail: None,
                             last_pull: None,

@@ -485,6 +485,8 @@ pub struct RepoHarborApp {
     pub fleet_discard: Option<Vec<String>>,
     /// Pending bulk-commit message strip (one shared message for Commit All…).
     pub fleet_commit: Option<crate::fleet::CommitPlan>,
+    /// Pending bulk-merge branch strip (one shared branch to merge into HEAD).
+    pub fleet_merge: Option<crate::fleet::MergePlan>,
     /// Pending Gen & push confirm modal (multi-repo only) — AI message →
     /// commit all → push. Dropped on selection change / Esc / Cancel /
     /// backdrop / Confirm.
@@ -7317,6 +7319,8 @@ impl Render for RepoHarborApp {
                     this.cancel_fleet_reset(cx);
                 } else if this.fleet_commit.is_some() {
                     this.cancel_fleet_commit(cx);
+                } else if this.fleet_merge.is_some() {
+                    this.cancel_fleet_merge(cx);
                 } else if this.fleet_prune.is_some() {
                     // A pending prune confirm dismisses first, keeping the
                     // selection — a second Esc clears that.
