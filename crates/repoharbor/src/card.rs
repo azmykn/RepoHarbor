@@ -440,7 +440,33 @@ pub fn card(
         .text_size(px(t.text_data_sm));
     // Attention reason chips (or urgent dot fallback) lead the status row.
     status = status.child(attention_marks(&state, t));
-    status = status.child(seg("git-branch", row.branch.clone(), t.fg2));
+    if !row.branch.is_empty() {
+        let app_br = app.clone();
+        let repo_id = row.id.clone();
+        status = status.child(
+            div()
+                .id(SharedString::from(format!("card-branch-{}", row.id)))
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(4.))
+                .px(px(4.))
+                .py(px(1.))
+                .rounded(px(t.r_xs))
+                .cursor_pointer()
+                .hover(|s| s.bg(rgb(t.surface_hover)).text_color(rgb(t.fg0)))
+                .child(lucide("git-branch", 13., t.fg2))
+                .child(row.branch.clone())
+                .on_click(move |_ev, window, cx| {
+                    let id = repo_id.clone();
+                    app_br.update(cx, |this, cx| {
+                        this.open_drawer(id, window, cx);
+                        this.drawer.branch_picker_open = true;
+                        cx.notify();
+                    });
+                }),
+        );
+    }
     if row.ahead > 0 || row.behind > 0 {
         let color = if row.behind > 0 { t.behind } else { t.clean };
         status = status.child(
@@ -778,7 +804,33 @@ pub(crate) fn list_item(
         .font_family(MONO)
         .text_size(px(t.text_data_sm));
     status = status.child(attention_marks(&state, t));
-    status = status.child(seg("git-branch", row.branch.clone(), t.fg2));
+    if !row.branch.is_empty() {
+        let app_br = app.clone();
+        let repo_id = row.id.clone();
+        status = status.child(
+            div()
+                .id(SharedString::from(format!("list-branch-{}", row.id)))
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(4.))
+                .px(px(4.))
+                .py(px(1.))
+                .rounded(px(t.r_xs))
+                .cursor_pointer()
+                .hover(|s| s.bg(rgb(t.surface_hover)).text_color(rgb(t.fg0)))
+                .child(lucide("git-branch", 13., t.fg2))
+                .child(row.branch.clone())
+                .on_click(move |_ev, window, cx| {
+                    let id = repo_id.clone();
+                    app_br.update(cx, |this, cx| {
+                        this.open_drawer(id, window, cx);
+                        this.drawer.branch_picker_open = true;
+                        cx.notify();
+                    });
+                }),
+        );
+    }
     if row.ahead > 0 || row.behind > 0 {
         let color = if row.behind > 0 { t.behind } else { t.clean };
         status = status.child(

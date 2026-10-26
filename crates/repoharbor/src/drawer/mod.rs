@@ -178,6 +178,7 @@ pub struct NotesData {
 #[derive(Default)]
 pub struct DrawerData {
     pub repo: SharedString,
+    pub branch_picker_open: bool,
     pub branches: Option<Vec<BranchRow>>,
     pub worktrees: Option<Vec<WorktreeRow>>,
     pub readme: ReadmeState,
@@ -1134,7 +1135,7 @@ pub fn drawer(
             })
     };
 
-    let panel = div()
+    let mut panel = div()
         .flex()
         .flex_col()
         .w(px(PANEL_W))
@@ -1142,7 +1143,13 @@ pub fn drawer(
         .bg(rgb(t.page))
         .border_l_1()
         .border_color(rgb(t.border))
-        .child(header(row, t, app))
+        .child(header(row, t, app, data));
+
+    if data.branch_picker_open {
+        panel = panel.child(branch_picker_dropdown(data.repo.clone(), data, t, app));
+    }
+
+    let panel = panel
         .child(tab_bar(tab, t, app, data.repo.clone(), github_slug(row)))
         .child(body(row, tab, t, data, app, ai_ready, github_authed))
         .child(footer(row, t, app, ide_cmd, agent_cmd));
@@ -1161,7 +1168,12 @@ pub fn drawer(
         .child(panel)
 }
 
-fn header(row: &Row, t: &Theme, app: &Entity<RepoHarborApp>) -> impl IntoElement {
+fn header(
+    row: &Row,
+    t: &Theme,
+    app: &Entity<RepoHarborApp>,
+    data: &DrawerData,
+) -> impl IntoElement {
     let close = {
         let app = app.clone();
         div()
@@ -1194,6 +1206,55 @@ fn header(row: &Row, t: &Theme, app: &Entity<RepoHarborApp>) -> impl IntoElement
         .child(div().min_w(px(0.)).truncate().child(row.name.clone()));
     if !row.host.is_empty() {
         title = title.child(brand(&row.host, 15., t.fg2));
+    }
+    if !row.branch.is_empty() {
+        let app_br = app.clone();
+        let is_open = data.branch_picker_open;
+        let br_pill = div()
+            .id("drawer-branch-badge")
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(5.))
+            .px(px(8.))
+            .py(px(2.))
+            .rounded(px(t.r_sm))
+            .bg(rgb(if is_open { t.accent_wash } else { t.surface }))
+            .border_1()
+            .border_color(rgb(if is_open { t.accent_bright } else { t.border }))
+            .cursor_pointer()
+            .hover(move |s| {
+                s.border_color(rgb(t.accent_bright))
+                    .bg(rgb(t.surface_hover))
+            })
+            .on_click(move |_ev, _win, cx| {
+                app_br.update(cx, |this, cx| {
+                    this.drawer.branch_picker_open = !this.drawer.branch_picker_open;
+                    if this.drawer.branches.is_none() {
+                        load_overview(this.drawer.repo.clone(), cx);
+                    }
+                    cx.notify();
+                });
+            })
+            .child(lucide("git-branch", 13., t.accent_bright))
+            .child(
+                div()
+                    .font_family(MONO)
+                    .text_size(px(t.text_data_sm))
+                    .font_weight(FontWeight::NORMAL)
+                    .text_color(rgb(t.fg1))
+                    .child(row.branch.clone()),
+            )
+            .child(lucide(
+                if is_open {
+                    "chevron-up"
+                } else {
+                    "chevron-down"
+                },
+                12.,
+                t.fg2,
+            ));
+        title = title.child(br_pill);
     }
     if row.last_commit_unix > 0 {
         let now = crate::data::now_unix();
@@ -1268,6 +1329,198 @@ fn header(row: &Row, t: &Theme, app: &Entity<RepoHarborApp>) -> impl IntoElement
                 ),
         )
         .child(trailing)
+}
+
+fn branch_picker_dropdown(
+    repo: SharedString,
+    data: &DrawerData,
+    t: &Theme,
+    app: &Entity<RepoHarborApp>,
+) -> impl IntoElement {
+    let mut dropdown = div()
+        .id("branch-picker-dropdown")
+        .flex()
+        .flex_col()
+        .p(px(8.))
+        .mx(px(18.))
+        .my(px(8.))
+        .gap(px(4.))
+        .bg(rgb(t.surface))
+        .border_1()
+        .border_color(rgb(t.border_strong))
+        .rounded(px(t.r_md));
+
+    let header = div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .justify_between()
+        .px(px(6.))
+        .py(px(4.))
+        .font_family(MONO)
+        .text_size(px(t.text_data_sm))
+        .text_color(rgb(t.fg2))
+        .child("Switch / Checkout branch")
+        .child(
+            div()
+                .id("branch-picker-close")
+                .cursor_pointer()
+                .hover(|s| s.text_color(rgb(t.fg0)))
+                .child(lucide("x", 14., t.fg2))
+                .on_click({
+                    let app = app.clone();
+                    move |_ev, _win, cx| {
+                        app.update(cx, |this, cx| {
+                            this.drawer.branch_picker_open = false;
+                            cx.notify();
+                        });
+                    }
+                }),
+        );
+    dropdown = dropdown.child(header);
+
+    match &data.branches {
+        None => {
+            dropdown = dropdown.child(
+                div()
+                    .px(px(8.))
+                    .py(px(10.))
+                    .font_family(MONO)
+                    .text_size(px(t.text_data_sm))
+                    .text_color(rgb(t.fg2))
+                    .child("Loading branches…"),
+            );
+        }
+        Some(branches) if branches.is_empty() => {
+            dropdown = dropdown.child(
+                div()
+                    .px(px(8.))
+                    .py(px(10.))
+                    .font_family(MONO)
+                    .text_size(px(t.text_data_sm))
+                    .text_color(rgb(t.fg2))
+                    .child("No local branches found."),
+            );
+        }
+        Some(branches) => {
+            let mut list = div()
+                .id("branch-picker-list")
+                .flex()
+                .flex_col()
+                .gap(px(2.))
+                .max_h(px(220.))
+                .overflow_y_scroll();
+
+            for b in branches {
+                let is_current = b.current;
+                let name = b.name.clone();
+                let repo = repo.clone();
+                let app = app.clone();
+
+                let mut row_el = div()
+                    .id(SharedString::from(format!("quick-branch-row-{}", b.name)))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .justify_between()
+                    .px(px(8.))
+                    .py(px(6.))
+                    .rounded(px(t.r_xs))
+                    .font_family(MONO)
+                    .text_size(px(t.text_data_sm))
+                    .gap(px(8.));
+
+                if is_current {
+                    row_el = row_el
+                        .bg(rgb(t.accent_wash))
+                        .text_color(rgb(t.accent_bright));
+                } else {
+                    row_el = row_el
+                        .cursor_pointer()
+                        .hover(|s| s.bg(rgb(t.surface_hover)).text_color(rgb(t.fg0)))
+                        .text_color(rgb(t.fg1));
+                }
+
+                let left = div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(6.))
+                    .min_w(px(0.))
+                    .truncate()
+                    .child(lucide(
+                        "git-branch",
+                        13.,
+                        if is_current { t.accent_bright } else { t.fg2 },
+                    ))
+                    .child(b.name.clone());
+
+                let mut right = div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(6.))
+                    .flex_shrink_0();
+
+                if b.gone {
+                    right = right.child(tag("gone", t.behind, t));
+                }
+                if b.merged {
+                    right = right.child(tag("merged", t.fg3, t));
+                }
+
+                if is_current {
+                    right = right.child(tag("current", t.accent_bright, t));
+                } else {
+                    let app2 = app.clone();
+                    let repo2 = repo.clone();
+                    let name2 = name.clone();
+                    let checkout_btn = div()
+                        .id(SharedString::from(format!("quick-checkout-{}", b.name)))
+                        .px(px(8.))
+                        .py(px(2.))
+                        .rounded(px(t.r_xs))
+                        .bg(rgb(t.button_bg))
+                        .border_1()
+                        .border_color(rgb(t.border))
+                        .text_color(rgb(t.fg1))
+                        .hover(|s| s.border_color(rgb(t.accent_bright)).text_color(rgb(t.fg0)))
+                        .on_click(move |_ev, _win, cx| {
+                            let (repo, name) = (repo2.clone(), name2.clone());
+                            app2.update(cx, |this, cx| {
+                                this.drawer.branch_picker_open = false;
+                                this.drawer.branches = None;
+                                switch_branch(repo, name, cx);
+                                cx.notify();
+                            });
+                        })
+                        .child("checkout");
+                    right = right.child(checkout_btn);
+                }
+
+                if !is_current {
+                    let app_row = app.clone();
+                    let repo_row = repo.clone();
+                    let name_row = name.clone();
+                    row_el = row_el.on_click(move |_ev, _win, cx| {
+                        let (repo, name) = (repo_row.clone(), name_row.clone());
+                        app_row.update(cx, |this, cx| {
+                            this.drawer.branch_picker_open = false;
+                            this.drawer.branches = None;
+                            switch_branch(repo, name, cx);
+                            cx.notify();
+                        });
+                    });
+                }
+
+                row_el = row_el.child(left).child(right);
+                list = list.child(row_el);
+            }
+            dropdown = dropdown.child(list);
+        }
+    }
+
+    dropdown
 }
 
 /// The owner/name slug if this repo is a usable GitHub remote, else `None`.
