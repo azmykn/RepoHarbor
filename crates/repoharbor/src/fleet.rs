@@ -335,8 +335,9 @@ pub(crate) fn fleet_confirms_idle(
     has_discard: bool,
     has_commit: bool,
     has_gen_push: bool,
+    has_merge: bool,
 ) -> bool {
-    !has_prune && !has_reset && !has_discard && !has_commit && !has_gen_push
+    !has_prune && !has_reset && !has_discard && !has_commit && !has_gen_push && !has_merge
 }
 
 /// Toast copy when Push / Empty commit / Gen & push drop pull-only targets.
@@ -368,6 +369,7 @@ impl RepoHarborApp {
         self.fleet_reset = None;
         self.fleet_discard = None;
         self.fleet_commit = None;
+        self.fleet_merge = None;
         self.fleet_gen_push = None;
         if !self.selected.remove(&id) {
             self.selected.insert(id);
@@ -382,6 +384,7 @@ impl RepoHarborApp {
             || self.fleet_reset.is_some()
             || self.fleet_discard.is_some()
             || self.fleet_commit.is_some()
+            || self.fleet_merge.is_some()
             || self.fleet_gen_push.is_some()
         {
             self.clear_selection_quiet();
@@ -397,6 +400,7 @@ impl RepoHarborApp {
         self.fleet_reset = None;
         self.fleet_discard = None;
         self.fleet_commit = None;
+        self.fleet_merge = None;
         self.fleet_gen_push = None;
     }
 
@@ -418,6 +422,7 @@ impl RepoHarborApp {
         self.fleet_reset = None;
         self.fleet_discard = None;
         self.fleet_commit = None;
+        self.fleet_merge = None;
         self.fleet_gen_push = None;
         self.prune_selection_to_visible();
         for i in self.visible_rows() {
@@ -455,6 +460,7 @@ impl RepoHarborApp {
             || self.fleet_reset.is_some()
             || self.fleet_discard.is_some()
             || self.fleet_commit.is_some()
+            || self.fleet_merge.is_some()
     }
 
     /// Idle for starting / enqueueing ops = no pending confirm (strip or Gen &
@@ -467,6 +473,7 @@ impl RepoHarborApp {
             self.fleet_discard.is_some(),
             self.fleet_commit.is_some(),
             self.fleet_gen_push.is_some(),
+            self.fleet_merge.is_some(),
         )
     }
 
@@ -556,6 +563,7 @@ impl RepoHarborApp {
         self.fleet_reset = None;
         self.fleet_discard = None;
         self.fleet_commit = None;
+        self.fleet_merge = None;
         self.fleet_gen_push = None;
         self.selected = matched;
         cx.notify();
@@ -809,6 +817,7 @@ impl RepoHarborApp {
         self.fleet_reset = None;
         self.fleet_discard = None;
         self.fleet_commit = None;
+        self.fleet_merge = None;
         self.fleet_gen_push = None;
 
         if fleet_should_enqueue(self.fleet_run.is_some()) {
@@ -1015,6 +1024,16 @@ impl RepoHarborApp {
                             progress,
                             fleet::discard_changes_op(),
                         ),
+                        FleetOp::MergeBranch => {
+                            let br = commit_message.unwrap_or_else(|| "main".into());
+                            fleet::run(
+                                &repos,
+                                workers,
+                                &cancel,
+                                progress,
+                                fleet::merge_branch_op(br),
+                            )
+                        }
                     }
                 })
                 .await;
@@ -1093,6 +1112,53 @@ impl RepoHarborApp {
 
     pub fn cancel_fleet_commit(&mut self, cx: &mut Context<Self>) {
         if self.fleet_commit.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    /// Open the fleet-bar merge-branch strip for the current selection.
+    pub fn start_fleet_merge(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.fleet_merge.is_some()
+            || self.fleet_commit.is_some()
+            || self.fleet_prune.is_some()
+            || self.fleet_reset.is_some()
+            || self.fleet_discard.is_some()
+        {
+            return;
+        }
+        let repos = self.selected_repos_ordered();
+        if repos.is_empty() {
+            return;
+        }
+        let input = cx.new(|cx| {
+            gpui_component::input::InputState::new(window, cx)
+                .placeholder("Branch to merge (e.g. main, staging, origin/main)")
+        });
+        self.fleet_merge = Some(MergePlan { repos, input });
+        cx.notify();
+    }
+
+    /// Merge the entered branch into HEAD for the planned repos.
+    pub fn confirm_fleet_merge(&mut self, cx: &mut Context<Self>) {
+        let Some(plan) = self.fleet_merge.take() else {
+            return;
+        };
+        let branch = plan.input.read(cx).value().trim().to_string();
+        if branch.is_empty() {
+            self.fleet_merge = Some(plan);
+            self.push_toast(
+                ToastKind::Error,
+                "Branch name required",
+                Some("Enter a branch name to merge into HEAD.".into()),
+                cx,
+            );
+            return;
+        }
+        self.run_fleet_repos_msg(FleetOp::MergeBranch, plan.repos, Some(branch), cx);
+    }
+
+    pub fn cancel_fleet_merge(&mut self, cx: &mut Context<Self>) {
+        if self.fleet_merge.take().is_some() {
             cx.notify();
         }
     }
@@ -1491,6 +1557,63 @@ impl RepoHarborApp {
                     false,
                     t,
                     cx.listener(|this, _e, _w, cx| this.cancel_fleet_commit(cx)),
+                ));
+            return Some(
+                div()
+                    .flex()
+                    .flex_col()
+                    .child(strip)
+                    .child(bar)
+                    .into_any_element(),
+            );
+        }
+        // A pending merge-branch strip expands above the status row.
+        if let Some(plan) = &self.fleet_merge {
+            let n = plan.repos.len();
+            let input = plan.input.clone();
+            let strip = div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(10.))
+                .px(px(16.))
+                .py(px(10.))
+                .border_t_1()
+                .border_color(rgb(t.border))
+                .bg(rgb(t.surface))
+                .child(lucide("git-merge", 15., t.accent_bright))
+                .child(
+                    div()
+                        .text_size(px(t.text_small))
+                        .text_color(rgb(t.fg1))
+                        .child(SharedString::from(format!(
+                            "Merge branch into HEAD for {n} {}",
+                            if n == 1 { "repo" } else { "repos" }
+                        ))),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w(px(180.))
+                        .child(gpui_component::input::Input::new(&input)),
+                )
+                .child(bar_btn(
+                    "fleet-merge-confirm",
+                    "git-merge",
+                    "Merge",
+                    true,
+                    false,
+                    t,
+                    cx.listener(|this, _e, _w, cx| this.confirm_fleet_merge(cx)),
+                ))
+                .child(bar_btn(
+                    "fleet-merge-cancel",
+                    "x",
+                    "Cancel",
+                    true,
+                    false,
+                    t,
+                    cx.listener(|this, _e, _w, cx| this.cancel_fleet_merge(cx)),
                 ));
             return Some(
                 div()
@@ -2912,12 +3035,27 @@ mod tests {
 
     #[test]
     fn fleet_confirms_idle_requires_no_armed_confirm() {
-        assert!(fleet_confirms_idle(false, false, false, false, false));
-        assert!(!fleet_confirms_idle(true, false, false, false, false));
-        assert!(!fleet_confirms_idle(false, true, false, false, false));
-        assert!(!fleet_confirms_idle(false, false, true, false, false));
-        assert!(!fleet_confirms_idle(false, false, false, true, false));
-        assert!(!fleet_confirms_idle(false, false, false, false, true));
+        assert!(fleet_confirms_idle(
+            false, false, false, false, false, false
+        ));
+        assert!(!fleet_confirms_idle(
+            true, false, false, false, false, false
+        ));
+        assert!(!fleet_confirms_idle(
+            false, true, false, false, false, false
+        ));
+        assert!(!fleet_confirms_idle(
+            false, false, true, false, false, false
+        ));
+        assert!(!fleet_confirms_idle(
+            false, false, false, true, false, false
+        ));
+        assert!(!fleet_confirms_idle(
+            false, false, false, false, true, false
+        ));
+        assert!(!fleet_confirms_idle(
+            false, false, false, false, false, true
+        ));
         assert!(
             FLEET_CONFIRM_PENDING_DETAIL.contains("Finish or cancel"),
             "{}",

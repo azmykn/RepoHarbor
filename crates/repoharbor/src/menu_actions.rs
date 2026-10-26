@@ -254,6 +254,17 @@ pub(crate) fn fill_fleet_actions_menu(
                 });
             }),
     );
+    let (a, r) = (app.clone(), repos.clone());
+    m = m.item(
+        PopupMenuItem::new("Merge branch into HEAD…")
+            .disabled(!on)
+            .on_click(move |_, window, cx| {
+                a.update(cx, |this, cx| {
+                    this.adopt_fleet_targets(&r);
+                    this.start_fleet_merge(window, cx);
+                });
+            }),
+    );
     m = m.separator();
 
     // ── Destructive ────────────────────────────────────────────────────────

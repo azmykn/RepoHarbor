@@ -5,6 +5,19 @@ All notable changes to [RepoHarbor](https://github.com/azmykn/RepoHarbor) by Dig
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project (upstream) uses calendar versioning (`YYYY.M.P`).
 
+## [2026.10.7] - 2026-10-26
+
+DigitsCode RepoHarbor — multi-repo workspaces (hundreds of checkouts across
+versioned trees, including nested submodule parents).
+
+### Added
+
+- **Native Git Branch Merge** — added comprehensive branch merge capabilities:
+  - **Quick Merge in Branch Switcher & Drawer**: Added one-click `[merge]` action button beside `[checkout]` in the branch dropdown and Drawer branch list to merge any local or remote branch directly into HEAD.
+  - **Fleet Multi-Repo Merge**: Added `Merge branch into HEAD…` under `Actions ▾` with a dedicated prompt strip to batch-merge a specified branch across all selected repositories with real-time progress.
+  - **Conflict Resolution & Abort**: Directly surfaced an `[Abort merge]` action in the Work tab's conflict banner alongside diff tool and IDE launchers, safely restoring clean pre-merge working state.
+  - **Safety Pre-flight**: Added checks preventing dirty tree corruption or collisions with in-progress rebases.
+
 ## [2026.10.6] - 2026-10-26
 
 DigitsCode RepoHarbor — multi-repo workspaces (hundreds of checkouts across

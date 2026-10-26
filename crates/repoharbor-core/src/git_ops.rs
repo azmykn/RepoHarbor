@@ -3468,11 +3468,7 @@ mod tests {
     #[test]
     fn merge_branch_rejects_dirty() {
         let (_dir, path) = init_repo();
-        fs::write(
-            std::path::Path::new(&path).join("dirty.txt"),
-            "uncommitted",
-        )
-        .unwrap();
+        fs::write(std::path::Path::new(&path).join("dirty.txt"), "uncommitted").unwrap();
         let err = merge_branch(&path, "feature", MergeStrategy::Auto, None).unwrap_err();
         assert!(err.contains("uncommitted changes"));
     }
@@ -3486,7 +3482,11 @@ mod tests {
             repo.branch("side", &head_commit, false).unwrap();
         }
 
-        fs::write(std::path::Path::new(&path).join("README.md"), "# Master edit").unwrap();
+        fs::write(
+            std::path::Path::new(&path).join("README.md"),
+            "# Master edit",
+        )
+        .unwrap();
         stage_all(&path).unwrap();
         commit(&path, "edit on master").unwrap();
 

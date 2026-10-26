@@ -176,7 +176,7 @@ Released under the [MIT License](LICENSE) for **public use** — you may use, co
 
 | | |
 |---|---|
-| **Version** | `2026.10.6` (calendar `YYYY.M.P`; also shown in **Settings → About**) |
+| **Version** | `2026.10.7` (calendar `YYYY.M.P`; also shown in **Settings → About**) |
 | **Publisher** | DigitsCode |
 | **Author** | Azmy Karam |
 | **Repository** | [https://github.com/azmykn/RepoHarbor](https://github.com/azmykn/RepoHarbor) |

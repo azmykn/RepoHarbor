@@ -89,7 +89,9 @@ fn conflict_banner(data: &DrawerData, t: &Theme, app: &Entity<RepoHarborApp>) ->
     let first = paths.first().map(|p| p.to_string()).unwrap_or_default();
     let app_b = app.clone();
     let app_ide = app.clone();
+    let app_abort = app.clone();
     let repo_ide = repo.clone();
+    let repo_abort = repo.clone();
     let mut body = div()
         .flex()
         .flex_col()
@@ -154,6 +156,17 @@ fn conflict_banner(data: &DrawerData, t: &Theme, app: &Entity<RepoHarborApp>) ->
                 move |_win, cx: &mut App| {
                     let repo = repo_ide.clone();
                     app_ide.update(cx, |this, cx| this.open_in_ide(&repo, cx));
+                },
+            ))
+            .child(pr_btn(
+                SharedString::from("conflict-abort"),
+                "Abort merge",
+                t,
+                move |_win, cx: &mut App| {
+                    let repo = repo_abort.clone();
+                    app_abort.update(cx, |_this, cx| {
+                        super::abort_merge(repo, cx);
+                    });
                 },
             )),
     )

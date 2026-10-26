@@ -322,6 +322,140 @@ pub fn switch_branch(repo: SharedString, name: SharedString, cx: &mut Context<Re
     .detach();
 }
 
+/// Merge `source` branch into HEAD for `repo`.
+pub fn merge_branch(
+    repo: SharedString,
+    source: SharedString,
+    strategy: repoharbor_core::git_ops::MergeStrategy,
+    cx: &mut Context<RepoHarborApp>,
+) {
+    let (id, branch) = (repo.to_string(), source.to_string());
+    cx.spawn(async move |this, cx| {
+        let (outcome, loaded) = cx
+            .background_executor()
+            .spawn(async move {
+                let outcome = repoharbor_core::git_ops::merge_branch(&id, &branch, strategy, None);
+                let loaded = read_overview(&id);
+                (outcome, loaded)
+            })
+            .await;
+        store_overview(&this, cx, &repo, loaded);
+        let _ = this.update(cx, |this, cx| {
+            match outcome {
+                Ok(repoharbor_core::git_ops::MergeOutcome::FastForwarded { commits }) => {
+                    this.push_toast(
+                        crate::toast::ToastKind::Success,
+                        "Fast-forwarded",
+                        Some(
+                            format!(
+                                "Merged '{source}' ({commits} commit{})",
+                                if commits == 1 { "" } else { "s" }
+                            )
+                            .into(),
+                        ),
+                        cx,
+                    );
+                }
+                Ok(repoharbor_core::git_ops::MergeOutcome::Merged { summary }) => {
+                    this.push_toast(
+                        crate::toast::ToastKind::Success,
+                        "Merged branch",
+                        Some(summary.into()),
+                        cx,
+                    );
+                }
+                Ok(repoharbor_core::git_ops::MergeOutcome::Squashed { commits }) => {
+                    this.push_toast(
+                        crate::toast::ToastKind::Success,
+                        "Squashed changes",
+                        Some(
+                            format!("Squashed {commits} commit(s) from '{source}' into index")
+                                .into(),
+                        ),
+                        cx,
+                    );
+                }
+                Ok(repoharbor_core::git_ops::MergeOutcome::UpToDate) => {
+                    this.push_toast(
+                        crate::toast::ToastKind::Info,
+                        "Already up to date",
+                        Some(format!("Branch '{source}' is already merged into HEAD").into()),
+                        cx,
+                    );
+                }
+                Ok(repoharbor_core::git_ops::MergeOutcome::Conflict { files }) => {
+                    this.push_toast(
+                        crate::toast::ToastKind::Error,
+                        "Merge conflicts",
+                        Some(
+                            format!(
+                                "{} conflicting file(s) — open in IDE or diff tool",
+                                files.len()
+                            )
+                            .into(),
+                        ),
+                        cx,
+                    );
+                }
+                Err(e) => {
+                    this.push_toast(
+                        crate::toast::ToastKind::Error,
+                        "Merge failed",
+                        Some(e.into()),
+                        cx,
+                    );
+                }
+            }
+            load_changes(repo.clone(), cx);
+            load_work_meta(repo.clone(), cx);
+            this.rescan(cx);
+            cx.notify();
+        });
+    })
+    .detach();
+}
+
+/// Abort an in-progress merge for `repo`.
+pub fn abort_merge(repo: SharedString, cx: &mut Context<RepoHarborApp>) {
+    let id = repo.to_string();
+    cx.spawn(async move |this, cx| {
+        let (res, loaded) = cx
+            .background_executor()
+            .spawn(async move {
+                let res = repoharbor_core::git_ops::abort_merge(&id);
+                let loaded = read_overview(&id);
+                (res, loaded)
+            })
+            .await;
+        store_overview(&this, cx, &repo, loaded);
+        let _ = this.update(cx, |this, cx| {
+            match res {
+                Ok(()) => {
+                    this.push_toast(
+                        crate::toast::ToastKind::Success,
+                        "Merge aborted",
+                        Some("Working tree restored to pre-merge state".into()),
+                        cx,
+                    );
+                }
+                Err(e) => {
+                    this.push_toast(
+                        crate::toast::ToastKind::Error,
+                        "Abort failed",
+                        Some(e.into()),
+                        cx,
+                    );
+                }
+            }
+            load_changes(repo.clone(), cx);
+            load_work_meta(repo.clone(), cx);
+            this.rescan(cx);
+            cx.notify();
+        });
+    })
+    .detach();
+}
+
 /// Lazily load the repo's README (filesystem, sync) when the Readme tab opens.
 pub fn load_readme(repo: SharedString, cx: &mut Context<RepoHarborApp>) {
     let id = repo.to_string();
@@ -1496,6 +1630,35 @@ fn branch_picker_dropdown(
                         })
                         .child("checkout");
                     right = right.child(checkout_btn);
+
+                    let app_m = app.clone();
+                    let repo_m = repo.clone();
+                    let name_m = name.clone();
+                    let merge_btn = div()
+                        .id(SharedString::from(format!("quick-merge-{}", b.name)))
+                        .px(px(8.))
+                        .py(px(2.))
+                        .rounded(px(t.r_xs))
+                        .bg(rgb(t.button_bg))
+                        .border_1()
+                        .border_color(rgb(t.border))
+                        .text_color(rgb(t.fg1))
+                        .hover(|s| s.border_color(rgb(t.accent_bright)).text_color(rgb(t.fg0)))
+                        .on_click(move |_ev, _win, cx| {
+                            let (repo, name) = (repo_m.clone(), name_m.clone());
+                            app_m.update(cx, |this, cx| {
+                                this.drawer.branch_picker_open = false;
+                                merge_branch(
+                                    repo,
+                                    name,
+                                    repoharbor_core::git_ops::MergeStrategy::Auto,
+                                    cx,
+                                );
+                                cx.notify();
+                            });
+                        })
+                        .child("merge");
+                    right = right.child(merge_btn);
                 }
 
                 if !is_current {
@@ -1983,6 +2146,37 @@ fn branch_item(
                     });
                 })
                 .child("checkout"),
+        );
+        let app_m = app.clone();
+        let repo_m = repo.clone();
+        let name_m = b.name.clone();
+        item = item.child(
+            div()
+                .id(SharedString::from(format!("br-merge-{}", b.name)))
+                .px(px(7.))
+                .py(px(2.))
+                .rounded(px(t.r_xs))
+                .bg(rgb(checkout_bg))
+                .border_1()
+                .border_color(rgb(checkout_border))
+                .font_family(MONO)
+                .text_size(px(t.text_data_sm))
+                .text_color(rgb(checkout_fg))
+                .cursor_pointer()
+                .hover(move |s| s.border_color(rgb(hov_border)).text_color(rgb(hov_fg)))
+                .on_click(move |_ev, _win, cx| {
+                    let (repo, name) = (repo_m.clone(), name_m.clone());
+                    app_m.update(cx, |_this, cx| {
+                        merge_branch(
+                            repo,
+                            name,
+                            repoharbor_core::git_ops::MergeStrategy::Auto,
+                            cx,
+                        );
+                        cx.notify();
+                    });
+                })
+                .child("merge"),
         );
     }
     // Clicking anywhere on the row also switches branch.
