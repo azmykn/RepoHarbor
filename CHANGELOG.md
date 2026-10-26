@@ -5,12 +5,17 @@ All notable changes to [RepoHarbor](https://github.com/azmykn/RepoHarbor) by Dig
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project (upstream) uses calendar versioning (`YYYY.M.P`).
 
-## [Unreleased]
+## [2026.10.3] - 2026-10-26
 
 DigitsCode RepoHarbor — multi-repo workspaces (hundreds of checkouts across
 versioned trees, including nested submodule parents).
 
 ### Added
+
+- **Commit generation acceleration and Fast commit** — added smart diff compaction to strip noisy lockfiles/assets from AI context, lowered token generation budget to 160 tokens for 2x faster LLM responses, added automatic Conventional Commit scope extraction, and added a 0ms "Fast commit" button in the Changes drawer.
+- **Explicit checkout on branches** — added direct Checkout action to non-current branches in the drawer branch list.
+- **Commit activity sparkline** — added 14-day mini commit pulse in the drawer header.
+- **Smart search syntax** — added filter tokens (`is:dirty`, `is:behind`, `is:ahead`, `lang:`, `host:`, `root:`, etc.) and `/` quick shortcut.
 
 - **Stale settings are repaired on launch** — a missing IDE binary (for example `subl`) is rewritten to the first installed editor (`cursor`, `code`, `codium`, `zed`, `subl`, then `nvim` / `vim`, else `xdg-open`). A file-manager diff fallback is replaced when Cursor, VS Code, or Meld is installed. Scan roots whose directory no longer exists are dropped.
 - **Cleanup skips worktree checkouts** — a merged or gone branch that is checked out in a linked worktree is not offered for Prune (deleting it fails and the row used to stay with no error). A real delete failure now shows a toast.

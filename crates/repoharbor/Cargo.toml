@@ -3,7 +3,7 @@
 # that the legacy Tauri shell (src-tauri/) and React frontend are gone.
 [package]
 name = "repoharbor"
-version = "2026.10.2"
+version = "2026.10.3"
 edition = "2024"
 publish = false
 authors = ["Azmy Karam <azmykn@gmail.com>"]
