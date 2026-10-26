@@ -38,20 +38,39 @@ pub(super) fn view(
     col = col.child(stash_section(row, data, t, app));
     if let Some((path, _)) = &data.change_sel {
         let (app, repo, file) = (app.clone(), data.repo.clone(), path.clone());
-        col = col.child(pr_btn(
-            SharedString::from("blame-file"),
-            "Blame file",
-            t,
-            move |_win, cx: &mut App| {
-                let (repo, file) = (repo.clone(), file.clone());
-                app.update(cx, |this, cx| {
-                    this.drawer.blame_file = Some(file.clone());
-                    this.drawer.blame = BlameState::Loading;
-                    load_blame(repo, file, None, cx);
-                    cx.notify();
-                });
-            },
-        ));
+        let (app_diff, repo_diff, file_diff) = (app.clone(), repo.clone(), file.clone());
+        col = col.child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(8.))
+                .child(pr_btn(
+                    SharedString::from("blame-file"),
+                    "Blame file",
+                    t,
+                    move |_win, cx: &mut App| {
+                        let (repo, file) = (repo.clone(), file.clone());
+                        app.update(cx, |this, cx| {
+                            this.drawer.blame_file = Some(file.clone());
+                            this.drawer.blame = BlameState::Loading;
+                            load_blame(repo, file, None, cx);
+                            cx.notify();
+                        });
+                    },
+                ))
+                .child(pr_btn(
+                    SharedString::from("diff-file"),
+                    "Open in Diff tool",
+                    t,
+                    move |_win, cx: &mut App| {
+                        let (repo, file) = (repo_diff.clone(), file_diff.clone());
+                        app_diff.update(cx, |this, cx| {
+                            this.open_external_diff(&repo, Some(&file), cx);
+                        });
+                    },
+                )),
+        );
     }
     if data.blame_file.is_some() {
         col = col.child(blame_pane(data, t));
