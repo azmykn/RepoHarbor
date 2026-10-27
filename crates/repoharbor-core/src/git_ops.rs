@@ -182,6 +182,10 @@ pub(crate) fn status_of(repo: &Repository) -> GitStatus {
 
 /// Fetch the `origin` remote, then return refreshed git status.
 pub fn fetch(path: &str) -> Result<GitStatus, String> {
+    let path = crate::scan::expand(path);
+    let path = path
+        .to_str()
+        .ok_or_else(|| "invalid repository path".to_string())?;
     let repo = Repository::open(path).map_err(|e| e.to_string())?;
     if let Ok(mut remote) = repo.find_remote("origin") {
         let mut opts = FetchOptions::new();
@@ -309,6 +313,10 @@ pub fn pull_with_files(
     path: &str,
     rebase_if_diverged: bool,
 ) -> Result<(OpOutcome, Vec<String>), String> {
+    let path = crate::scan::expand(path);
+    let path = path
+        .to_str()
+        .ok_or_else(|| "invalid repository path".to_string())?;
     let repo = Repository::open(path).map_err(|e| e.to_string())?;
     if let Ok(mut remote) = repo.find_remote("origin") {
         let mut opts = FetchOptions::new();
@@ -1951,6 +1959,11 @@ pub fn commit_all(path: &str, message: &str) -> Result<String, String> {
 /// nothing is declared (callers map that to Skip). Any hard failure in a child
 /// fails the whole op with the combined summary.
 pub fn submodule_update(path: &str) -> Result<String, String> {
+    // Fleet / UI ids are absolute, but abbreviated `~/…` paths (or pasted
+    // roots) must expand before libgit2 / `Path::join` — otherwise open fails
+    // with `failed to open directory '~/…'` or `.gitmodules` is missed.
+    let path = crate::scan::expand(path);
+    let path = path.to_str().ok_or_else(|| "invalid repository path".to_string())?;
     let root = std::path::Path::new(path);
     if !root.join(".gitmodules").is_file() {
         return Err("no submodules".into());
@@ -2087,6 +2100,25 @@ fn submodule_target_branch(
     Ok(head.shorthand().map(String::from))
 }
 
+/// Fetch a single `origin/<branch>` tip.
+///
+/// Needed when the submodule remote uses a narrow refspec (e.g. only
+/// `+refs/heads/master:refs/remotes/origin/master`) so a configured
+/// `.gitmodules` `branch = 15.0` never appears after a default fetch.
+fn fetch_origin_branch(sub_path: &str, branch: &str) -> Result<(), String> {
+    let repo = Repository::open(sub_path).map_err(|e| e.to_string())?;
+    let mut remote = repo
+        .find_remote("origin")
+        .map_err(|_| "no 'origin' remote".to_string())?;
+    let mut opts = FetchOptions::new();
+    opts.remote_callbacks(remote_callbacks());
+    let refspec = format!("+refs/heads/{branch}:refs/remotes/origin/{branch}");
+    remote
+        .fetch(&[refspec.as_str()], Some(&mut opts), None)
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 /// Check out `branch` in the submodule without discarding dirty work.
 /// Creates a local tracking branch from `origin/<branch>` when needed.
 fn ensure_submodule_on_branch(sub_path: &str, branch: &str) -> Result<OpOutcome, String> {
@@ -2106,6 +2138,11 @@ fn ensure_submodule_on_branch(sub_path: &str, branch: &str) -> Result<OpOutcome,
     }
 
     let remote_ref = format!("refs/remotes/origin/{branch}");
+    if repo.find_reference(&remote_ref).is_err() {
+        // Narrow fetch refspecs omit non-default branches; pull the tip we need.
+        fetch_origin_branch(sub_path, branch)?;
+    }
+    let repo = Repository::open(sub_path).map_err(|e| e.to_string())?;
     let remote = repo
         .find_reference(&remote_ref)
         .map_err(|_| format!("branch '{branch}' not found locally or on origin"))?;
@@ -3275,6 +3312,24 @@ mod tests {
     fn submodule_update_skips_without_gitmodules() {
         let (_dir, path) = init_repo();
         assert_eq!(submodule_update(&path).unwrap_err(), "no submodules");
+    }
+
+    #[test]
+    fn submodule_update_expands_tilde_home_prefix() {
+        // Abbreviated UI paths must not be passed literally to libgit2.
+        let home = dirs::home_dir().expect("home");
+        let (_dir, abs) = init_repo();
+        let Ok(rel) = std::path::Path::new(&abs).strip_prefix(&home) else {
+            // Tempdir outside $HOME (rare CI layout) — expand still a no-op for abs.
+            assert_eq!(submodule_update(&abs).unwrap_err(), "no submodules");
+            return;
+        };
+        let tilde = format!("~/{}", rel.display());
+        assert_eq!(
+            submodule_update(&tilde).unwrap_err(),
+            "no submodules",
+            "tilde path must expand to the real repo directory"
+        );
     }
 
     #[test]
