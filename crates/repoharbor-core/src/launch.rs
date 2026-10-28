@@ -73,6 +73,50 @@ pub fn open(target: &str) -> Result<(), String> {
         .map_err(|e| format!("failed to open `{target}`: {e}"))
 }
 
+/// Open the folder containing `path` in the system file manager.
+/// If `path` is an existing file, first attempts to highlight/select it via D-Bus
+/// `org.freedesktop.FileManager1.ShowItems`. Falls back to `open` on the parent directory.
+pub fn open_location(path: &str) -> Result<(), String> {
+    let p = std::path::Path::new(path);
+    if p.is_dir() {
+        return open(path);
+    }
+    let parent = p.parent().unwrap_or(p);
+    let parent_str = parent.to_string_lossy().to_string();
+
+    if p.is_file() {
+        let abs = if p.is_absolute() {
+            p.to_path_buf()
+        } else if let Ok(canon) = p.canonicalize() {
+            canon
+        } else {
+            p.to_path_buf()
+        };
+        let uri = format!("file://{}", abs.to_string_lossy());
+        let res = Command::new("dbus-send")
+            .args([
+                "--session",
+                "--dest=org.freedesktop.FileManager1",
+                "--type=method_call",
+                "/org/freedesktop/FileManager1",
+                "org.freedesktop.FileManager1.ShowItems",
+                &format!("array:string:{uri}"),
+                "string:",
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+        if let Ok(status) = res {
+            if status.success() {
+                return Ok(());
+            }
+        }
+    }
+
+    open(&parent_str)
+}
+
 #[cfg(test)]
 mod tests {
     use super::dispatch_tokens;

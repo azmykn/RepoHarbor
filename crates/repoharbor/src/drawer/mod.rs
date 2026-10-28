@@ -2740,8 +2740,77 @@ fn change_item(
         .is_some_and(|(p, s)| *p == c.path && *s == c.staged);
     let (letter, color) = kind_badge(c.kind, t);
 
+    let full_path = std::path::Path::new(repo.as_ref())
+        .join(c.path.as_ref())
+        .to_string_lossy()
+        .to_string();
+    let rel_path = c.path.to_string();
+    let file_name = std::path::Path::new(c.path.as_ref())
+        .file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| c.path.to_string());
+
+    let open_btn = {
+        let (app, path) = (app.clone(), full_path.clone());
+        div()
+            .id(SharedString::from(format!(
+                "chg-open-{}-{}",
+                c.staged, c.path
+            )))
+            .flex()
+            .items_center()
+            .justify_center()
+            .w(px(22.))
+            .h(px(22.))
+            .rounded(px(t.r_xs))
+            .cursor_pointer()
+            .hover(|s| s.bg(rgb(t.surface_hover)))
+            .child(lucide("external-link", 12., t.fg3))
+            .on_click(move |_ev, _win, cx| {
+                cx.stop_propagation();
+                let path = path.clone();
+                app.update(cx, |this, cx| {
+                    if let Err(e) = launch::open(&path) {
+                        this.push_toast(ToastKind::Error, "Couldn't open file", Some(e.into()), cx);
+                    }
+                });
+            })
+    };
+
+    let loc_btn = {
+        let (app, path) = (app.clone(), full_path.clone());
+        div()
+            .id(SharedString::from(format!(
+                "chg-loc-{}-{}",
+                c.staged, c.path
+            )))
+            .flex()
+            .items_center()
+            .justify_center()
+            .w(px(22.))
+            .h(px(22.))
+            .rounded(px(t.r_xs))
+            .cursor_pointer()
+            .hover(|s| s.bg(rgb(t.surface_hover)))
+            .child(lucide("folder-open", 12., t.fg3))
+            .on_click(move |_ev, _win, cx| {
+                cx.stop_propagation();
+                let path = path.clone();
+                app.update(cx, |this, cx| {
+                    if let Err(e) = launch::open_location(&path) {
+                        this.push_toast(
+                            ToastKind::Error,
+                            "Couldn't open location",
+                            Some(e.into()),
+                            cx,
+                        );
+                    }
+                });
+            })
+    };
+
     let copy_btn = {
-        let (app, path) = (app.clone(), c.path.to_string());
+        let (app, path) = (app.clone(), full_path.clone());
         div()
             .id(SharedString::from(format!(
                 "chg-copy-{}-{}",
@@ -2758,7 +2827,7 @@ fn change_item(
             .child(lucide("copy", 12., t.fg3))
             .on_click(move |_ev, _win, cx| {
                 cx.stop_propagation();
-                copy_text(&app, path.clone(), "Path copied", cx);
+                copy_text(&app, path.clone(), "Full path copied", cx);
             })
     };
 
@@ -2814,6 +2883,8 @@ fn change_item(
                 .text_color(rgb(if selected { t.fg0 } else { t.fg1 }))
                 .child(c.path.clone()),
         )
+        .child(open_btn)
+        .child(loc_btn)
         .child(copy_btn)
         .child(action);
     let row = if selected {
@@ -2822,16 +2893,73 @@ fn change_item(
         row.hover(|s| s.bg(rgb(t.surface_hover)))
     };
     let (app_click, path_click, staged) = (app.clone(), c.path.clone(), c.staged);
-    let (app_menu, path_menu) = (app.clone(), c.path.to_string());
+    let (app_menu, full_path_menu, rel_path_menu, file_name_menu) = (
+        app.clone(),
+        full_path.clone(),
+        rel_path.clone(),
+        file_name.clone(),
+    );
     row.on_click(move |_ev, _win, cx| {
         let path = path_click.clone();
         app_click.update(cx, |this, cx| select_change(this, path, staged, cx));
     })
     .context_menu(move |menu, _win, _cx| {
-        let (app, path) = (app_menu.clone(), path_menu.clone());
+        let (app_open, path_open) = (app_menu.clone(), full_path_menu.clone());
+        let (app_ide, path_ide) = (app_menu.clone(), full_path_menu.clone());
+        let (app_loc, path_loc) = (app_menu.clone(), full_path_menu.clone());
+        let (app_cp_full, path_full) = (app_menu.clone(), full_path_menu.clone());
+        let (app_cp_rel, path_rel) = (app_menu.clone(), rel_path_menu.clone());
+        let (app_cp_name, path_name) = (app_menu.clone(), file_name_menu.clone());
         menu.item(
-            PopupMenuItem::new("Copy path").on_click(move |_win, _w, cx| {
-                copy_text(&app, path.clone(), "Path copied", cx);
+            PopupMenuItem::new("Open file").on_click(move |_win, _w, cx| {
+                let path = path_open.clone();
+                app_open.update(cx, |this, cx| {
+                    if let Err(e) = launch::open(&path) {
+                        this.push_toast(ToastKind::Error, "Couldn't open file", Some(e.into()), cx);
+                    }
+                });
+            }),
+        )
+        .item(
+            PopupMenuItem::new("Open in IDE").on_click(move |_win, _w, cx| {
+                let path = path_ide.clone();
+                app_ide.update(cx, |this, cx| {
+                    let cmd = this.config.ide_command.clone();
+                    if let Err(e) = launch::launch(&cmd, &path) {
+                        this.push_toast(ToastKind::Error, "Couldn't open IDE", Some(e.into()), cx);
+                    }
+                });
+            }),
+        )
+        .item(
+            PopupMenuItem::new("Open location").on_click(move |_win, _w, cx| {
+                let path = path_loc.clone();
+                app_loc.update(cx, |this, cx| {
+                    if let Err(e) = launch::open_location(&path) {
+                        this.push_toast(
+                            ToastKind::Error,
+                            "Couldn't open location",
+                            Some(e.into()),
+                            cx,
+                        );
+                    }
+                });
+            }),
+        )
+        .separator()
+        .item(
+            PopupMenuItem::new("Copy full path").on_click(move |_win, _w, cx| {
+                copy_text(&app_cp_full, path_full.clone(), "Full path copied", cx);
+            }),
+        )
+        .item(
+            PopupMenuItem::new("Copy relative path").on_click(move |_win, _w, cx| {
+                copy_text(&app_cp_rel, path_rel.clone(), "Relative path copied", cx);
+            }),
+        )
+        .item(
+            PopupMenuItem::new("Copy file name").on_click(move |_win, _w, cx| {
+                copy_text(&app_cp_name, path_name.clone(), "File name copied", cx);
             }),
         )
     })
@@ -2857,9 +2985,103 @@ fn diff_pane(repo: SharedString, data: &DrawerData, t: &Theme, app: &Entity<Repo
                 .truncate()
                 .child(SharedString::from(format!("· {path} ({side})"))),
         );
-        // Copy path + Copy diff — GPUI SharedString children aren't drag-
-        // selectable, so explicit clipboard affordances (same as Settings).
-        let (app_path, path_copy) = (app.clone(), path.to_string());
+        let full_path = std::path::Path::new(repo.as_ref())
+            .join(path.as_ref())
+            .to_string_lossy()
+            .to_string();
+
+        // Open file button
+        let (app_open, path_open) = (app.clone(), full_path.clone());
+        head = head.child(
+            div()
+                .id(SharedString::from(format!(
+                    "diff-open-file-{staged}-{path}"
+                )))
+                .flex()
+                .items_center()
+                .justify_center()
+                .w(px(22.))
+                .h(px(22.))
+                .rounded(px(t.r_xs))
+                .cursor_pointer()
+                .hover(|s| s.bg(rgb(t.surface_hover)))
+                .child(lucide("external-link", 12., t.fg3))
+                .on_click(move |_ev, _win, cx| {
+                    let path = path_open.clone();
+                    app_open.update(cx, |this, cx| {
+                        if let Err(e) = launch::open(&path) {
+                            this.push_toast(
+                                ToastKind::Error,
+                                "Couldn't open file",
+                                Some(e.into()),
+                                cx,
+                            );
+                        }
+                    });
+                }),
+        );
+
+        // Open in IDE button
+        let (app_ide, path_ide) = (app.clone(), full_path.clone());
+        head = head.child(
+            div()
+                .id(SharedString::from(format!("diff-open-ide-{staged}-{path}")))
+                .flex()
+                .items_center()
+                .justify_center()
+                .w(px(22.))
+                .h(px(22.))
+                .rounded(px(t.r_xs))
+                .cursor_pointer()
+                .hover(|s| s.bg(rgb(t.surface_hover)))
+                .child(lucide("code", 12., t.fg3))
+                .on_click(move |_ev, _win, cx| {
+                    let path = path_ide.clone();
+                    app_ide.update(cx, |this, cx| {
+                        let cmd = this.config.ide_command.clone();
+                        if let Err(e) = launch::launch(&cmd, &path) {
+                            this.push_toast(
+                                ToastKind::Error,
+                                "Couldn't open IDE",
+                                Some(e.into()),
+                                cx,
+                            );
+                        }
+                    });
+                }),
+        );
+
+        // Open location button
+        let (app_loc, path_loc) = (app.clone(), full_path.clone());
+        head = head.child(
+            div()
+                .id(SharedString::from(format!("diff-open-loc-{staged}-{path}")))
+                .flex()
+                .items_center()
+                .justify_center()
+                .w(px(22.))
+                .h(px(22.))
+                .rounded(px(t.r_xs))
+                .cursor_pointer()
+                .hover(|s| s.bg(rgb(t.surface_hover)))
+                .child(lucide("folder-open", 12., t.fg3))
+                .on_click(move |_ev, _win, cx| {
+                    let path = path_loc.clone();
+                    app_loc.update(cx, |this, cx| {
+                        if let Err(e) = launch::open_location(&path) {
+                            this.push_toast(
+                                ToastKind::Error,
+                                "Couldn't open location",
+                                Some(e.into()),
+                                cx,
+                            );
+                        }
+                    });
+                }),
+        );
+
+        // Copy full path
+        let (app_path, path_copy) = (app.clone(), full_path.clone());
         head = head.child(
             div()
                 .id(SharedString::from(format!(
@@ -2875,7 +3097,7 @@ fn diff_pane(repo: SharedString, data: &DrawerData, t: &Theme, app: &Entity<Repo
                 .hover(|s| s.bg(rgb(t.surface_hover)))
                 .child(lucide("copy", 12., t.fg3))
                 .on_click(move |_ev, _win, cx| {
-                    copy_text(&app_path, path_copy.clone(), "Path copied", cx);
+                    copy_text(&app_path, path_copy.clone(), "Full path copied", cx);
                 }),
         );
         let can_copy_diff = matches!(&data.diff, DiffState::Ready(h) if !h.is_empty());
@@ -3019,20 +3241,84 @@ fn diff_block(
         budget = budget.saturating_sub(hunk.lines.len());
     }
     let (app_menu, repo_menu, path_menu) = (app.clone(), repo.clone(), path.clone());
+    let full_path_menu = std::path::Path::new(repo.as_ref())
+        .join(path.as_ref())
+        .to_string_lossy()
+        .to_string();
+    let rel_path_menu = path.to_string();
+    let file_name_menu = std::path::Path::new(path.as_ref())
+        .file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| path.to_string());
+
     block.context_menu(move |menu, _win, _cx| {
-        let (app, repo, path) = (app_menu.clone(), repo_menu.clone(), path_menu.clone());
+        let (app_open, path_open) = (app_menu.clone(), full_path_menu.clone());
+        let (app_ide, path_ide) = (app_menu.clone(), full_path_menu.clone());
+        let (app_loc, path_loc) = (app_menu.clone(), full_path_menu.clone());
+        let (app_cp_full, path_full) = (app_menu.clone(), full_path_menu.clone());
+        let (app_cp_rel, path_rel) = (app_menu.clone(), rel_path_menu.clone());
+        let (app_cp_name, path_name) = (app_menu.clone(), file_name_menu.clone());
+        let (app_d, repo_d, path_d) = (app_menu.clone(), repo_menu.clone(), path_menu.clone());
+
         menu.item(
-            PopupMenuItem::new("Copy diff").on_click(move |_w, _win, cx| {
-                let (repo, path) = (repo.clone(), path.clone());
-                app.update(cx, |_this, cx| copy_file_diff(repo, path, staged, cx));
+            PopupMenuItem::new("Open file").on_click(move |_win, _w, cx| {
+                let path = path_open.clone();
+                app_open.update(cx, |this, cx| {
+                    if let Err(e) = launch::open(&path) {
+                        this.push_toast(ToastKind::Error, "Couldn't open file", Some(e.into()), cx);
+                    }
+                });
             }),
         )
-        .item({
-            let (app, path) = (app_menu.clone(), path_menu.to_string());
-            PopupMenuItem::new("Copy path").on_click(move |_w, _win, cx| {
-                copy_text(&app, path.clone(), "Path copied", cx);
-            })
-        })
+        .item(
+            PopupMenuItem::new("Open in IDE").on_click(move |_win, _w, cx| {
+                let path = path_ide.clone();
+                app_ide.update(cx, |this, cx| {
+                    let cmd = this.config.ide_command.clone();
+                    if let Err(e) = launch::launch(&cmd, &path) {
+                        this.push_toast(ToastKind::Error, "Couldn't open IDE", Some(e.into()), cx);
+                    }
+                });
+            }),
+        )
+        .item(
+            PopupMenuItem::new("Open location").on_click(move |_win, _w, cx| {
+                let path = path_loc.clone();
+                app_loc.update(cx, |this, cx| {
+                    if let Err(e) = launch::open_location(&path) {
+                        this.push_toast(
+                            ToastKind::Error,
+                            "Couldn't open location",
+                            Some(e.into()),
+                            cx,
+                        );
+                    }
+                });
+            }),
+        )
+        .separator()
+        .item(
+            PopupMenuItem::new("Copy full path").on_click(move |_w, _win, cx| {
+                copy_text(&app_cp_full, path_full.clone(), "Full path copied", cx);
+            }),
+        )
+        .item(
+            PopupMenuItem::new("Copy relative path").on_click(move |_w, _win, cx| {
+                copy_text(&app_cp_rel, path_rel.clone(), "Relative path copied", cx);
+            }),
+        )
+        .item(
+            PopupMenuItem::new("Copy file name").on_click(move |_w, _win, cx| {
+                copy_text(&app_cp_name, path_name.clone(), "File name copied", cx);
+            }),
+        )
+        .separator()
+        .item(
+            PopupMenuItem::new("Copy diff").on_click(move |_w, _win, cx| {
+                let (repo, path) = (repo_d.clone(), path_d.clone());
+                app_d.update(cx, |_this, cx| copy_file_diff(repo, path, staged, cx));
+            }),
+        )
     })
 }
 

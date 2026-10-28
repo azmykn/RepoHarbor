@@ -5,6 +5,25 @@ All notable changes to [RepoHarbor](https://github.com/azmykn/RepoHarbor) by Dig
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project (upstream) uses calendar versioning (`YYYY.M.P`).
 
+## [2026.10.8] - 2026-10-29
+
+DigitsCode RepoHarbor — multi-repo workspaces (hundreds of checkouts across
+versioned trees, including nested submodule parents).
+
+### Added
+
+- **File Path Copy & Launch Actions in Drawer**:
+  - **Full Absolute Path by Default**: The inline copy button on modified file rows and the diff pane header now copies the full absolute path of the file on disk, rather than just the relative file name.
+  - **Comprehensive Context Menu**: Right-clicking any change row or diff block now provides:
+    - `Open file`: Launches the file directly with the system default application (`xdg-open`).
+    - `Open in IDE`: Opens the specific file in the user-configured IDE (`ideCommand`, e.g. Cursor, VS Code, Zed).
+    - `Open location`: Opens the containing folder in the system file manager and reveals/selects the file via D-Bus (`org.freedesktop.FileManager1.ShowItems`), safely falling back to opening the parent folder.
+    - `Copy full path`: Puts the absolute file path on clipboard.
+    - `Copy relative path`: Puts the repository-relative path on clipboard.
+    - `Copy file name`: Puts the bare filename on clipboard.
+    - `Copy diff`: (In diff view) copies unified diff patch.
+  - **Inline Action Buttons**: Added quick-access inline buttons (`Open file`, `Open location`, `Copy path`) directly on the file change rows and in the Diff pane header.
+
 ## [2026.10.7] - 2026-10-26
 
 DigitsCode RepoHarbor — multi-repo workspaces (hundreds of checkouts across

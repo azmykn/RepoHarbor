@@ -1963,7 +1963,9 @@ pub fn submodule_update(path: &str) -> Result<String, String> {
     // roots) must expand before libgit2 / `Path::join` — otherwise open fails
     // with `failed to open directory '~/…'` or `.gitmodules` is missed.
     let path = crate::scan::expand(path);
-    let path = path.to_str().ok_or_else(|| "invalid repository path".to_string())?;
+    let path = path
+        .to_str()
+        .ok_or_else(|| "invalid repository path".to_string())?;
     let root = std::path::Path::new(path);
     if !root.join(".gitmodules").is_file() {
         return Err("no submodules".into());
