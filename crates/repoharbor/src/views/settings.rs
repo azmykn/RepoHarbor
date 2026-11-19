@@ -190,14 +190,13 @@ impl SettingsState {
     }
 }
 
-const SETTINGS_TITLES: [(&str, &str); 7] = [
+const SETTINGS_TITLES: [(&str, &str); 6] = [
     ("roots", "Workspace & Roots"),
     ("account", "GitHub Account"),
     ("launchers", "Launchers & Terminal"),
     ("ai", "AI & Providers"),
     ("notifications", "Notifications & System"),
     ("about", "About & License"),
-    ("all", "All Sections"),
 ];
 
 #[allow(clippy::too_many_arguments)]
@@ -215,8 +214,10 @@ pub fn render(
     t: &Theme,
     app: &Entity<RepoHarborApp>,
 ) -> impl IntoElement {
-    let active_tab = filter.unwrap_or("roots");
-    let show = |sec: &str| active_tab == "all" || active_tab == sec;
+    let active_tab = filter
+        .filter(|tab| SETTINGS_TITLES.iter().any(|(id, _)| id == tab))
+        .unwrap_or("roots");
+    let show = |sec: &str| active_tab == sec;
 
     let mut sections: Vec<gpui::AnyElement> = Vec::new();
     if show("roots") {
@@ -2547,6 +2548,7 @@ fn about_metric_tile(
     div()
         .flex_1()
         .min_w(px(150.))
+        .min_w_0()
         .p(px(10.))
         .rounded(px(t.r_sm))
         .bg(rgb(t.page))
@@ -2563,6 +2565,7 @@ fn about_metric_tile(
         )
         .child(
             div()
+                .truncate()
                 .font_family("monospace")
                 .text_size(px(t.text_data_sm))
                 .font_weight(FontWeight::MEDIUM)
@@ -2895,7 +2898,7 @@ fn about_product(
         install_kind.label()
     );
 
-    section(t, "Product overview")
+    section(t, "Product")
         .child(
             div()
                 .flex()
@@ -2904,20 +2907,22 @@ fn about_product(
                 .gap(px(14.))
                 .child(
                     div()
-                        .w(px(46.))
-                        .h(px(46.))
+                        .w(px(44.))
+                        .h(px(44.))
                         .rounded(px(t.r_md))
                         .bg(rgb(t.accent_wash))
                         .border_1()
                         .border_color(rgb(t.primary))
                         .flex()
+                        .flex_none()
                         .items_center()
                         .justify_center()
-                        .child(lucide("harbor", 24., t.primary)),
+                        .child(lucide("harbor", 22., t.primary)),
                 )
                 .child(
                     div()
                         .flex_1()
+                        .min_w_0()
                         .flex()
                         .flex_col()
                         .gap(px(4.))
@@ -2964,59 +2969,14 @@ fn about_product(
                                     t,
                                 )),
                         )
-                        .child(
-                            div()
-                                .text_size(px(t.text_small))
-                                .text_color(rgb(t.fg1))
-                                .child(format!("Published by {}", id::PUBLISHER)),
-                        ),
+                        .child(note_line(
+                            SharedString::from(
+                                "Native GPU-rendered git fleet command center across Linux, macOS, and Windows.",
+                            ),
+                            t.fg2,
+                            t,
+                        )),
                 ),
-        )
-        .child(note_line(
-            SharedString::from(
-                "Every repo at harbor — a native GPU-rendered command center for managing multi-repository git fleets, nested submodules, GitHub/GitLab reviews & CI, multi-provider AI failover, and interactive PTY terminals across Linux, macOS, and Windows.",
-            ),
-            t.fg2,
-            t,
-        ))
-        .child(
-            div()
-                .flex()
-                .flex_row()
-                .flex_wrap()
-                .gap(px(6.))
-                .child(about_pill_badge(
-                    Some("git-branch"),
-                    "Fleet Git & Submodules",
-                    t.fg1,
-                    t.page,
-                    t.border,
-                    t,
-                ))
-                .child(about_pill_badge(
-                    Some("git-pull-request"),
-                    "GitHub & GitLab PR/CI",
-                    t.fg1,
-                    t.page,
-                    t.border,
-                    t,
-                ))
-                .child(about_pill_badge(
-                    Some("sparkles"),
-                    "Local & Cloud AI Pool",
-                    t.fg1,
-                    t.page,
-                    t.border,
-                    t,
-                ))
-                .child(about_pill_badge(
-                    Some("square-terminal"),
-                    "Embedded VT100 PTY Dock",
-                    t.fg1,
-                    t.page,
-                    t.border,
-                    t,
-                )),
         )
         .child(
             div()
@@ -3024,25 +2984,15 @@ fn about_product(
                 .flex_row()
                 .flex_wrap()
                 .gap(px(8.))
-                .child(button_id("btn-about-repo", "Open repository", t, |_cx| {
+                .child(button_id("btn-about-docs", "Documentation", t, |_cx| {
+                    let _ = repoharbor_core::launch::open(id::DOCS_URL);
+                }))
+                .child(button_id("btn-about-changelog", "Changelog", t, |_cx| {
+                    let _ = repoharbor_core::launch::open(id::CHANGELOG_URL);
+                }))
+                .child(button_id("btn-about-repo", "GitHub Repository", t, |_cx| {
                     let _ = repoharbor_core::launch::open(id::REPOSITORY);
                 }))
-                .child(button_id(
-                    "btn-about-docs",
-                    "Open documentation",
-                    t,
-                    |_cx| {
-                        let _ = repoharbor_core::launch::open(id::DOCS_URL);
-                    },
-                ))
-                .child(button_id(
-                    "btn-about-changelog",
-                    "Open changelog",
-                    t,
-                    |_cx| {
-                        let _ = repoharbor_core::launch::open(id::CHANGELOG_URL);
-                    },
-                ))
                 .child(button_id(
                     "btn-about-copy-sysinfo",
                     "Copy system info",
@@ -3057,7 +3007,6 @@ fn about_product(
 fn about_contact(t: &Theme) -> impl IntoElement {
     use crate::identity as id;
     let issues_url = format!("{}/issues", id::REPOSITORY.trim_end_matches('/'));
-    let issues_url_open = issues_url.clone();
 
     section(t, "Publisher & support")
         .child(
@@ -3070,18 +3019,11 @@ fn about_contact(t: &Theme) -> impl IntoElement {
                 .bg(rgb(t.page))
                 .border_1()
                 .border_color(rgb(t.border))
-                .child(about_value_row("Organization", id::PUBLISHER, t))
+                .child(about_value_row("Publisher", "DigitsCode", t))
+                .child(about_value_row("Legal entity", id::PUBLISHER, t))
                 .child(about_value_row("Website", id::WEBSITE, t))
-                .child(about_value_row("Support Email", id::CONTACT_EMAIL, t))
-                .child(about_value_row("Issue Tracker", &issues_url, t)),
+                .child(about_value_row("Support", id::CONTACT_EMAIL, t)),
         )
-        .child(note_line(
-            SharedString::from(
-                "For enterprise support, feature requests, or bug reports, reach out via the DigitsCode website, support email, or GitHub issue tracker.",
-            ),
-            t.fg3,
-            t,
-        ))
         .child(
             div()
                 .flex()
@@ -3097,9 +3039,14 @@ fn about_contact(t: &Theme) -> impl IntoElement {
                 .child(button_id("btn-about-copy-email", "Copy email", t, |cx| {
                     cx.write_to_clipboard(ClipboardItem::new_string(id::CONTACT_EMAIL.to_string()));
                 }))
-                .child(button_id("btn-about-issues", "Report an issue", t, move |_cx| {
-                    let _ = repoharbor_core::launch::open(&issues_url_open);
-                })),
+                .child(button_id(
+                    "btn-about-issues",
+                    "Report issue",
+                    t,
+                    move |_cx| {
+                        let _ = repoharbor_core::launch::open(&issues_url);
+                    },
+                )),
         )
 }
 
@@ -3111,99 +3058,44 @@ fn about_license(t: &Theme) -> impl IntoElement {
         id::REPOSITORY.trim_end_matches('/')
     );
 
-    section(t, "License, rights & attribution")
+    section(t, "License & attribution")
         .child(
             div()
                 .flex()
-                .flex_row()
-                .flex_wrap()
-                .items_center()
+                .flex_col()
                 .gap(px(8.))
-                .child(about_pill_badge(
-                    Some("circle-check"),
-                    format!("{} License", id::LICENSE_SPDX),
-                    t.clean,
-                    t.page,
-                    t.border,
-                    t,
-                ))
-                .child(about_pill_badge(
-                    Some("globe"),
-                    "Open Source · Public Use",
-                    t.primary,
-                    t.accent_wash,
-                    t.primary,
-                    t,
-                )),
-        )
-        .child(
-            div()
-                .text_size(px(t.text_small))
-                .font_weight(FontWeight::MEDIUM)
-                .text_color(rgb(t.fg0))
-                .child(SharedString::from(format!(
-                    "© {} {}",
-                    id::COPYRIGHT_YEAR,
-                    id::PUBLISHER
-                ))),
-        )
-        .child(
-            div()
-                .flex()
-                .flex_row()
-                .flex_wrap()
-                .gap(px(6.))
-                .child(about_pill_badge(
-                    Some("check"),
-                    "Commercial use",
-                    t.fg1,
-                    t.page,
-                    t.border,
-                    t,
-                ))
-                .child(about_pill_badge(
-                    Some("check"),
-                    "Modification",
-                    t.fg1,
-                    t.page,
-                    t.border,
-                    t,
-                ))
-                .child(about_pill_badge(
-                    Some("check"),
-                    "Distribution",
-                    t.fg1,
-                    t.page,
-                    t.border,
-                    t,
-                ))
-                .child(about_pill_badge(
-                    Some("check"),
-                    "Private use",
-                    t.fg1,
-                    t.page,
-                    t.border,
-                    t,
-                )),
-        )
-        .child(note_line(SharedString::from(id::PUBLIC_USE), t.fg2, t))
-        .child(
-            div()
-                .p(px(10.))
+                .p(px(12.))
                 .rounded(px(t.r_sm))
                 .bg(rgb(t.page))
                 .border_1()
                 .border_color(rgb(t.border))
-                .flex()
-                .flex_col()
-                .gap(px(4.))
                 .child(
                     div()
-                        .text_size(px(t.text_data_sm))
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(rgb(t.fg2))
-                        .child("UPSTREAM ATTRIBUTION"),
+                        .flex()
+                        .flex_row()
+                        .flex_wrap()
+                        .items_center()
+                        .gap(px(8.))
+                        .child(about_pill_badge(
+                            Some("circle-check"),
+                            format!("{} License", id::LICENSE_SPDX),
+                            t.clean,
+                            t.surface,
+                            t.border,
+                            t,
+                        ))
+                        .child(
+                            div()
+                                .text_size(px(t.text_small))
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_color(rgb(t.fg0))
+                                .child(SharedString::from(format!(
+                                    "© {} DigitsCode",
+                                    id::COPYRIGHT_YEAR
+                                ))),
+                        ),
                 )
+                .child(note_line(SharedString::from(id::PUBLIC_USE), t.fg2, t))
                 .child(note_line(SharedString::from(id::UPSTREAM_CREDIT), t.fg3, t)),
         )
         .child(
@@ -3235,12 +3127,21 @@ fn about_value_row(label: &str, value: &str, t: &Theme) -> impl IntoElement {
     div()
         .flex()
         .flex_row()
-        .items_baseline()
-        .justify_between()
+        .items_center()
         .gap(px(12.))
-        .child(field_label(label, t))
         .child(
             div()
+                .w(px(92.))
+                .flex_none()
+                .text_size(px(t.text_data_sm))
+                .text_color(rgb(t.fg3))
+                .child(SharedString::from(label.to_string())),
+        )
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .truncate()
                 .font_family("monospace")
                 .text_size(px(t.text_data_sm))
                 .text_color(rgb(t.fg0))

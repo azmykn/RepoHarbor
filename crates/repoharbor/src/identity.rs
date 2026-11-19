@@ -30,7 +30,8 @@ pub const LICENSE_SPDX: &str = "MIT";
 pub const UPSTREAM_CREDIT: &str = "Includes software originally published as Orrery by Seb Burrell (MIT). This is an independent DigitsCode product, not an official fork continuation.";
 
 /// Short public-use summary (not a substitute for LICENSE).
-pub const PUBLIC_USE: &str = "Released under the MIT License for public use: you may use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies, provided the copyright and permission notices in LICENSE are retained.";
+pub const PUBLIC_USE: &str =
+    "Open-source under the MIT License for commercial, personal, and internal use.";
 
 #[cfg(test)]
 mod tests {

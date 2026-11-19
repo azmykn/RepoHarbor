@@ -6493,7 +6493,6 @@ impl RepoHarborApp {
                     "About & License".into(),
                     None,
                 ),
-                (Some("all".into()), "settings", "All Sections".into(), None),
             ],
         )
     }
