@@ -12,7 +12,8 @@ RepoHarbor includes a built-in, GPU-rendered interactive PTY terminal dock (`por
 
 - **Full ANSI 16/256/Truecolor & Scrollback**: Scroll back with the mouse wheel and snap back via the floating **Jump to bottom** pill.
 - **Zero-Drift Cursor Alignment**: Cursor bounds are measured directly through GPUI's `TextSystem` shaper on the active monospace font.
-- **Clipboard & Interrupts**: Use **Copy** (<kbd>Ctrl+Shift+C</kbd>), **Paste** (<kbd>Ctrl+Shift+V</kbd>), **Clear**, and **Ctrl+C** (`SIGINT`) buttons in the dock bar.
+- **Mouse Selection & Copy**: Drag across text to highlight any character or multi-line range, **double-click** to select a word/token, or **triple-click** to select an entire line. Copy your selection with <kbd>Ctrl+C</kbd> (when text is selected; otherwise <kbd>Ctrl+C</kbd> sends `SIGINT`), <kbd>Ctrl+Shift+C</kbd>, the **`Copy sel`** dock button, or **right-click**.
+- **Clipboard & Interrupts**: Use **Copy** / **Copy sel** (<kbd>Ctrl+Shift+C</kbd>), **Paste** (<kbd>Ctrl+Shift+V</kbd>), **Clear**, and **Ctrl+C** (`SIGINT`) buttons in the dock bar.
 - **Quick Command Bar (`$`)**: Type any command and click **Run** (executes immediately) or **Paste** (stages on the shell prompt). When viewing **Action Log**, running a command opens or focuses an interactive shell tab automatically.
 
 ## Live `Action Log` Tab

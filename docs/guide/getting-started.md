@@ -20,7 +20,7 @@ On first launch, RepoHarbor automatically scans common workspace folders (`~/odo
 
 ## Periodic updates
 
-- **In-app:** When a new version lands on GitHub Releases, an `↑ vYYYY.M.P` badge appears in the title bar. Open **Settings → About → Updates** and click **Update & Restart**.
+- **In-app:** When a new version lands on GitHub Releases, both an **`Update <tag>`** button in the top header bar and an `↑ vYYYY.M.P` badge in the title bar appear. Click **`Update <tag>`** (or open **Settings → About → Updates & installation** and click **Update & Restart**) for a SHA-256 verified atomic update.
 - **CLI:** Run `repoharbor update` anytime (supports `--check` and `--quiet`). Binary installs verify SHA-256 checksums and atomically swap `~/.local/bin/repoharbor` while running; source installs pull and rebuild `--release`.
 
 ## Install a release package

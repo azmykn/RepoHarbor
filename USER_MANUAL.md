@@ -101,7 +101,7 @@ Click any repository row or card to open its inspection drawer:
 ## 6. Embedded PTY Terminal & Live Action Log
 
 - Toggle with **<kbd>Ctrl+\`</kbd>** or the top-right **Terminal** button.
-- **Multi-Tab Interactive PTY**: Spawn repository-scoped shells (`+ New` / `Ctrl+Shift+T`), close (`Ctrl+Shift+W`), drag-resize splitter, Expand/Restore, Copy (`Ctrl+Shift+C`), Paste (`Ctrl+Shift+V`), `Ctrl+C` (`SIGINT`), Clear, and scrollback with **Jump to bottom**.
+- **Multi-Tab Interactive PTY**: Spawn repository-scoped shells (`+ New` / `Ctrl+Shift+T`), close (`Ctrl+Shift+W`), drag-resize splitter, Expand/Restore, mouse drag / double-click word / triple-click line selection (copy with `Ctrl+C` while selected, `Ctrl+Shift+C`, **`Copy sel`**, or **right-click**), Paste (`Ctrl+Shift+V`), `Ctrl+C` (`SIGINT`), Clear, and scrollback with **Jump to bottom**.
 - **Zero-Drift Cursor**: Aligned directly via GPUI's `TextSystem` monospace shaper.
 - **Live `Action Log` Tab**: Streams every toolbar and fleet operation (`[HH:MM:SS] $ <command>`, per-repo `✓`/`↷`/`✗` status, and final summary). Toggle **Auto-log: On/Off** in the dock bar.
 - **Safety Confirmation Strip**: Potentially destructive commands (`rm -rf`, `sudo`, `--force`, `curl | sh`, `git reset --hard`) clicked from READMEs, Notice modals, or Activity Log pause behind an inline **Press Enter / Dismiss** review bar when `terminalConfirmDestructive` is enabled.
@@ -163,5 +163,5 @@ repoharbor install-desktop        # Repair user .desktop entry & icons (--autost
 ### In-App Periodic Updates
 
 - RepoHarbor checks GitHub Releases automatically 4 seconds after launch and every 12 hours when **Check for periodic updates automatically** is enabled.
-- When a newer version is available, a clickable **`↑ vYYYY.M.P`** badge appears in the TitleBar.
-- Open **Settings → About → Updates & installation** to inspect release notes and click **Update & Restart** (or run the update command directly in the built-in terminal for `.deb`/`.rpm`/source installs).
+- When a newer version is available, a prominent **`Update <tag>`** button appears in the top header bar (next to `Refresh` and `Terminal`) alongside a clickable **`↑ vYYYY.M.P`** badge in the TitleBar.
+- Click **`Update <tag>`** directly (or open **Settings → About → Updates & installation** to inspect release notes and click **Update & Restart**) to verify SHA-256, atomically swap the binary, and relaunch.

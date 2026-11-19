@@ -23,7 +23,7 @@ The toolbar uses **work modes** instead of a dense all-filters chip strip:
 
 | Mode | Shows |
 |------|--------|
-| **Needs me** | Attention filter — repos that need action (reviews, dirty/unpushed work, behind, finished agents, …). Submodule children that need you stay listed even without a TREE focus; host-only review/CI (no local checkout) appears too. Badge / chip / header count only what the list can show. A live **Agent running** session is not a Needs-me hit (the card keeps a terminal icon; it does not replace the git/commit line). Segment shows the count when &gt; 0. Empty state: **All clear**. |
+| **Needs me** | Attention filter — repos that need action (reviews, dirty/unpushed work, behind, finished agents, …). Submodule children that need you stay listed even without an active `N sub` focus; host-only review/CI (no local checkout) appears too. Badge / chip / header count only what the list can show. A live **Agent running** session is not a Needs-me hit (the card keeps a terminal icon; it does not replace the git/commit line). Segment shows the count when &gt; 0. Empty state: **All clear**. |
 | **Behind** | Repos behind upstream. **Pull behind** on the ops row fleet-pulls them. |
 | **Working** | Contextual chips: Dirty / Stageable / Pushable (no Commitable / Ahead duplicates). |
 | **All** | No git filter; optional Public / Private / Starred / Stale chips. |

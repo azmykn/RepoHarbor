@@ -4,7 +4,7 @@ RepoHarbor isn't just a viewer — it operates across many repos at once, and ke
 
 ## Bulk actions
 
-Select repos in [Mission Control](./mission-control) (each card / list row has a checkbox) and the ops row shows selection-scoped git verbs. Targets are always **selected ∩ visible** under the current Mission Control filters (work mode, chips, root, language, group, TREE, Needs me, search) — off-filter checkboxes never run.
+Select repos in [Mission Control](./mission-control) (each card / list row has a checkbox) and the ops row shows selection-scoped git verbs. Targets are always **selected ∩ visible** under the current Mission Control filters (work mode, chips, root, language, group, `N sub` focus, Needs me, search) — off-filter checkboxes never run.
 
 | Action | What it does |
 |---|---|
@@ -14,7 +14,7 @@ Select repos in [Mission Control](./mission-control) (each card / list row has a
 | **Gen only** | AI commit message for dirty repos (one-click), including pull-only trees. Single target opens the drawer Changes composer; multi-repo drafts via the fleet engine. |
 | **Gen & push** | AI message → commit all → push on **non–pull-only** paths only (same **Skipped pull-only** / all–pull-only Error as Push). **One dirty pushable repo** stays one-click; **two or more** opens a centered confirm modal (repo list + Confirm / Cancel; Esc cancels) before running. Dims when the selection has no dirty pushable path. |
 | **Empty commit** | `git commit --allow-empty` on non–pull-only paths only (same skip toast as Push). Hidden when the selection is entirely pull-only. |
-| **Actions ▾** | Stage all, Commit…, Discard, Prune, Reset hard, Mute attention, Open in IDE, Clear selection. Sync verbs (Fetch / Pull / Push / Gen / Empty) stay on the ops-row primaries so the gear stays slim. Card / TREE right-click still includes the full sync set. |
+| **Actions ▾** | Stage all, Commit…, Discard, Prune, Reset hard, Mute attention, Open in IDE, Clear selection. Sync verbs (Fetch / Pull / Push / Gen / Empty) stay on the ops-row primaries so the gear stays slim. Card / list-row right-click still includes the full sync set. |
 
 Always-on (no selection required):
 
@@ -26,7 +26,9 @@ Always-on (no selection required):
 | **Submodules** | Update nested checkouts. With a selection → selected ∩ visible; with an **empty** selection → every *visible* parent with `child_count > 0`. Idle empty selection shows **Submodules (N)**; starting toasts list parent names. Progress is **parent repos** (`Updating submodules — name (2/3)…`); Log lines are `Submodules: parent — child: status`. |
 | **Summarize** | One-line AI summaries when `aiReady`. |
 
-Results stream back **per repo** as each finishes — done, skipped, or error — and a long run can be **cancelled** mid-flight. Clear the selection from the bar (or Esc) when you're done. Destructive ops (Discard / Prune / Reset) expand a confirm strip before running; multi-repo **Gen & push** uses a centered confirm modal instead. While a confirm strip or Gen & push modal is armed, ops-row sync buttons stay dimmed and keyboard / palette fleet starts (`Ctrl+Shift+F` / `Ctrl+Shift+P`, Fetch/Pull verbs) toast **Confirm pending** — finish or cancel first.
+Results stream back **per repo** as each finishes — done, skipped, or error — directly to both toasts and the live **`Action Log`** dock tab (`Auto-log: On/Off`), and a long run can be **cancelled** mid-flight. Clear the selection from the bar (or Esc) when you're done. Destructive ops (Discard / Prune / Reset) expand a confirm strip before running; multi-repo **Gen & push** uses a centered confirm modal instead. While a confirm strip or Gen & push modal is armed, ops-row sync buttons stay dimmed and keyboard / palette fleet starts (`Ctrl+Shift+F` / `Ctrl+Shift+P`, Fetch/Pull verbs) toast **Confirm pending** — finish or cancel first.
+
+Remote branch-protection rejections (`GH013` / repository rules) are classified separately from non-fast-forward errors and suggest `git checkout -b fix/update && git push -u origin HEAD` as a runnable command in the Notice modal. Commit messages are also checked by the pre-commit secret scanner (`gsk_*`, `mstrl_*`, `ghp_*`, `sk-*`) before committing.
 
 ## Job queue
 
