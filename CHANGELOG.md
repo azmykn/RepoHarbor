@@ -276,7 +276,7 @@ versioned trees, including nested submodule parents).
 ### Added
 
 - **About & license** — Settings → About shows crate version `2026.8.1`, the
-  GitHub repository, email (`azmykn@gmail.com`), phone (`+966559622034`), MIT
+  GitHub repository, website (`https://www.digitscode.com`), email (`info@digitscode.com`), MIT
   public-use terms, and Orrery attribution. Same notice in [COPYRIGHT.md](COPYRIGHT.md)
   and the docs [Copyright & contact](docs/guide/copyright.md) page (version is
   read from `Cargo.toml`).

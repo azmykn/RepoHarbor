@@ -305,11 +305,13 @@ if have pgrep; then
   RUNNING_PIDS="$(pgrep -x repoharbor 2>/dev/null | tr '\n' ' ' || true)"
   if [[ -n "${RUNNING_PIDS// /}" ]]; then
     ok "Restarting running RepoHarbor instance (${RUNNING_PIDS% })…"
-    RESTART_CMD="trap '' HUP; sleep 0.2; kill -TERM $RUNNING_PIDS 2>/dev/null || true; sleep 0.35; nohup \"$BIN_DST\" </dev/null >/dev/null 2>&1 &"
-    if have setsid; then
-      setsid sh -c "$RESTART_CMD" </dev/null >/dev/null 2>&1 &
+    RESTART_CMD="sleep 0.2; kill -TERM $RUNNING_PIDS 2>/dev/null || true; sleep 0.35; exec \"$BIN_DST\""
+    if have systemd-run && systemd-run --user --collect --unit="repoharbor-restart-$(date +%s)" sh -c "$RESTART_CMD" >/dev/null 2>&1; then
+      true
+    elif have setsid; then
+      setsid sh -c "trap '' HUP; $RESTART_CMD" </dev/null >/dev/null 2>&1 &
     else
-      nohup sh -c "$RESTART_CMD" </dev/null >/dev/null 2>&1 &
+      nohup sh -c "trap '' HUP; $RESTART_CMD" </dev/null >/dev/null 2>&1 &
     fi
   fi
 fi

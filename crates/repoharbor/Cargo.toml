@@ -6,7 +6,7 @@ name = "repoharbor"
 version = "2026.11.1"
 edition = "2024"
 publish = false
-authors = ["Azmy Karam <azmykn@gmail.com>"]
+authors = ["Digital Integrated Transformation Solutions (DigitsCode) <info@digitscode.com>"]
 description = "every repo at harbor — a Linux-native command center for your git fleet"
 license = "MIT"
 repository = "https://github.com/azmykn/RepoHarbor"
@@ -78,8 +78,8 @@ all = "warn"
 # `.deb` via cargo-deb. Asset source paths are relative to this manifest dir;
 # `target/release/` is special-cased to the workspace target dir.
 [package.metadata.deb]
-maintainer = "Azmy Karam <azmykn@gmail.com>"
-copyright = "2026, Azmy Karam / DigitsCode"
+maintainer = "Digital Integrated Transformation Solutions (DigitsCode) <info@digitscode.com>"
+copyright = "2026, Digital Integrated Transformation Solutions (DigitsCode)"
 license-file = ["../../LICENSE", "0"]
 extended-description = "RepoHarbor is a Linux-native command center for your git fleet: a fast GPU-rendered desktop dashboard that scans your workspace, surfaces status/PRs/CI at a glance, and launches your IDE or agent. Includes software originally published as Orrery by Seb Burrell (MIT)."
 section = "devel"

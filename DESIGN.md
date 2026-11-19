@@ -8,7 +8,7 @@ This is the living design reference. Decisions here were settled during the desi
 
 - **Name:** RepoHarbor · **Tagline:** *every repo at harbor — a Linux-native command center for your git fleet*
 - **App id:** `com.digitscode.repoharbor` · **Window title:** "RepoHarbor"
-- **Org:** DigitsCode · **Author:** Azmy Karam · **Contact:** azmykn@gmail.com · +966559622034
+- **Org:** Digital Integrated Transformation Solutions (DigitsCode) · **Website:** https://www.digitscode.com · **Contact:** info@digitscode.com
 - **Repository:** https://github.com/azmykn/RepoHarbor · **Docs:** https://azmykn.github.io/RepoHarbor/
 
 RepoHarbor is DigitsCode's independent Linux-native command center for managing a local git fleet at a glance — discovery, status, host enrichment, and launchers in one dense mission-control surface.

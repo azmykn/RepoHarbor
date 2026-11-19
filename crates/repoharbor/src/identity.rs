@@ -21,10 +21,9 @@ pub const DOCS_URL: &str = "https://azmykn.github.io/RepoHarbor/";
 pub const CHANGELOG_URL: &str = "https://github.com/azmykn/RepoHarbor/blob/main/CHANGELOG.md";
 
 pub const COPYRIGHT_YEAR: &str = "2026";
-pub const PUBLISHER: &str = "DigitsCode";
-pub const AUTHOR: &str = "Azmy Karam";
-pub const CONTACT_EMAIL: &str = "azmykn@gmail.com";
-pub const CONTACT_PHONE: &str = "+966559622034";
+pub const PUBLISHER: &str = "Digital Integrated Transformation Solutions (DigitsCode)";
+pub const CONTACT_EMAIL: &str = "info@digitscode.com";
+pub const WEBSITE: &str = "https://www.digitscode.com";
 pub const LICENSE_SPDX: &str = "MIT";
 
 /// One-line MIT credit required for the included Orrery portions.
@@ -51,14 +50,13 @@ mod tests {
 
     #[test]
     fn public_identity_matches_published_contact() {
-        assert_eq!(CONTACT_EMAIL, "azmykn@gmail.com");
-        assert_eq!(CONTACT_PHONE, "+966559622034");
+        assert_eq!(CONTACT_EMAIL, "info@digitscode.com");
+        assert_eq!(WEBSITE, "https://www.digitscode.com");
         assert!(
             REPOSITORY.contains("github.com/azmykn/RepoHarbor"),
             "repository {REPOSITORY}"
         );
         assert_eq!(LICENSE_SPDX, "MIT");
-        assert!(!AUTHOR.is_empty());
         assert!(!PUBLISHER.is_empty());
     }
 }

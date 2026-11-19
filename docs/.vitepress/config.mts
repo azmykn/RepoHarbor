@@ -84,7 +84,7 @@ export default defineConfig({
     },
     footer: {
       message: `RepoHarbor ${appVersion} · MIT License · public use · DigitsCode`,
-      copyright: "© 2026 Azmy Karam / DigitsCode · azmykn@gmail.com · +966559622034",
+      copyright: "© 2026 Digital Integrated Transformation Solutions (DigitsCode) · info@digitscode.com",
     },
   },
 });

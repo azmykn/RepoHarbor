@@ -14,12 +14,11 @@ import { data as appVersion } from '../version.data'
 | | |
 |---|---|
 | **Version** | `{{ appVersion }}` (from `crates/repoharbor/Cargo.toml`, calendar `YYYY.M.P`) |
-| **Publisher** | DigitsCode |
-| **Author** | Azmy Karam |
+| **Publisher** | Digital Integrated Transformation Solutions (DigitsCode) |
+| **Website** | [digitscode.com](https://www.digitscode.com) |
 | **Repository** | [github.com/azmykn/RepoHarbor](https://github.com/azmykn/RepoHarbor) |
 | **Changelog** | [CHANGELOG.md](https://github.com/azmykn/RepoHarbor/blob/main/CHANGELOG.md) |
-| **Email** | [azmykn@gmail.com](mailto:azmykn@gmail.com) |
-| **Phone** | [+966559622034](tel:+966559622034) |
+| **Email** | [info@digitscode.com](mailto:info@digitscode.com) |
 
 ## Public use
 
@@ -30,7 +29,7 @@ Full terms: [LICENSE](https://github.com/azmykn/RepoHarbor/blob/main/LICENSE) ·
 ## Copyright
 
 ```
-Copyright (c) 2026 Azmy Karam / DigitsCode
+Copyright (c) 2026 Digital Integrated Transformation Solutions (DigitsCode)
 Copyright (c) 2026 Seb Burrell (original Orrery portions)
 ```
 

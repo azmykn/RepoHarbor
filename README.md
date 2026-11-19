@@ -427,10 +427,9 @@ Released under the **[MIT License](LICENSE)** for public use — you are free to
 | **Product** | **RepoHarbor** |
 | **Version** | `2026.11.1` (Calendar versioning `YYYY.M.P`) |
 | **Publisher** | **Digital Integrated Transformation Solutions (DigitsCode)** |
-| **Author** | **Azmy Karam** |
+| **Website** | [https://www.digitscode.com](https://www.digitscode.com) |
 | **Repository** | [https://github.com/azmykn/RepoHarbor](https://github.com/azmykn/RepoHarbor) |
 | **Documentation** | [https://azmykn.github.io/RepoHarbor/](https://azmykn.github.io/RepoHarbor/) |
-| **Email** | [azmykn@gmail.com](mailto:azmykn@gmail.com) |
-| **Phone** | [+966559622034](tel:+966559622034) |
+| **Email** | [info@digitscode.com](mailto:info@digitscode.com) |
 
 See **[COPYRIGHT.md](COPYRIGHT.md)** and **[NOTICE](NOTICE)** for the full public distribution notice.

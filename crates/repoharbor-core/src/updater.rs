@@ -515,6 +515,24 @@ pub fn spawn_detached_relaunch(exe: &Path) -> Result<(), String> {
     }
     #[cfg(not(windows))]
     {
+        if Command::new("systemd-run")
+            .args([
+                "--user",
+                "--collect",
+                "sh",
+                "-c",
+                "sleep 0.35; exec \"$1\"",
+                "repoharbor-relaunch",
+                &exe_str,
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success())
+        {
+            return Ok(());
+        }
         Command::new("sh")
             .args([
                 "-c",
@@ -601,6 +619,27 @@ pub fn restart_running_gui_instances(new_exe: &Path) -> bool {
             .map(|p| p.to_string())
             .collect::<Vec<_>>()
             .join(" ");
+        let systemd_script = format!(
+            "sleep 0.2; kill -TERM {pid_args} 2>/dev/null || true; sleep 0.35; exec \"$1\""
+        );
+        if Command::new("systemd-run")
+            .args([
+                "--user",
+                "--collect",
+                "sh",
+                "-c",
+                &systemd_script,
+                "repoharbor-restart",
+                &exe_str,
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success())
+        {
+            return true;
+        }
         let script = format!(
             "trap '' HUP; sleep 0.2; kill -TERM {pid_args} 2>/dev/null || true; sleep 0.35; if command -v setsid >/dev/null 2>&1; then setsid \"$1\" </dev/null >/dev/null 2>&1 & else nohup \"$1\" </dev/null >/dev/null 2>&1 & fi"
         );

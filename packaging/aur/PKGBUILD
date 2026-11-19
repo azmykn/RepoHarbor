@@ -1,4 +1,4 @@
-# Maintainer: Azmy Karam <azmykn@gmail.com>
+# Maintainer: Digital Integrated Transformation Solutions (DigitsCode) <info@digitscode.com>
 pkgname=repoharbor-git
 _pkgname=repoharbor
 pkgver=0.2.0.r0.g0000000

@@ -2437,11 +2437,7 @@ fn about_product(t: &Theme) -> impl IntoElement {
             t,
         ))
         .child(note_line(
-            SharedString::from(format!(
-                "Publisher: {} · Author: {}",
-                id::PUBLISHER,
-                id::AUTHOR
-            )),
+            SharedString::from(format!("Publisher: {}", id::PUBLISHER)),
             t.fg1,
             t,
         ))
@@ -2476,22 +2472,22 @@ fn about_product(t: &Theme) -> impl IntoElement {
 fn about_contact(t: &Theme) -> impl IntoElement {
     use crate::identity as id;
     section(t, "Contact")
+        .child(about_value_row("Website", id::WEBSITE, t))
         .child(about_value_row("Email", id::CONTACT_EMAIL, t))
-        .child(about_value_row("Phone", id::CONTACT_PHONE, t))
         .child(
             div()
                 .flex()
                 .flex_row()
                 .flex_wrap()
                 .gap(px(8.))
+                .child(button_id("btn-about-website", "Open website", t, |_cx| {
+                    let _ = repoharbor_core::launch::open(id::WEBSITE);
+                }))
                 .child(button_id("btn-about-email", "Email", t, |_cx| {
                     let _ = repoharbor_core::launch::open(&format!("mailto:{}", id::CONTACT_EMAIL));
                 }))
                 .child(button_id("btn-about-copy-email", "Copy email", t, |cx| {
                     cx.write_to_clipboard(ClipboardItem::new_string(id::CONTACT_EMAIL.to_string()));
-                }))
-                .child(button_id("btn-about-copy-phone", "Copy phone", t, |cx| {
-                    cx.write_to_clipboard(ClipboardItem::new_string(id::CONTACT_PHONE.to_string()));
                 })),
         )
 }
@@ -2501,9 +2497,8 @@ fn about_license(t: &Theme) -> impl IntoElement {
     section(t, "License & public use")
         .child(note_line(
             SharedString::from(format!(
-                "© {} {} / {} — {}.",
+                "© {} {} — {}.",
                 id::COPYRIGHT_YEAR,
-                id::AUTHOR,
                 id::PUBLISHER,
                 id::LICENSE_SPDX
             )),

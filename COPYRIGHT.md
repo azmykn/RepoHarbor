@@ -2,8 +2,8 @@
 
 **Product:** RepoHarbor  
 **Version:** see `version` in [`crates/repoharbor/Cargo.toml`](crates/repoharbor/Cargo.toml) (calendar `YYYY.M.P`). The running app always shows the version it was built with under **Settings → About**.  
-**Publisher:** DigitsCode  
-**Author:** Azmy Karam  
+**Publisher:** Digital Integrated Transformation Solutions (DigitsCode)  
+**Website:** [https://www.digitscode.com](https://www.digitscode.com)  
 **Repository:** [https://github.com/azmykn/RepoHarbor](https://github.com/azmykn/RepoHarbor)  
 **Documentation:** [https://azmykn.github.io/RepoHarbor/](https://azmykn.github.io/RepoHarbor/)
 
@@ -11,8 +11,8 @@
 
 | | |
 |---|---|
-| Email | [azmykn@gmail.com](mailto:azmykn@gmail.com) |
-| Phone | [+966559622034](tel:+966559622034) |
+| Website | [https://www.digitscode.com](https://www.digitscode.com) |
+| Email | [info@digitscode.com](mailto:info@digitscode.com) |
 
 ## License (public use)
 
@@ -23,7 +23,7 @@ There is no warranty. See the MIT text for the full terms.
 ## Copyright
 
 ```
-Copyright (c) 2026 Azmy Karam / DigitsCode
+Copyright (c) 2026 Digital Integrated Transformation Solutions (DigitsCode)
 Copyright (c) 2026 Seb Burrell (original Orrery portions)
 ```
 

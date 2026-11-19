@@ -6,7 +6,7 @@
 name = "repoharbor-platform"
 version = "2026.11.1"
 edition = "2021"
-authors = ["Azmy Karam <azmykn@gmail.com>"]
+authors = ["Digital Integrated Transformation Solutions (DigitsCode) <info@digitscode.com>"]
 license = "MIT"
 repository = "https://github.com/azmykn/RepoHarbor"
 homepage = "https://azmykn.github.io/RepoHarbor/"
