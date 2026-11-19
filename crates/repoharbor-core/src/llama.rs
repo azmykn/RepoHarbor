@@ -1,0 +1,454 @@
+//! Bundled llama.cpp backend (#21). Spawns a local `llama-server` sidecar and
+//! talks to its native HTTP API (`/health`, `/completion`). The engine binary
+//! is discovered at runtime — a configured path, then the app data dir's
+//! `bin/`, then `PATH` — so the app degrades to "unavailable" (rather than
+//! failing to build/launch) when it isn't present. Release builds ship a
+//! `llama-server` as a bundled resource (fetched in CI); on first use it's
+//! unpacked into the app data `bin/` so it's found by the same lookup. Models
+//! are GGUF files in the app data dir. Generation only; embeddings stay on the
+//! Ollama path.
+
+use std::path::{Path, PathBuf};
+use std::process::Child;
+use std::sync::{LazyLock, Mutex, OnceLock};
+use std::time::Duration;
+
+use serde::Deserialize;
+
+/// A running `llama-server` for a specific model. Process-lifetime singleton —
+/// like the shared HTTP clients — so successive generate calls reuse it.
+struct Server {
+    child: Child,
+    port: u16,
+    model: PathBuf,
+}
+
+static SERVER: LazyLock<Mutex<Option<Server>>> = LazyLock::new(|| Mutex::new(None));
+
+/// The bundled llama runtime dir (`<prefix>/lib/repoharbor/llama-runtime`),
+/// recorded once at startup — resolving it needs the executable's install
+/// prefix, which the discovery path lacks. Empty (or absent) in dev/source
+/// builds; populated by the release CI fetch.
+static BUNDLED_DIR: OnceLock<PathBuf> = OnceLock::new();
+
+/// Record the bundled llama runtime dir. Called from app setup in
+/// `crates/repoharbor/src/main.rs` with the dir resolved relative to the running
+/// executable; a no-op if called more than once.
+pub fn set_bundled_dir(dir: PathBuf) {
+    let _ = BUNDLED_DIR.set(dir);
+}
+
+/// Copy a shipped llama runtime into the writable app-data `bin/` on first use,
+/// marking the server executable. We run from app-data rather than straight out
+/// of the bundle so it works even when the bundle is a read-only mount (the
+/// AppImage squashfs) and so the executable bit is guaranteed regardless of how
+/// the bundler copied the resource. Idempotent and cheap: a single stat once the
+/// binary is in place. Does nothing when no runtime was bundled.
+fn materialize_bundled() {
+    let Some(src) = BUNDLED_DIR
+        .get()
+        .filter(|d| d.join("llama-server").is_file())
+    else {
+        return;
+    };
+    let Some(dest) = data_dir().map(|d| d.join("bin")) else {
+        return;
+    };
+    let server = dest.join("llama-server");
+    if server.is_file() {
+        return; // already materialized
+    }
+    if std::fs::create_dir_all(&dest).is_err() {
+        return;
+    }
+    // Copy the binary and its co-located shared libraries ($ORIGIN rpath).
+    if let Ok(entries) = std::fs::read_dir(src) {
+        for e in entries.flatten() {
+            let _ = std::fs::copy(e.path(), dest.join(e.file_name()));
+        }
+    }
+    #[cfg(unix)]
+    if let Ok(meta) = std::fs::metadata(&server) {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = meta.permissions();
+        perms.set_mode(0o755);
+        let _ = std::fs::set_permissions(&server, perms);
+    }
+}
+
+fn client() -> reqwest::Client {
+    // Connect-timeout only: a dead sidecar fails the /health probe fast, but
+    // CPU inference of a completion can legitimately run long, so no overall
+    // request timeout (which would truncate generation).
+    static CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
+        reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(8))
+            .build()
+            .unwrap_or_default()
+    });
+    CLIENT.clone()
+}
+
+fn data_dir() -> Option<PathBuf> {
+    crate::paths::data_dir()
+}
+
+/// Where downloaded GGUF models live.
+pub fn models_dir() -> Option<PathBuf> {
+    data_dir().map(|d| d.join("models"))
+}
+
+/// Locate the `llama-server` binary: a configured override, then the app data
+/// dir's `bin/`, then `PATH`.
+fn server_binary() -> Option<PathBuf> {
+    let cfg = crate::config::load();
+    if !cfg.llama_server_path.trim().is_empty() {
+        let p = PathBuf::from(cfg.llama_server_path.trim());
+        if p.is_file() {
+            return Some(p);
+        }
+    }
+    // Unpack a bundled runtime into app-data bin/ on first use, so the check
+    // below finds it just like a user-installed binary.
+    materialize_bundled();
+    if let Some(p) = data_dir().map(|d| d.join("bin").join("llama-server")) {
+        if p.is_file() {
+            return Some(p);
+        }
+    }
+    which::which("llama-server").ok()
+}
+
+/// The configured GGUF model file, if it exists on disk.
+fn model_path() -> Option<PathBuf> {
+    let cfg = crate::config::load();
+    let raw = cfg.llama_model_path.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    let p = PathBuf::from(raw);
+    p.is_file().then_some(p)
+}
+
+/// True when `path` has any execute permission bit set. A binary that exists
+/// but isn't executable (e.g. copied without mode bits) would only fail later
+/// at spawn time, so `available()` checks it up front.
+#[cfg(unix)]
+fn is_executable(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path)
+        .map(|m| m.permissions().mode() & 0o111 != 0)
+        .unwrap_or(false)
+}
+
+#[cfg(not(unix))]
+fn is_executable(_path: &Path) -> bool {
+    true
+}
+
+/// GGUF fixed header: magic (4) + version (4) + tensor count (8) + metadata
+/// kv count (8).
+const GGUF_HEADER_LEN: u64 = 24;
+
+/// True when `path` looks like a real GGUF model: at least a full fixed
+/// header long and starting with the `GGUF` magic. A cheap 4-byte read — not
+/// a full parse — but enough to reject empty/truncated downloads and files
+/// that aren't GGUF at all.
+fn valid_gguf(path: &Path) -> bool {
+    use std::io::Read;
+    let Ok(mut f) = std::fs::File::open(path) else {
+        return false;
+    };
+    if f.metadata().map(|m| m.len()).unwrap_or(0) < GGUF_HEADER_LEN {
+        return false;
+    }
+    let mut magic = [0u8; 4];
+    f.read_exact(&mut magic).is_ok() && &magic == b"GGUF"
+}
+
+/// True when the llama.cpp backend can serve generation. If a sidecar is
+/// already running, this is a live `GET /health` probe (mirroring the Ollama
+/// `/api/version` check). Otherwise it stays cheap — no server spawn, since a
+/// model load can take many seconds — but goes beyond bare existence: the
+/// engine binary must be executable and the model must pass the GGUF header
+/// check, so `ai_ready` isn't reported from a corrupt binary or a truncated
+/// download. (The server itself still spawns lazily, on first generate.)
+pub async fn available() -> bool {
+    let running_port = {
+        let guard = SERVER.lock().unwrap_or_else(|e| e.into_inner());
+        guard.as_ref().map(|s| s.port)
+    };
+    if let Some(port) = running_port {
+        // A dead sidecar refuses the connection immediately, so this stays fast.
+        return client()
+            .get(format!("http://127.0.0.1:{port}/health"))
+            .send()
+            .await
+            .map(|r| r.status().is_success())
+            .unwrap_or(false);
+    }
+    let (Some(bin), Some(model)) = (server_binary(), model_path()) else {
+        return false;
+    };
+    is_executable(&bin) && valid_gguf(&model)
+}
+
+/// Download a GGUF model from `url` into [`models_dir`], reporting
+/// `(downloaded, total)` bytes via `on_progress`. Streams to a `.part` file and
+/// renames on success; the partial is removed on any error. Returns the final
+/// path. `total` is 0 when the server sends no Content-Length.
+pub async fn download_model(
+    url: &str,
+    mut on_progress: impl FnMut(u64, u64),
+) -> Result<String, String> {
+    use futures_util::StreamExt;
+    use std::io::Write;
+
+    // Derive the filename from the URL path (strip any query/fragment).
+    let name = url
+        .rsplit('/')
+        .next()
+        .map(|s| s.split(['?', '#']).next().unwrap_or(s))
+        .filter(|s| !s.is_empty())
+        .ok_or("could not derive a filename from the URL")?;
+    if !name.to_lowercase().ends_with(".gguf") {
+        return Err("URL must point to a .gguf file".into());
+    }
+    let dir = models_dir().ok_or("no models directory")?;
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let final_path = dir.join(name);
+    let part_path = dir.join(format!("{name}.part"));
+
+    let resp = client().get(url).send().await.map_err(|e| e.to_string())?;
+    if !resp.status().is_success() {
+        return Err(format!("download failed: HTTP {}", resp.status()));
+    }
+    let total = resp.content_length().unwrap_or(0);
+
+    let mut file = std::fs::File::create(&part_path).map_err(|e| e.to_string())?;
+    let mut downloaded: u64 = 0;
+    let mut stream = resp.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = match chunk {
+            Ok(c) => c,
+            Err(e) => {
+                let _ = std::fs::remove_file(&part_path);
+                return Err(e.to_string());
+            }
+        };
+        if let Err(e) = file.write_all(&chunk) {
+            let _ = std::fs::remove_file(&part_path);
+            return Err(e.to_string());
+        }
+        downloaded += chunk.len() as u64;
+        on_progress(downloaded, total);
+    }
+    if let Err(e) = file.flush() {
+        let _ = std::fs::remove_file(&part_path);
+        return Err(e.to_string());
+    }
+    drop(file);
+    std::fs::rename(&part_path, &final_path).map_err(|e| {
+        let _ = std::fs::remove_file(&part_path);
+        e.to_string()
+    })?;
+    Ok(final_path.to_string_lossy().into_owned())
+}
+
+/// Downloaded GGUF models as (filename, size_bytes).
+pub fn installed_models() -> Vec<(String, u64)> {
+    let Some(dir) = models_dir() else {
+        return Vec::new();
+    };
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return Vec::new();
+    };
+    entries
+        .filter_map(Result::ok)
+        .filter_map(|e| {
+            let p = e.path();
+            if p.extension().and_then(|x| x.to_str()) == Some("gguf") {
+                let size = e.metadata().map(|m| m.len()).unwrap_or(0);
+                Some((p.file_name()?.to_string_lossy().into_owned(), size))
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+/// Ask the OS for an unused localhost port (bind to :0, read it back, release).
+fn free_port() -> Option<u16> {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .ok()
+        .and_then(|l| l.local_addr().ok())
+        .map(|a| a.port())
+}
+
+/// Ensure a `llama-server` is running for the configured model; return its base
+/// URL. Reuses a live server for the same model, else (re)spawns and waits for
+/// `/health` to go green.
+async fn ensure_running() -> Result<String, String> {
+    let bin = server_binary().ok_or("llama-server binary not found")?;
+    let model = model_path().ok_or("no model selected — download one first")?;
+
+    // Reuse an already-running server for the same model.
+    {
+        let guard = SERVER.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(s) = guard.as_ref() {
+            if s.model == model {
+                return Ok(format!("http://127.0.0.1:{}", s.port));
+            }
+        }
+    }
+
+    let port = free_port().ok_or("no free port for llama-server")?;
+    let child = std::process::Command::new(&bin)
+        .arg("-m")
+        .arg(&model)
+        .arg("--host")
+        .arg("127.0.0.1")
+        .arg("--port")
+        .arg(port.to_string())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(|e| format!("spawn llama-server: {e}"))?;
+
+    // Replace (and reap) any prior server for a different model.
+    {
+        let mut guard = SERVER.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(mut old) = guard.take() {
+            let _ = old.child.kill();
+            let _ = old.child.wait();
+        }
+        *guard = Some(Server { child, port, model });
+    }
+
+    // Poll /health until the model has loaded (up to ~30s for a small model).
+    let base = format!("http://127.0.0.1:{port}");
+    for _ in 0..60 {
+        let ok = client()
+            .get(format!("{base}/health"))
+            .send()
+            .await
+            .map(|r| r.status().is_success())
+            .unwrap_or(false);
+        if ok {
+            return Ok(base);
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    Err("llama-server did not become ready in time".into())
+}
+
+/// Generate text from `prompt` via the llama.cpp sidecar.
+///
+/// `n_predict` caps how many tokens the completion may emit (commit messages
+/// use a higher budget than short summaries).
+pub async fn generate(prompt: &str, n_predict: u32) -> Result<String, String> {
+    let base = ensure_running().await?;
+    #[derive(Deserialize)]
+    struct Resp {
+        #[serde(default)]
+        content: String,
+    }
+    let body = serde_json::json!({
+        "prompt": prompt,
+        "n_predict": n_predict,
+        "temperature": 0.2,
+        "stream": false,
+    });
+    let resp = client()
+        .post(format!("{base}/completion"))
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    if !resp.status().is_success() {
+        return Err(format!("llama-server {}", resp.status()));
+    }
+    let parsed: Resp = resp.json().await.map_err(|e| e.to_string())?;
+    Ok(parsed.content.trim().to_string())
+}
+
+/// Kill the running sidecar (called on app exit so it isn't orphaned).
+pub fn shutdown() {
+    let mut guard = SERVER.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(mut s) = guard.take() {
+        let _ = s.child.kill();
+        let _ = s.child.wait();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn free_port_returns_something() {
+        assert!(free_port().is_some());
+    }
+
+    #[test]
+    fn valid_gguf_accepts_gguf_header() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("model.gguf");
+        // Magic + version + tensor count + kv count (all little-endian).
+        let mut bytes = b"GGUF".to_vec();
+        bytes.extend_from_slice(&3u32.to_le_bytes());
+        bytes.extend_from_slice(&0u64.to_le_bytes());
+        bytes.extend_from_slice(&0u64.to_le_bytes());
+        std::fs::write(&p, &bytes).unwrap();
+        assert!(valid_gguf(&p));
+    }
+
+    #[test]
+    fn valid_gguf_rejects_wrong_magic() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("model.gguf");
+        std::fs::write(&p, vec![0u8; GGUF_HEADER_LEN as usize]).unwrap();
+        assert!(!valid_gguf(&p));
+    }
+
+    #[test]
+    fn valid_gguf_rejects_truncated_and_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("model.gguf");
+        // Right magic but shorter than the fixed header — a truncated download.
+        std::fs::write(&p, b"GGUF").unwrap();
+        assert!(!valid_gguf(&p));
+        assert!(!valid_gguf(&dir.path().join("nope.gguf")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn is_executable_tracks_mode_bits() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("llama-server");
+        std::fs::write(&p, b"#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(!is_executable(&p));
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(is_executable(&p));
+        assert!(!is_executable(&dir.path().join("missing")));
+    }
+
+    #[test]
+    fn installed_models_lists_only_gguf() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.gguf"), b"x").unwrap();
+        std::fs::write(dir.path().join("notes.txt"), b"y").unwrap();
+        let found: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter_map(|e| {
+                let p = e.path();
+                (p.extension().and_then(|x| x.to_str()) == Some("gguf"))
+                    .then(|| p.file_name().unwrap().to_string_lossy().into_owned())
+            })
+            .collect();
+        assert_eq!(found, vec!["a.gguf"]);
+    }
+}

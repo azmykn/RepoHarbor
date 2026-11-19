@@ -1,0 +1,4030 @@
+//! Repo workspace — the right-anchored detail panel. Opens over the shell when
+//! a card is clicked; a scrim backdrop or the close button dismisses it.
+//! Tabs: Work / History / About.
+//!
+//! Work is the commit surface (stage, hunks, commit, AI) plus stash, conflict
+//! paths, and blame for the selected file ([`work`]). History is a flat lane
+//! graph ([`history`]). About stacks the former Overview, PR, Notes, and
+//! Readme sections ([`about`]) so those journeys stay on one scroll.
+
+mod about;
+mod history;
+mod work;
+
+use gpui::{
+    App, AppContext, AsyncApp, ClipboardItem, Context, Div, Entity, FontWeight, InteractiveElement,
+    IntoElement, ParentElement, SharedString, StatefulInteractiveElement, Styled, WeakEntity,
+    Window, div, px, rgb, rgba,
+};
+use gpui_component::menu::{ContextMenuExt as _, PopupMenuItem};
+use repoharbor_core::{cache, git_ops, inbox, launch};
+
+use crate::data::{self, Row};
+use crate::icon::{brand, lucide};
+use crate::shell::{DrawerTab, Overlay, RepoHarborApp};
+use crate::theme::Theme;
+use crate::toast::ToastKind;
+
+pub(super) const MONO: &str = "monospace";
+const PANEL_W: f32 = 720.;
+/// Commits drawn on the History tab.
+pub(crate) const HISTORY_LIMIT: usize = 80;
+
+const TABS: [(DrawerTab, &str); 3] = [
+    (DrawerTab::Work, "Work"),
+    (DrawerTab::History, "History"),
+    (DrawerTab::About, "About"),
+];
+
+// ── async per-repo data ────────────────────────────────────────────────────
+// The drawer's git data is loaded off the UI thread and marshalled back onto the
+// foreground (the live-wiring pattern). `None` = still loading; `Some(vec)` =
+// loaded (possibly empty). `repo` guards against a result landing after the
+// drawer moved to a different repo or closed.
+
+pub struct BranchRow {
+    pub name: SharedString,
+    pub current: bool,
+    pub gone: bool,
+    pub merged: bool,
+}
+
+pub struct WorktreeRow {
+    pub name: SharedString,
+    pub path: SharedString,
+}
+
+pub struct HistoryRow {
+    pub id: SharedString,
+    pub summary: SharedString,
+    pub author: SharedString,
+    pub age: SharedString,
+    pub parents: Vec<SharedString>,
+    pub lane: u32,
+}
+
+pub struct StashRow {
+    pub index: usize,
+    pub id: SharedString,
+    pub message: SharedString,
+}
+
+pub struct BlameLineRow {
+    pub number: u32,
+    pub text: SharedString,
+    pub id: SharedString,
+    pub author: SharedString,
+}
+
+#[derive(Default)]
+pub enum BlameState {
+    #[default]
+    Idle,
+    Loading,
+    Ready {
+        lines: Vec<BlameLineRow>,
+        truncated: bool,
+    },
+    Failed(SharedString),
+}
+
+/// Lazy-loaded state for a drawer tab whose data is fetched on first view.
+#[derive(Default, PartialEq)]
+pub enum ReadmeState {
+    /// Not requested yet.
+    #[default]
+    Idle,
+    Loading,
+    /// Loaded — `None` means the repo has no README file.
+    Ready(Option<SharedString>),
+}
+
+/// A render-ready open pull request (flattened from `inbox::PrDetail`).
+pub struct PrRow {
+    pub number: u64,
+    pub title: SharedString,
+    pub url: SharedString,
+    pub draft: bool,
+    pub author: SharedString,
+    pub refs: SharedString,         // "head → base"
+    pub mergeable: SharedString,    // clean | conflicting | unknown
+    pub review: SharedString,       // approved | changes_requested | review_required | none
+    pub checks: SharedString,       // success | failure | pending | none (rollup)
+    pub check_runs: Vec<CheckItem>, // individual status checks / CI contexts
+}
+
+/// One status check on a PR, for the per-check breakdown under the rollup.
+pub struct CheckItem {
+    pub name: SharedString,
+    pub state: SharedString, // success | failure | pending | neutral
+    pub url: Option<SharedString>,
+}
+
+/// Lazy-loaded PR panel state (network).
+#[derive(Default)]
+pub enum PrState {
+    #[default]
+    Idle,
+    Loading,
+    Ready {
+        methods: Vec<SharedString>,
+        prs: Vec<PrRow>,
+    },
+    /// Not applicable (non-GitHub) or the fetch failed.
+    Error(SharedString),
+}
+
+/// Lazy-loaded diff state (sync git, but loaded off the UI thread).
+#[derive(Default)]
+pub enum DiffState {
+    #[default]
+    Idle,
+    Loading,
+    /// The diff's hunks (empty when the selected file has no diff on its side).
+    Ready(Vec<HunkRow>),
+}
+
+/// One hunk of the selected file's diff, render-ready
+/// ([`git_ops::Hunk`] flattened; the vec position is the stage/unstage index).
+pub struct HunkRow {
+    /// The `@@ -a,b +c,d @@ …` header line.
+    pub header: SharedString,
+    /// Body lines, origin-char prefixed (single lines by construction).
+    pub lines: Vec<SharedString>,
+}
+
+/// One pending change in the Changes tab's Unstaged/Staged lists (render-ready
+/// [`git_ops::FileChange`]). A path staged and then further edited appears in
+/// both lists.
+pub struct ChangeRow {
+    pub path: SharedString,
+    pub kind: git_ops::ChangeKind,
+    pub staged: bool,
+}
+
+/// Notes tab data: the "resume where I left off" catch-up line (the note text
+/// itself lives in `DrawerData::note_input`).
+pub struct NotesData {
+    pub catchup: SharedString,
+    /// Commits since last seen — drives whether "Mark caught up" is offered.
+    pub count: usize,
+    pub first_visit: bool,
+    /// AI "what changed" narrative, once generated (gated on `aiReady`).
+    pub resume: Option<SharedString>,
+}
+
+/// Async-loaded data for the currently open repo's drawer. Overview loads on
+/// open; Readme/PR/Changes/Notes load lazily when their tabs are first shown.
+#[derive(Default)]
+pub struct DrawerData {
+    pub repo: SharedString,
+    pub branch_picker_open: bool,
+    pub branches: Option<Vec<BranchRow>>,
+    pub worktrees: Option<Vec<WorktreeRow>>,
+    pub readme: ReadmeState,
+    pub pr: PrState,
+    /// The selected file's diff (per-file, capped render — see [`diff_block`]).
+    pub diff: DiffState,
+    /// The Changes tab's file lists; `None` until the tab first loads them.
+    pub changes: Option<Vec<ChangeRow>>,
+    /// The file whose diff the pane shows, as (path, staged-side).
+    pub change_sel: Option<(SharedString, bool)>,
+    /// AI-generated commit message for the staged diff, once requested, as
+    /// (subject, body) — the body may be empty. Errors land in the subject.
+    pub commit_suggestion: Option<(SharedString, SharedString)>,
+    /// AI-generated changelog from recent commits, once requested.
+    pub changelog: Option<SharedString>,
+    /// Notes tab (catch-up + saved note); `None` until first shown.
+    pub notes: Option<NotesData>,
+    /// The editable note field (gpui-component multiline input), seeded from the
+    /// saved note when the Notes tab first opens.
+    pub note_input: Option<Entity<gpui_component::input::InputState>>,
+    /// The commit-subject field for the Changes tab, created when it first opens.
+    pub commit_input: Option<Entity<gpui_component::input::InputState>>,
+    /// The optional multi-line commit-body field, created with `commit_input`.
+    pub commit_body_input: Option<Entity<gpui_component::input::InputState>>,
+    /// The new-worktree name field (Overview), created when the drawer opens.
+    pub worktree_input: Option<Entity<gpui_component::input::InputState>>,
+    /// The repo's default branch (origin/HEAD else main/master), loaded with
+    /// the Overview — the base for "Open PR" and its visibility check.
+    pub default_branch: Option<SharedString>,
+    /// The repo's cached default-branch CI state (central pass, #183), looked
+    /// up from the app's `ci_states` when the drawer opens — the Overview's
+    /// CI line. `None` for non-GitHub repos or before the first pass.
+    pub ci: Option<repoharbor_core::cache::CiEntry>,
+    /// A commit landed in this drawer session — keeps Push offered even while
+    /// the grid row's ahead count is stale (no upstream / pre-rescan).
+    pub committed: bool,
+    /// A push kicked off from this drawer is still running.
+    pub push_busy: bool,
+    /// Hard-reset confirm armed (second click executes).
+    pub reset_hard_armed: bool,
+    /// A hard-reset kicked off from this drawer is still running.
+    pub reset_hard_busy: bool,
+    /// An "Open PR" flow kicked off from this drawer is still running.
+    pub pr_busy: bool,
+    /// The PR created from this drawer, for the "View PR" affordance.
+    pub pr_url: Option<SharedString>,
+    /// The agent-dispatch task field (Overview), created when the drawer opens.
+    pub dispatch_input: Option<Entity<gpui_component::input::InputState>>,
+    /// Whether "Dispatch" runs the agent on a fresh worktree (#185).
+    pub dispatch_fresh: bool,
+    /// History tab graph; `None` until the tab first loads it.
+    pub history: Option<Vec<HistoryRow>>,
+    /// Index of the selected history row.
+    pub history_sel: Option<usize>,
+    /// Files touched by the selected history commit.
+    pub history_files: Option<Vec<SharedString>>,
+    /// Stash entries for the Work tab.
+    pub stash: Option<Vec<StashRow>>,
+    /// Unresolved conflict paths for the Work tab banner.
+    pub conflicts: Option<Vec<SharedString>>,
+    /// Blame for the file last requested from Work or History.
+    pub blame: BlameState,
+    /// Repo-relative path the blame pane is showing.
+    pub blame_file: Option<SharedString>,
+}
+
+impl DrawerData {
+    /// Fresh, all-loading state for a newly opened repo.
+    pub fn loading(repo: SharedString) -> Self {
+        DrawerData {
+            repo,
+            ..Default::default()
+        }
+    }
+}
+
+type Loaded = (
+    Vec<git_ops::BranchInfo>,
+    Vec<git_ops::WorktreeInfo>,
+    Option<String>,
+);
+
+/// Read branches + worktrees + the default branch for `id` (all git-heavy —
+/// runs on the background pool). Commit history loads on the History tab.
+fn read_overview(id: &str) -> Loaded {
+    (
+        git_ops::branches(id).unwrap_or_default(),
+        git_ops::worktrees(id).unwrap_or_default(),
+        git_ops::default_branch(id),
+    )
+}
+
+/// Apply a finished Overview load to the app, but only if the drawer still shows
+/// the same repo (else the user moved on and this is stale).
+fn store_overview(
+    this: &WeakEntity<RepoHarborApp>,
+    cx: &mut AsyncApp,
+    repo: &SharedString,
+    loaded: Loaded,
+) {
+    let (branches, worktrees, default_branch) = loaded;
+    let _ = this.update(cx, |this, cx| {
+        if &this.drawer.repo != repo {
+            return;
+        }
+        this.drawer.branches = Some(branches.into_iter().map(branch_row).collect());
+        this.drawer.worktrees = Some(worktrees.into_iter().map(worktree_row).collect());
+        this.drawer.default_branch = default_branch.map(Into::into);
+        cx.notify();
+    });
+}
+
+/// Kick off the Overview load for `repo` (branches/worktrees).
+pub fn load_overview(repo: SharedString, cx: &mut Context<RepoHarborApp>) {
+    let id = repo.to_string();
+    cx.spawn(async move |this, cx| {
+        let loaded = cx
+            .background_executor()
+            .spawn(async move { read_overview(&id) })
+            .await;
+        store_overview(&this, cx, &repo, loaded);
+    })
+    .detach();
+}
+
+/// Switch `repo` to `name`, then refresh the Overview. Spawn-only (the caller,
+/// already holding `&mut RepoHarborApp`, sets the loading state). The `.git/HEAD`
+/// change also trips the filesystem watcher, so the card row refreshes on its own.
+pub fn switch_branch(repo: SharedString, name: SharedString, cx: &mut Context<RepoHarborApp>) {
+    let (id, branch) = (repo.to_string(), name.to_string());
+    cx.spawn(async move |this, cx| {
+        let loaded = cx
+            .background_executor()
+            .spawn(async move {
+                let _ = git_ops::switch_branch(&id, &branch);
+                read_overview(&id)
+            })
+            .await;
+        store_overview(&this, cx, &repo, loaded);
+    })
+    .detach();
+}
+
+/// Merge `source` branch into HEAD for `repo`.
+pub fn merge_branch(
+    repo: SharedString,
+    source: SharedString,
+    strategy: repoharbor_core::git_ops::MergeStrategy,
+    cx: &mut Context<RepoHarborApp>,
+) {
+    let (id, branch) = (repo.to_string(), source.to_string());
+    cx.spawn(async move |this, cx| {
+        let (outcome, loaded) = cx
+            .background_executor()
+            .spawn(async move {
+                let outcome = repoharbor_core::git_ops::merge_branch(&id, &branch, strategy, None);
+                let loaded = read_overview(&id);
+                (outcome, loaded)
+            })
+            .await;
+        store_overview(&this, cx, &repo, loaded);
+        let _ = this.update(cx, |this, cx| {
+            match outcome {
+                Ok(repoharbor_core::git_ops::MergeOutcome::FastForwarded { commits }) => {
+                    this.push_toast(
+                        crate::toast::ToastKind::Success,
+                        "Fast-forwarded",
+                        Some(
+                            format!(
+                                "Merged '{source}' ({commits} commit{})",
+                                if commits == 1 { "" } else { "s" }
+                            )
+                            .into(),
+                        ),
+                        cx,
+                    );
+                }
+                Ok(repoharbor_core::git_ops::MergeOutcome::Merged { summary }) => {
+                    this.push_toast(
+                        crate::toast::ToastKind::Success,
+                        "Merged branch",
+                        Some(summary.into()),
+                        cx,
+                    );
+                }
+                Ok(repoharbor_core::git_ops::MergeOutcome::Squashed { commits }) => {
+                    this.push_toast(
+                        crate::toast::ToastKind::Success,
+                        "Squashed changes",
+                        Some(
+                            format!("Squashed {commits} commit(s) from '{source}' into index")
+                                .into(),
+                        ),
+                        cx,
+                    );
+                }
+                Ok(repoharbor_core::git_ops::MergeOutcome::UpToDate) => {
+                    this.push_toast(
+                        crate::toast::ToastKind::Info,
+                        "Already up to date",
+                        Some(format!("Branch '{source}' is already merged into HEAD").into()),
+                        cx,
+                    );
+                }
+                Ok(repoharbor_core::git_ops::MergeOutcome::Conflict { files }) => {
+                    this.push_toast(
+                        crate::toast::ToastKind::Error,
+                        "Merge conflicts",
+                        Some(
+                            format!(
+                                "{} conflicting file(s) — open in IDE or diff tool",
+                                files.len()
+                            )
+                            .into(),
+                        ),
+                        cx,
+                    );
+                }
+                Err(e) => {
+                    this.push_toast(
+                        crate::toast::ToastKind::Error,
+                        "Merge failed",
+                        Some(e.into()),
+                        cx,
+                    );
+                }
+            }
+            load_changes(repo.clone(), cx);
+            load_work_meta(repo.clone(), cx);
+            this.rescan(cx);
+            cx.notify();
+        });
+    })
+    .detach();
+}
+
+/// Abort an in-progress merge for `repo`.
+pub fn abort_merge(repo: SharedString, cx: &mut Context<RepoHarborApp>) {
+    let id = repo.to_string();
+    cx.spawn(async move |this, cx| {
+        let (res, loaded) = cx
+            .background_executor()
+            .spawn(async move {
+                let res = repoharbor_core::git_ops::abort_merge(&id);
+                let loaded = read_overview(&id);
+                (res, loaded)
+            })
+            .await;
+        store_overview(&this, cx, &repo, loaded);
+        let _ = this.update(cx, |this, cx| {
+            match res {
+                Ok(()) => {
+                    this.push_toast(
+                        crate::toast::ToastKind::Success,
+                        "Merge aborted",
+                        Some("Working tree restored to pre-merge state".into()),
+                        cx,
+                    );
+                }
+                Err(e) => {
+                    this.push_toast(
+                        crate::toast::ToastKind::Error,
+                        "Abort failed",
+                        Some(e.into()),
+                        cx,
+                    );
+                }
+            }
+            load_changes(repo.clone(), cx);
+            load_work_meta(repo.clone(), cx);
+            this.rescan(cx);
+            cx.notify();
+        });
+    })
+    .detach();
+}
+
+/// Lazily load the repo's README (filesystem, sync) when the Readme tab opens.
+pub fn load_readme(repo: SharedString, cx: &mut Context<RepoHarborApp>) {
+    let id = repo.to_string();
+    cx.spawn(async move |this, cx| {
+        let content = cx
+            .background_executor()
+            .spawn(async move { read_readme(&id) })
+            .await;
+        let _ = this.update(cx, |this, cx| {
+            if this.drawer.repo == repo {
+                this.drawer.readme = ReadmeState::Ready(content.map(SharedString::from));
+                cx.notify();
+            }
+        });
+    })
+    .detach();
+}
+
+fn change_row(c: git_ops::FileChange) -> ChangeRow {
+    ChangeRow {
+        path: c.path.into(),
+        kind: c.kind,
+        staged: c.staged,
+    }
+}
+
+/// Lazily load the Changes tab's file lists (sync git, off the UI thread).
+/// The store step auto-selects a file and loads its diff.
+pub fn load_changes(repo: SharedString, cx: &mut Context<RepoHarborApp>) {
+    let id = repo.to_string();
+    cx.spawn(async move |this, cx| {
+        let list = cx
+            .background_executor()
+            .spawn(async move { git_ops::changes(&id).unwrap_or_default() })
+            .await;
+        let _ = this.update(cx, |this, cx| {
+            if this.drawer.repo == repo {
+                store_changes(this, list, cx);
+            }
+        });
+    })
+    .detach();
+}
+
+/// Stash list + conflict paths for the Work tab. Runs beside [`load_changes`].
+pub fn load_work_meta(repo: SharedString, cx: &mut Context<RepoHarborApp>) {
+    let id = repo.to_string();
+    cx.spawn(async move |this, cx| {
+        let (stash, conflicts) = cx
+            .background_executor()
+            .spawn(async move {
+                (
+                    git_ops::stash_list(&id).unwrap_or_default(),
+                    git_ops::conflict_paths(&id).unwrap_or_default(),
+                )
+            })
+            .await;
+        let _ = this.update(cx, |this, cx| {
+            if this.drawer.repo != repo {
+                return;
+            }
+            this.drawer.stash = Some(
+                stash
+                    .into_iter()
+                    .map(|s| StashRow {
+                        index: s.index,
+                        id: s.id.into(),
+                        message: s.message.into(),
+                    })
+                    .collect(),
+            );
+            this.drawer.conflicts = Some(conflicts.into_iter().map(SharedString::from).collect());
+            cx.notify();
+        });
+    })
+    .detach();
+}
+
+/// Apply or drop stash `index`, then refresh Work.
+pub fn stash_op(repo: SharedString, index: usize, apply: bool, cx: &mut Context<RepoHarborApp>) {
+    cx.spawn(async move |this, cx| {
+        let id = repo.to_string();
+        let result = cx
+            .background_executor()
+            .spawn(async move {
+                if apply {
+                    git_ops::stash_apply(&id, index)
+                } else {
+                    git_ops::stash_drop(&id, index)
+                }
+            })
+            .await;
+        let _ = this.update(cx, |this, cx| {
+            if this.drawer.repo != repo {
+                return;
+            }
+            match result {
+                Ok(()) => {
+                    this.push_toast(
+                        ToastKind::Success,
+                        if apply {
+                            "Stash applied"
+                        } else {
+                            "Stash dropped"
+                        },
+                        None,
+                        cx,
+                    );
+                    load_work_meta(repo.clone(), cx);
+                    load_changes(repo, cx);
+                }
+                Err(e) => {
+                    this.push_toast(ToastKind::Error, "Stash failed", Some(e.into()), cx);
+                }
+            }
+            cx.notify();
+        });
+    })
+    .detach();
+}
+
+/// Stash uncommitted changes, then refresh Work.
+pub fn stash_save(repo: SharedString, cx: &mut Context<RepoHarborApp>) {
+    cx.spawn(async move |this, cx| {
+        let id = repo.to_string();
+        let result = cx
+            .background_executor()
+            .spawn(async move { git_ops::stash(&id) })
+            .await;
+        let _ = this.update(cx, |this, cx| {
+            if this.drawer.repo != repo {
+                return;
+            }
+            match result {
+                Ok(git_ops::OpOutcome::Skipped(why)) => {
+                    this.push_toast(ToastKind::Info, "Nothing to stash", Some(why.into()), cx);
+                }
+                Ok(git_ops::OpOutcome::Done(_)) => {
+                    this.push_toast(ToastKind::Success, "Changes stashed", None, cx);
+                    load_work_meta(repo.clone(), cx);
+                    load_changes(repo, cx);
+                }
+                Err(e) => {
+                    this.push_toast(ToastKind::Error, "Stash failed", Some(e.into()), cx);
+                }
+            }
+            cx.notify();
+        });
+    })
+    .detach();
+}
+
+/// History graph for the open repo.
+pub fn load_history(repo: SharedString, cx: &mut Context<RepoHarborApp>) {
+    let id = repo.to_string();
+    cx.spawn(async move |this, cx| {
+        let now = data::now_unix();
+        let rows = cx
+            .background_executor()
+            .spawn(async move { git_ops::history(&id, HISTORY_LIMIT).unwrap_or_default() })
+            .await;
+        let _ = this.update(cx, |this, cx| {
+            if this.drawer.repo != repo {
+                return;
+            }
+            this.drawer.history = Some(
+                rows.into_iter()
+                    .map(|c| HistoryRow {
+                        id: c.id.into(),
+                        summary: c.summary.into(),
+                        author: c.author.into(),
+                        age: data::rel_age(c.time_unix, now).into(),
+                        parents: c.parents.into_iter().map(SharedString::from).collect(),
+                        lane: c.lane,
+                    })
+                    .collect(),
+            );
+            cx.notify();
+        });
+    })
+    .detach();
+}
+
+/// Files touched by history commit `id`, stored for the blame picker.
+pub fn load_history_files(repo: SharedString, id: SharedString, cx: &mut Context<RepoHarborApp>) {
+    let path = repo.to_string();
+    let prefix = id.to_string();
+    cx.spawn(async move |this, cx| {
+        let files = cx
+            .background_executor()
+            .spawn(async move { git_ops::commit_files(&path, &prefix).unwrap_or_default() })
+            .await;
+        let _ = this.update(cx, |this, cx| {
+            if this.drawer.repo != repo {
+                return;
+            }
+            this.drawer.history_files = Some(files.into_iter().map(SharedString::from).collect());
+            cx.notify();
+        });
+    })
+    .detach();
+}
+
+/// Blame `file`. `newest` is a commit prefix when blaming from History.
+pub fn load_blame(
+    repo: SharedString,
+    file: SharedString,
+    newest: Option<String>,
+    cx: &mut Context<RepoHarborApp>,
+) {
+    let path = repo.to_string();
+    let rel = file.to_string();
+    cx.spawn(async move |this, cx| {
+        let lines = cx
+            .background_executor()
+            .spawn(async move { git_ops::blame_lines(&path, &rel, newest.as_deref()) })
+            .await;
+        let _ = this.update(cx, |this, cx| {
+            if this.drawer.repo != repo || this.drawer.blame_file.as_ref() != Some(&file) {
+                return;
+            }
+            this.drawer.blame = match lines {
+                Ok((rows, truncated)) => BlameState::Ready {
+                    lines: rows
+                        .into_iter()
+                        .map(|s| BlameLineRow {
+                            number: s.number,
+                            text: s.text.into(),
+                            id: s.id.into(),
+                            author: s.author.into(),
+                        })
+                        .collect(),
+                    truncated,
+                },
+                Err(e) => BlameState::Failed(e.into()),
+            };
+            cx.notify();
+        });
+    })
+    .detach();
+}
+
+/// Apply freshly read file lists: keep the selection if its entry survived
+/// (same path on the other side counts — the file just moved lists), else fall
+/// back to the first entry, then (re)load the selected file's diff. Runs after
+/// every load / stage / unstage / commit, so the pane always tracks the index.
+fn store_changes(
+    this: &mut RepoHarborApp,
+    list: Vec<git_ops::FileChange>,
+    cx: &mut Context<RepoHarborApp>,
+) {
+    let list: Vec<ChangeRow> = list.into_iter().map(change_row).collect();
+    let sel = this
+        .drawer
+        .change_sel
+        .take()
+        .and_then(|(p, s)| {
+            if list.iter().any(|c| c.path == p && c.staged == s) {
+                Some((p, s))
+            } else {
+                list.iter()
+                    .find(|c| c.path == p)
+                    .map(|c| (c.path.clone(), c.staged))
+            }
+        })
+        .or_else(|| list.first().map(|c| (c.path.clone(), c.staged)));
+    this.drawer.changes = Some(list);
+    this.drawer.change_sel = sel.clone();
+    match sel {
+        Some((path, staged)) => {
+            this.drawer.diff = DiffState::Loading;
+            load_file_diff(this.drawer.repo.clone(), path, staged, cx);
+        }
+        None => this.drawer.diff = DiffState::Ready(Vec::new()),
+    }
+    cx.notify();
+}
+
+/// Show `path`'s diff (from the staged or unstaged side) in the pane.
+fn select_change(
+    this: &mut RepoHarborApp,
+    path: SharedString,
+    staged: bool,
+    cx: &mut Context<RepoHarborApp>,
+) {
+    if this
+        .drawer
+        .change_sel
+        .as_ref()
+        .is_some_and(|(p, s)| *p == path && *s == staged)
+    {
+        return;
+    }
+    this.drawer.change_sel = Some((path.clone(), staged));
+    this.drawer.diff = DiffState::Loading;
+    load_file_diff(this.drawer.repo.clone(), path, staged, cx);
+    cx.notify();
+}
+
+/// Load one file's diff as hunks (sync git, off the UI thread). The result is
+/// dropped if the drawer moved on or the selection changed while in flight.
+fn load_file_diff(
+    repo: SharedString,
+    path: SharedString,
+    staged: bool,
+    cx: &mut Context<RepoHarborApp>,
+) {
+    let (id, file) = (repo.to_string(), path.to_string());
+    cx.spawn(async move |this, cx| {
+        let hunks = cx
+            .background_executor()
+            .spawn(async move { git_ops::file_hunks(&id, &file, staged).unwrap_or_default() })
+            .await;
+        let _ = this.update(cx, |this, cx| {
+            let still_selected = this
+                .drawer
+                .change_sel
+                .as_ref()
+                .is_some_and(|(p, s)| *p == path && *s == staged);
+            if this.drawer.repo == repo && still_selected {
+                this.drawer.diff = DiffState::Ready(hunks.into_iter().map(hunk_row).collect());
+                cx.notify();
+            }
+        });
+    })
+    .detach();
+}
+
+/// Flatten a [`git_ops::Hunk`] for rendering (all single lines — GPUI text
+/// elements panic on embedded newlines, and `lines()` guarantees none).
+fn hunk_row(h: git_ops::Hunk) -> HunkRow {
+    HunkRow {
+        header: h.header.into(),
+        lines: h.lines.into_iter().map(SharedString::from).collect(),
+    }
+}
+
+/// Write `text` to the system clipboard and toast success (Settings About pattern).
+fn copy_text(app: &Entity<RepoHarborApp>, text: String, title: &'static str, cx: &mut App) {
+    cx.write_to_clipboard(ClipboardItem::new_string(text));
+    app.update(cx, |this, cx| {
+        this.push_toast(ToastKind::Success, title, None, cx);
+    });
+}
+
+/// Copy one file's staged/unstaged unified patch (full `git_ops::file_diff`).
+fn copy_file_diff(
+    repo: SharedString,
+    path: SharedString,
+    staged: bool,
+    cx: &mut Context<RepoHarborApp>,
+) {
+    let (id, file) = (repo.to_string(), path.to_string());
+    cx.spawn(async move |this, cx| {
+        let patch = cx
+            .background_executor()
+            .spawn(async move { git_ops::file_diff(&id, &file, staged) })
+            .await;
+        let _ = this.update(cx, |this, cx| match patch {
+            Ok(text) if text.trim().is_empty() => {
+                this.push_toast(
+                    ToastKind::Info,
+                    "Nothing to copy",
+                    Some("No diff for this file.".into()),
+                    cx,
+                );
+            }
+            Ok(text) => {
+                cx.write_to_clipboard(ClipboardItem::new_string(text));
+                this.push_toast(ToastKind::Success, "Diff copied", None, cx);
+            }
+            Err(e) => {
+                this.push_toast(ToastKind::Error, "Copy diff failed", Some(e.into()), cx);
+            }
+        });
+    })
+    .detach();
+}
+
+/// Stage (or unstage) one hunk of the selected file, then re-read the file
+/// lists + diff exactly like the file-level ops do. `staged` is the side the
+/// hunk was shown on (staged → unstage it). Failures surface as a toast.
+fn hunk_op(
+    repo: SharedString,
+    path: SharedString,
+    staged: bool,
+    hunk_ix: usize,
+    cx: &mut Context<RepoHarborApp>,
+) {
+    let (id, file) = (repo.to_string(), path.to_string());
+    cx.spawn(async move |this, cx| {
+        let (result, list) = cx
+            .background_executor()
+            .spawn(async move {
+                let result = if staged {
+                    git_ops::unstage_hunk(&id, &file, hunk_ix)
+                } else {
+                    git_ops::stage_hunk(&id, &file, hunk_ix)
+                };
+                (result, git_ops::changes(&id).unwrap_or_default())
+            })
+            .await;
+        let _ = this.update(cx, |this, cx| {
+            if let Err(e) = result {
+                let title = if staged {
+                    "Unstage hunk failed"
+                } else {
+                    "Stage hunk failed"
+                };
+                this.push_toast(ToastKind::Error, title, Some(e.into()), cx);
+            }
+            if this.drawer.repo == repo {
+                store_changes(this, list, cx);
+            }
+        });
+    })
+    .detach();
+}
+
+/// Stage (or unstage) `paths`, then re-read the file lists + selected diff.
+/// Failures surface as an error toast rather than vanishing silently.
+fn set_staged(
+    repo: SharedString,
+    paths: Vec<String>,
+    stage: bool,
+    cx: &mut Context<RepoHarborApp>,
+) {
+    let id = repo.to_string();
+    cx.spawn(async move |this, cx| {
+        let (result, list) = cx
+            .background_executor()
+            .spawn(async move {
+                let result = if stage {
+                    git_ops::stage_paths(&id, &paths)
+                } else {
+                    git_ops::unstage_paths(&id, &paths)
+                };
+                (result, git_ops::changes(&id).unwrap_or_default())
+            })
+            .await;
+        let _ = this.update(cx, |this, cx| {
+            if let Err(e) = result {
+                let title = if stage {
+                    "Stage failed"
+                } else {
+                    "Unstage failed"
+                };
+                this.push_toast(ToastKind::Error, title, Some(e.into()), cx);
+            }
+            if this.drawer.repo == repo {
+                store_changes(this, list, cx);
+            }
+        });
+    })
+    .detach();
+}
+
+/// Join a commit subject and optional body with the conventional blank line.
+/// Both sides are trimmed; an empty body yields just the subject.
+fn full_commit_message(subject: &str, body: &str) -> String {
+    let (subject, body) = (subject.trim(), body.trim());
+    if body.is_empty() {
+        subject.to_string()
+    } else {
+        format!("{subject}\n\n{body}")
+    }
+}
+
+/// Commit the index as-is with `message`, toast the outcome, then refresh the
+/// file lists + diff. The commit also trips the watcher, refreshing the card.
+fn commit_staged(repo: SharedString, message: String, cx: &mut Context<RepoHarborApp>) {
+    commit_with(repo, message, false, cx);
+}
+
+/// Stage any remaining unstaged changes, then commit — Cursor/PyCharm style.
+fn commit_all_changes(repo: SharedString, message: String, cx: &mut Context<RepoHarborApp>) {
+    commit_with(repo, message, true, cx);
+}
+
+fn commit_with(
+    repo: SharedString,
+    message: String,
+    stage_all: bool,
+    cx: &mut Context<RepoHarborApp>,
+) {
+    let id = repo.to_string();
+    // The commit subject, for the success toast's detail line.
+    let subject = message.lines().next().unwrap_or("").trim().to_string();
+    cx.spawn(async move |this, cx| {
+        let (result, list) = cx
+            .background_executor()
+            .spawn(async move {
+                let result = if stage_all {
+                    git_ops::commit_all(&id, message.trim())
+                } else {
+                    git_ops::commit(&id, message.trim())
+                };
+                (result, git_ops::changes(&id).unwrap_or_default())
+            })
+            .await;
+        let _ = this.update(cx, |this, cx| {
+            // The toast is global feedback — push it even if the drawer moved on.
+            match &result {
+                Ok(hash) => {
+                    this.push_toast(
+                        ToastKind::Success,
+                        format!("Committed {hash}"),
+                        Some(subject.clone().into()),
+                        cx,
+                    );
+                }
+                Err(e) => {
+                    this.push_toast(
+                        ToastKind::Error,
+                        "Commit failed",
+                        Some(e.clone().into()),
+                        cx,
+                    );
+                }
+            }
+            if this.drawer.repo != repo {
+                return;
+            }
+            if result.is_ok() {
+                this.drawer.commit_suggestion = None;
+                // Offer Push even while the grid row's ahead count is stale.
+                this.drawer.committed = true;
+            }
+            store_changes(this, list, cx);
+        });
+    })
+    .detach();
+}
+
+/// Read the "resume where I left off" catch-up for a repo (sync). The note text
+/// itself is seeded straight into the editable field at tab-open.
+fn read_notes(id: &str) -> NotesData {
+    let (catchup, count, first_visit) = match cache::seen_sha(id) {
+        None => (
+            "First visit — nothing to catch up on yet.".to_string(),
+            0,
+            true,
+        ),
+        Some(since) => {
+            let n = git_ops::log_since_sha(id, &since, 50)
+                .map(|c| c.len())
+                .unwrap_or(0);
+            let msg = match n {
+                0 => "All caught up since you last looked.".to_string(),
+                1 => "1 commit since you last looked.".to_string(),
+                n => format!("{n} commits since you last looked."),
+            };
+            (msg, n, false)
+        }
+    };
+    NotesData {
+        catchup: catchup.into(),
+        count,
+        first_visit,
+        resume: None,
+    }
+}
+
+/// Lazily load the Notes tab data when it first opens.
+pub fn load_notes(repo: SharedString, cx: &mut Context<RepoHarborApp>) {
+    let id = repo.to_string();
+    cx.spawn(async move |this, cx| {
+        let notes = cx
+            .background_executor()
+            .spawn(async move { read_notes(&id) })
+            .await;
+        let _ = this.update(cx, |this, cx| {
+            if this.drawer.repo == repo {
+                this.drawer.notes = Some(notes);
+                cx.notify();
+            }
+        });
+    })
+    .detach();
+}
+
+/// Persist the edited note (off the UI thread).
+fn save_note(repo: SharedString, text: String, cx: &mut Context<RepoHarborApp>) {
+    let id = repo.to_string();
+    cx.spawn(async move |_this, cx| {
+        cx.background_executor()
+            .spawn(async move {
+                let _ = cache::set_note(&id, &text);
+            })
+            .await;
+    })
+    .detach();
+}
+
+/// Record the current HEAD as "seen", then refresh the catch-up.
+fn mark_seen(repo: SharedString, cx: &mut Context<RepoHarborApp>) {
+    let now = data::now_unix();
+    let id = repo.to_string();
+    cx.spawn(async move |this, cx| {
+        let notes = cx
+            .background_executor()
+            .spawn(async move {
+                if let Ok(sha) = git_ops::head_sha(&id) {
+                    let _ = cache::set_seen(&id, &sha, now);
+                }
+                read_notes(&id)
+            })
+            .await;
+        let _ = this.update(cx, |this, cx| {
+            if this.drawer.repo == repo {
+                this.drawer.notes = Some(notes);
+                cx.notify();
+            }
+        });
+    })
+    .detach();
+}
+
+/// Create a worktree (+ branch) `name` in a sibling dir, then refresh Overview.
+fn add_worktree(repo: SharedString, name: String, cx: &mut Context<RepoHarborApp>) {
+    let id = repo.to_string();
+    let dest = format!("{id}-{name}");
+    cx.spawn(async move |this, cx| {
+        let loaded = cx
+            .background_executor()
+            .spawn(async move {
+                let _ = git_ops::add_worktree(&id, &name, &dest);
+                read_overview(&id)
+            })
+            .await;
+        store_overview(&this, cx, &repo, loaded);
+    })
+    .detach();
+}
+
+/// Unlink worktree `name` (leaves files on disk), then refresh Overview.
+fn remove_worktree(repo: SharedString, name: String, cx: &mut Context<RepoHarborApp>) {
+    let id = repo.to_string();
+    cx.spawn(async move |this, cx| {
+        let loaded = cx
+            .background_executor()
+            .spawn(async move {
+                let _ = git_ops::remove_worktree(&id, &name);
+                read_overview(&id)
+            })
+            .await;
+        store_overview(&this, cx, &repo, loaded);
+    })
+    .detach();
+}
+
+/// Read the first matching README from the repo root (mirrors the Tauri
+/// `repo_readme` command).
+fn read_readme(id: &str) -> Option<String> {
+    const NAMES: [&str; 5] = [
+        "README.md",
+        "Readme.md",
+        "readme.md",
+        "README.markdown",
+        "README",
+    ];
+    NAMES
+        .iter()
+        .find_map(|name| std::fs::read_to_string(std::path::Path::new(id).join(name)).ok())
+}
+
+fn branch_row(b: git_ops::BranchInfo) -> BranchRow {
+    BranchRow {
+        name: b.name.into(),
+        current: b.is_head,
+        gone: b.gone,
+        merged: b.merged,
+    }
+}
+
+fn worktree_row(w: git_ops::WorktreeInfo) -> WorktreeRow {
+    WorktreeRow {
+        name: w.name.into(),
+        path: w.path.into(),
+    }
+}
+
+fn pr_row(p: inbox::PrDetail) -> PrRow {
+    PrRow {
+        number: p.number,
+        title: data::oneline(p.title).into(),
+        url: p.url.into(),
+        draft: p.draft,
+        author: p.author.unwrap_or_default().into(),
+        refs: format!("{} → {}", p.head, p.base).into(),
+        mergeable: p.mergeable.into(),
+        review: p.review_decision.into(),
+        checks: p.checks_state.into(),
+        check_runs: p
+            .checks
+            .into_iter()
+            .map(|c| CheckItem {
+                name: c.name.into(),
+                state: c.state.into(),
+                url: c.url.map(Into::into),
+            })
+            .collect(),
+    }
+}
+
+fn ready_pr(panel: inbox::PrPanel) -> PrState {
+    PrState::Ready {
+        methods: panel.merge_methods.into_iter().map(Into::into).collect(),
+        prs: panel.prs.into_iter().map(pr_row).collect(),
+    }
+}
+
+/// Lazily load the GitHub PR panel for `repo` (slug = owner/name). Network — runs
+/// on the shared tokio runtime via [`crate::task`].
+pub fn load_pr(repo: SharedString, slug: SharedString, cx: &mut Context<RepoHarborApp>) {
+    let s = slug.to_string();
+    cx.spawn(async move |this, cx| {
+        let result = crate::task::run(async move { inbox::github_prs(&s).await }).await;
+        let _ = this.update(cx, |this, cx| {
+            if this.drawer.repo != repo {
+                return;
+            }
+            this.drawer.pr = result
+                .map(ready_pr)
+                .unwrap_or_else(|e| PrState::Error(e.into()));
+            cx.notify();
+        });
+    })
+    .detach();
+}
+
+/// Merge PR `number` via `method`, then refresh the panel. Caller sets the
+/// loading state.
+fn merge_pr(
+    repo: SharedString,
+    slug: SharedString,
+    number: u64,
+    method: String,
+    cx: &mut Context<RepoHarborApp>,
+) {
+    let (do_slug, re_slug) = (slug.to_string(), slug.to_string());
+    cx.spawn(async move |this, cx| {
+        let _ = crate::task::run(
+            async move { inbox::github_merge_pr(&do_slug, number, &method).await },
+        )
+        .await;
+        let panel = crate::task::run(async move { inbox::github_prs(&re_slug).await }).await;
+        let _ = this.update(cx, |this, cx| {
+            if this.drawer.repo != repo {
+                return;
+            }
+            this.drawer.pr = panel
+                .map(ready_pr)
+                .unwrap_or_else(|e| PrState::Error(e.into()));
+            cx.notify();
+        });
+    })
+    .detach();
+}
+
+/// Approve PR `number`, then refresh the panel. Caller sets the loading state.
+fn approve_pr(
+    repo: SharedString,
+    slug: SharedString,
+    number: u64,
+    cx: &mut Context<RepoHarborApp>,
+) {
+    let (do_slug, re_slug) = (slug.to_string(), slug.to_string());
+    cx.spawn(async move |this, cx| {
+        let _ =
+            crate::task::run(async move { inbox::github_approve_pr(&do_slug, number).await }).await;
+        let panel = crate::task::run(async move { inbox::github_prs(&re_slug).await }).await;
+        let _ = this.update(cx, |this, cx| {
+            if this.drawer.repo != repo {
+                return;
+            }
+            this.drawer.pr = panel
+                .map(ready_pr)
+                .unwrap_or_else(|e| PrState::Error(e.into()));
+            cx.notify();
+        });
+    })
+    .detach();
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn drawer(
+    row: &Row,
+    tab: DrawerTab,
+    t: &Theme,
+    app: &Entity<RepoHarborApp>,
+    data: &DrawerData,
+    ide_cmd: &str,
+    agent_cmd: &str,
+    ai_ready: bool,
+    github_authed: bool,
+) -> impl IntoElement {
+    // Scrim: click anywhere outside the panel to dismiss.
+    let backdrop = {
+        let app = app.clone();
+        div()
+            .id("drawer-backdrop")
+            .flex_1()
+            .h_full()
+            .bg(rgba(0x00000066))
+            .on_click(move |_ev, _win, cx| {
+                app.update(cx, |this, cx| {
+                    this.close_overlay();
+                    cx.notify();
+                });
+            })
+    };
+
+    let mut panel = div()
+        .flex()
+        .flex_col()
+        .w(px(PANEL_W))
+        .h_full()
+        .bg(rgb(t.page))
+        .border_l_1()
+        .border_color(rgb(t.border))
+        .child(header(row, t, app, data));
+
+    if data.branch_picker_open {
+        panel = panel.child(branch_picker_dropdown(data.repo.clone(), data, t, app));
+    }
+
+    let panel = panel
+        .child(tab_bar(tab, t, app, data.repo.clone(), github_slug(row)))
+        .child(body(row, tab, t, data, app, ai_ready, github_authed))
+        .child(footer(row, t, app, ide_cmd, agent_cmd));
+
+    div()
+        .absolute()
+        .top(px(0.))
+        .left(px(0.))
+        .size_full()
+        .flex()
+        .flex_row()
+        // Modal: block all mouse interaction with the grid behind, so clicks on
+        // the panel don't also fall through to a card.
+        .occlude()
+        .child(backdrop)
+        .child(panel)
+}
+
+fn header(
+    row: &Row,
+    t: &Theme,
+    app: &Entity<RepoHarborApp>,
+    data: &DrawerData,
+) -> impl IntoElement {
+    let close = {
+        let app = app.clone();
+        div()
+            .id("drawer-close")
+            .flex()
+            .items_center()
+            .justify_center()
+            .w(px(30.))
+            .h(px(30.))
+            .rounded(px(t.r_sm))
+            .cursor_pointer()
+            .hover(|s| s.bg(rgb(t.surface_hover)))
+            .child(lucide("x", 17., t.fg1))
+            .on_click(move |_ev, _win, cx| {
+                app.update(cx, |this, cx| {
+                    this.close_overlay();
+                    cx.notify();
+                });
+            })
+    };
+
+    let mut title = div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(8.))
+        .text_size(px(t.text_h3))
+        .font_weight(FontWeight::SEMIBOLD)
+        .text_color(rgb(t.fg0))
+        .child(div().min_w(px(0.)).truncate().child(row.name.clone()));
+    if !row.host.is_empty() {
+        title = title.child(brand(&row.host, 15., t.fg2));
+    }
+    if !row.branch.is_empty() {
+        let app_br = app.clone();
+        let is_open = data.branch_picker_open;
+        let br_pill = div()
+            .id("drawer-branch-badge")
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(5.))
+            .px(px(8.))
+            .py(px(2.))
+            .rounded(px(t.r_sm))
+            .bg(rgb(if is_open { t.accent_wash } else { t.surface }))
+            .border_1()
+            .border_color(rgb(if is_open { t.accent_bright } else { t.border }))
+            .cursor_pointer()
+            .hover(move |s| {
+                s.border_color(rgb(t.accent_bright))
+                    .bg(rgb(t.surface_hover))
+            })
+            .on_click(move |_ev, _win, cx| {
+                app_br.update(cx, |this, cx| {
+                    this.drawer.branch_picker_open = !this.drawer.branch_picker_open;
+                    if this.drawer.branches.is_none() {
+                        load_overview(this.drawer.repo.clone(), cx);
+                    }
+                    cx.notify();
+                });
+            })
+            .child(lucide("git-branch", 13., t.accent_bright))
+            .child(
+                div()
+                    .font_family(MONO)
+                    .text_size(px(t.text_data_sm))
+                    .font_weight(FontWeight::NORMAL)
+                    .text_color(rgb(t.fg1))
+                    .child(row.branch.clone()),
+            )
+            .child(lucide(
+                if is_open {
+                    "chevron-up"
+                } else {
+                    "chevron-down"
+                },
+                12.,
+                t.fg2,
+            ));
+        title = title.child(br_pill);
+    }
+    if row.last_commit_unix > 0 {
+        let now = crate::data::now_unix();
+        title = title.child(crate::heatmap::render_mini_pulse(
+            &[row.last_commit_unix],
+            now,
+            t,
+        ));
+    }
+
+    let mut trailing = div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(6.))
+        .flex_shrink_0();
+    if !row.url.is_empty() {
+        let url = row.url.clone();
+        let label = crate::data::open_on_host_label(row.host.as_ref());
+        let (hov_border, hov_fg) = (t.border_strong, t.fg0);
+        trailing = trailing.child(
+            div()
+                .id("drawer-open-host")
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(6.))
+                .px(px(10.))
+                .py(px(6.))
+                .rounded(px(t.r_sm))
+                .bg(rgb(t.button_bg))
+                .border_1()
+                .border_color(rgb(t.border))
+                .font_family(MONO)
+                .text_size(px(t.text_data_sm))
+                .text_color(rgb(t.fg1))
+                .cursor_pointer()
+                .hover(move |s| s.border_color(rgb(hov_border)).text_color(rgb(hov_fg)))
+                .on_click(move |_ev, _win, _cx| {
+                    let _ = launch::open(&url);
+                })
+                .child(lucide("external-link", 13., t.fg2))
+                .child(SharedString::from(label)),
+        );
+    }
+    trailing = trailing.child(close);
+
+    div()
+        .flex()
+        .flex_row()
+        .items_start()
+        .gap(px(10.))
+        .px(px(18.))
+        .py(px(15.))
+        .border_b_1()
+        .border_color(rgb(t.border))
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .flex_1()
+                .min_w(px(0.))
+                .gap(px(4.))
+                .child(title)
+                .child(
+                    div()
+                        .truncate()
+                        .font_family(MONO)
+                        .text_size(px(t.text_data_sm))
+                        .text_color(rgb(t.fg2))
+                        .child(SharedString::from(format!("{} · {}", row.slug, row.path))),
+                ),
+        )
+        .child(trailing)
+}
+
+fn branch_picker_dropdown(
+    repo: SharedString,
+    data: &DrawerData,
+    t: &Theme,
+    app: &Entity<RepoHarborApp>,
+) -> impl IntoElement {
+    let mut dropdown = div()
+        .id("branch-picker-dropdown")
+        .flex()
+        .flex_col()
+        .p(px(8.))
+        .mx(px(18.))
+        .my(px(8.))
+        .gap(px(4.))
+        .bg(rgb(t.surface))
+        .border_1()
+        .border_color(rgb(t.border_strong))
+        .rounded(px(t.r_md));
+
+    let header = div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .justify_between()
+        .px(px(6.))
+        .py(px(4.))
+        .font_family(MONO)
+        .text_size(px(t.text_data_sm))
+        .text_color(rgb(t.fg2))
+        .child("Switch / Checkout branch")
+        .child(
+            div()
+                .id("branch-picker-close")
+                .cursor_pointer()
+                .hover(|s| s.text_color(rgb(t.fg0)))
+                .child(lucide("x", 14., t.fg2))
+                .on_click({
+                    let app = app.clone();
+                    move |_ev, _win, cx| {
+                        app.update(cx, |this, cx| {
+                            this.drawer.branch_picker_open = false;
+                            cx.notify();
+                        });
+                    }
+                }),
+        );
+    dropdown = dropdown.child(header);
+
+    match &data.branches {
+        None => {
+            dropdown = dropdown.child(
+                div()
+                    .px(px(8.))
+                    .py(px(10.))
+                    .font_family(MONO)
+                    .text_size(px(t.text_data_sm))
+                    .text_color(rgb(t.fg2))
+                    .child("Loading branches…"),
+            );
+        }
+        Some(branches) if branches.is_empty() => {
+            dropdown = dropdown.child(
+                div()
+                    .px(px(8.))
+                    .py(px(10.))
+                    .font_family(MONO)
+                    .text_size(px(t.text_data_sm))
+                    .text_color(rgb(t.fg2))
+                    .child("No local branches found."),
+            );
+        }
+        Some(branches) => {
+            let mut list = div()
+                .id("branch-picker-list")
+                .flex()
+                .flex_col()
+                .gap(px(2.))
+                .max_h(px(220.))
+                .overflow_y_scroll();
+
+            for b in branches {
+                let is_current = b.current;
+                let name = b.name.clone();
+                let repo = repo.clone();
+                let app = app.clone();
+
+                let mut row_el = div()
+                    .id(SharedString::from(format!("quick-branch-row-{}", b.name)))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .justify_between()
+                    .px(px(8.))
+                    .py(px(6.))
+                    .rounded(px(t.r_xs))
+                    .font_family(MONO)
+                    .text_size(px(t.text_data_sm))
+                    .gap(px(8.));
+
+                if is_current {
+                    row_el = row_el
+                        .bg(rgb(t.accent_wash))
+                        .text_color(rgb(t.accent_bright));
+                } else {
+                    row_el = row_el
+                        .cursor_pointer()
+                        .hover(|s| s.bg(rgb(t.surface_hover)).text_color(rgb(t.fg0)))
+                        .text_color(rgb(t.fg1));
+                }
+
+                let left = div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(6.))
+                    .min_w(px(0.))
+                    .truncate()
+                    .child(lucide(
+                        "git-branch",
+                        13.,
+                        if is_current { t.accent_bright } else { t.fg2 },
+                    ))
+                    .child(b.name.clone());
+
+                let mut right = div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(6.))
+                    .flex_shrink_0();
+
+                if b.gone {
+                    right = right.child(tag("gone", t.behind, t));
+                }
+                if b.merged {
+                    right = right.child(tag("merged", t.fg3, t));
+                }
+
+                if is_current {
+                    right = right.child(tag("current", t.accent_bright, t));
+                } else {
+                    let app2 = app.clone();
+                    let repo2 = repo.clone();
+                    let name2 = name.clone();
+                    let checkout_btn = div()
+                        .id(SharedString::from(format!("quick-checkout-{}", b.name)))
+                        .px(px(8.))
+                        .py(px(2.))
+                        .rounded(px(t.r_xs))
+                        .bg(rgb(t.button_bg))
+                        .border_1()
+                        .border_color(rgb(t.border))
+                        .text_color(rgb(t.fg1))
+                        .hover(|s| s.border_color(rgb(t.accent_bright)).text_color(rgb(t.fg0)))
+                        .on_click(move |_ev, _win, cx| {
+                            let (repo, name) = (repo2.clone(), name2.clone());
+                            app2.update(cx, |this, cx| {
+                                this.drawer.branch_picker_open = false;
+                                this.drawer.branches = None;
+                                switch_branch(repo, name, cx);
+                                cx.notify();
+                            });
+                        })
+                        .child("checkout");
+                    right = right.child(checkout_btn);
+
+                    let app_m = app.clone();
+                    let repo_m = repo.clone();
+                    let name_m = name.clone();
+                    let merge_btn = div()
+                        .id(SharedString::from(format!("quick-merge-{}", b.name)))
+                        .px(px(8.))
+                        .py(px(2.))
+                        .rounded(px(t.r_xs))
+                        .bg(rgb(t.button_bg))
+                        .border_1()
+                        .border_color(rgb(t.border))
+                        .text_color(rgb(t.fg1))
+                        .hover(|s| s.border_color(rgb(t.accent_bright)).text_color(rgb(t.fg0)))
+                        .on_click(move |_ev, _win, cx| {
+                            let (repo, name) = (repo_m.clone(), name_m.clone());
+                            app_m.update(cx, |this, cx| {
+                                this.drawer.branch_picker_open = false;
+                                merge_branch(
+                                    repo,
+                                    name,
+                                    repoharbor_core::git_ops::MergeStrategy::Auto,
+                                    cx,
+                                );
+                                cx.notify();
+                            });
+                        })
+                        .child("merge");
+                    right = right.child(merge_btn);
+                }
+
+                if !is_current {
+                    let app_row = app.clone();
+                    let repo_row = repo.clone();
+                    let name_row = name.clone();
+                    row_el = row_el.on_click(move |_ev, _win, cx| {
+                        let (repo, name) = (repo_row.clone(), name_row.clone());
+                        app_row.update(cx, |this, cx| {
+                            this.drawer.branch_picker_open = false;
+                            this.drawer.branches = None;
+                            switch_branch(repo, name, cx);
+                            cx.notify();
+                        });
+                    });
+                }
+
+                row_el = row_el.child(left).child(right);
+                list = list.child(row_el);
+            }
+            dropdown = dropdown.child(list);
+        }
+    }
+
+    dropdown
+}
+
+/// The owner/name slug if this repo is a usable GitHub remote, else `None`.
+pub(crate) fn github_slug(row: &Row) -> Option<SharedString> {
+    (row.host.as_ref() == "github" && row.slug.as_ref() != "no remote").then(|| row.slug.clone())
+}
+
+fn tab_bar(
+    active: DrawerTab,
+    t: &Theme,
+    app: &Entity<RepoHarborApp>,
+    repo: SharedString,
+    pr_slug: Option<SharedString>,
+) -> impl IntoElement {
+    let mut bar = div()
+        .flex()
+        .flex_row()
+        .gap(px(2.))
+        .px(px(12.))
+        .border_b_1()
+        .border_color(rgb(t.border));
+
+    for (tab, label) in TABS {
+        let is_active = tab == active;
+        let fg = if is_active { t.fg0 } else { t.fg2 };
+        let app = app.clone();
+        let repo = repo.clone();
+        let pr_slug = pr_slug.clone();
+        // 1px underline on the active tab; page-coloured (invisible) otherwise so
+        // the row height stays constant.
+        let underline = if is_active { t.accent_bright } else { t.page };
+        let item = div()
+            .id(label)
+            .px(px(11.))
+            .py(px(10.))
+            .text_size(px(t.text_small))
+            .text_color(rgb(fg))
+            .cursor_pointer()
+            .border_b_1()
+            .border_color(rgb(underline))
+            .hover(|s| s.text_color(rgb(t.fg0)))
+            .child(SharedString::from(label))
+            .on_click(move |_ev, window, cx| {
+                let (repo, pr_slug) = (repo.clone(), pr_slug.clone());
+                app.update(cx, |this, cx| {
+                    if let Some(Overlay::Drawer { tab: cur, .. }) = &mut this.overlay {
+                        *cur = tab;
+                    }
+                    if tab == DrawerTab::Work {
+                        // Always re-read status when entering Work so nested
+                        // deletions/edits that landed while another tab was open
+                        // (or before a watcher rescan) still appear.
+                        this.drawer.diff = DiffState::Loading;
+                        if this.drawer.commit_input.is_none() {
+                            this.drawer.commit_input = Some(cx.new(|cx| {
+                                gpui_component::input::InputState::new(window, cx)
+                                    .placeholder("Commit subject…")
+                            }));
+                        }
+                        if this.drawer.commit_body_input.is_none() {
+                            this.drawer.commit_body_input = Some(cx.new(|cx| {
+                                gpui_component::input::InputState::new(window, cx)
+                                    .auto_grow(2, 8)
+                                    .placeholder("Body (optional)…")
+                            }));
+                        }
+                        load_changes(repo.clone(), cx);
+                        load_work_meta(repo, cx);
+                    } else if tab == DrawerTab::History && this.drawer.history.is_none() {
+                        load_history(repo, cx);
+                    } else if tab == DrawerTab::About {
+                        if this.drawer.readme == ReadmeState::Idle {
+                            this.drawer.readme = ReadmeState::Loading;
+                            load_readme(repo.clone(), cx);
+                        }
+                        if matches!(this.drawer.pr, PrState::Idle)
+                            && let Some(slug) = pr_slug
+                        {
+                            this.drawer.pr = PrState::Loading;
+                            load_pr(repo.clone(), slug, cx);
+                        }
+                        if this.drawer.notes.is_none() {
+                            load_notes(repo.clone(), cx);
+                        }
+                        if this.drawer.note_input.is_none() {
+                            let initial = cache::note(&repo);
+                            this.drawer.note_input = Some(cx.new(|cx| {
+                                gpui_component::input::InputState::new(window, cx)
+                                    .multi_line(true)
+                                    .placeholder("Notes (markdown)…")
+                                    .default_value(initial)
+                            }));
+                        }
+                    }
+                    cx.notify();
+                });
+            });
+        bar = bar.child(item);
+    }
+    bar
+}
+
+#[allow(clippy::too_many_arguments)]
+fn body(
+    row: &Row,
+    tab: DrawerTab,
+    t: &Theme,
+    data: &DrawerData,
+    app: &Entity<RepoHarborApp>,
+    ai_ready: bool,
+    github_authed: bool,
+) -> impl IntoElement {
+    let content = match tab {
+        DrawerTab::Work => {
+            work::view(row, data, t, app, ai_ready, github_authed).into_any_element()
+        }
+        DrawerTab::History => history::view(data, t, app).into_any_element(),
+        DrawerTab::About => about::view(row, data, t, app, ai_ready).into_any_element(),
+    };
+    div()
+        .id("drawer-body")
+        .flex()
+        .flex_col()
+        .flex_1()
+        .min_h(px(0.))
+        .overflow_y_scroll()
+        .p(px(18.))
+        .gap(px(16.))
+        .child(content)
+}
+
+/// Overview: the synchronous `Row` facts up top, then the async git data
+/// (branches / recent commits / worktrees) loaded via [`load_overview`].
+pub(super) fn overview(
+    row: &Row,
+    t: &Theme,
+    data: &DrawerData,
+    app: &Entity<RepoHarborApp>,
+) -> impl IntoElement {
+    let mut col = div().flex().flex_col().gap(px(16.));
+
+    // Description.
+    col = col.child(
+        div()
+            .text_size(px(t.text_small))
+            .line_height(px(20.))
+            .text_color(rgb(t.fg1))
+            .child(row.description.clone()),
+    );
+
+    // AI summary, when present.
+    if !row.ai_summary.is_empty() {
+        col = col.child(
+            div()
+                .flex()
+                .flex_row()
+                .items_start()
+                .gap(px(7.))
+                .p(px(11.))
+                .rounded(px(t.r_sm))
+                .bg(rgb(t.surface))
+                .border_1()
+                .border_color(rgb(t.border))
+                .child(lucide("sparkles", 14., t.ai))
+                .child(
+                    div()
+                        .flex_1()
+                        .text_size(px(t.text_data_sm))
+                        .line_height(px(18.))
+                        .text_color(rgb(t.ai))
+                        .child(row.ai_summary.clone()),
+                ),
+        );
+    }
+
+    // Git status block.
+    let mut status = div()
+        .flex()
+        .flex_row()
+        .flex_wrap()
+        .gap(px(16.))
+        .font_family(MONO)
+        .text_size(px(t.text_data_sm))
+        .child(seg("git-branch", row.branch.clone(), t.fg1));
+    if row.ahead > 0 || row.behind > 0 {
+        let color = if row.behind > 0 { t.behind } else { t.clean };
+        status = status.child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(4.))
+                .text_color(rgb(color))
+                .child(lucide("arrow-up", 13., color))
+                .child(SharedString::from(row.ahead.to_string()))
+                .child(lucide("arrow-down", 13., color))
+                .child(SharedString::from(row.behind.to_string())),
+        );
+    }
+    if row.dirty > 0 {
+        status = status.child(seg(
+            "circle-dot",
+            SharedString::from(format!("{} dirty", row.dirty)),
+            t.dirty,
+        ));
+    }
+    col = col.child(status);
+
+    // Host facts.
+    let mut facts = div()
+        .flex()
+        .flex_row()
+        .flex_wrap()
+        .items_center()
+        .gap(px(16.))
+        .font_family(MONO)
+        .text_size(px(t.text_data_sm))
+        .text_color(rgb(t.fg2));
+    if row.private {
+        facts = facts.child(seg("lock", SharedString::from("private"), t.fg3));
+    }
+    if !row.host.is_empty() {
+        facts = facts.child(seg("star", row.stars.clone(), t.star));
+    }
+    if !row.release.is_empty() {
+        facts = facts.child(seg("tag", row.release.clone(), t.fg2));
+    }
+    facts = facts.child(seg("clock", row.age.clone(), t.fg2));
+    // Default-branch CI state from the central pass (#183); clicking it opens
+    // the run's page when the API offered one.
+    if let Some(ci) = &data.ci {
+        let state = match ci.state.as_str() {
+            "failure" => Some(("circle-alert", "CI failing", t.behind)),
+            "success" => Some(("circle-check", "CI passing", t.clean)),
+            "pending" => Some(("clock", "CI running", t.fg2)),
+            _ => None, // "none": no CI on this repo — show nothing.
+        };
+        if let Some((icon, label, color)) = state {
+            facts = facts.child(match &ci.url {
+                Some(url) => {
+                    let url = url.clone();
+                    div()
+                        .id("ci-run")
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(4.))
+                        .text_color(rgb(color))
+                        .cursor_pointer()
+                        .hover(|s| s.text_color(rgb(t.fg0)))
+                        .child(lucide(icon, 13., color))
+                        .child(SharedString::from(label))
+                        .child(lucide("external-link", 11., t.fg3))
+                        .on_click(move |_ev, _win, _cx| {
+                            let _ = launch::open(&url);
+                        })
+                        .into_any_element()
+                }
+                None => seg(icon, SharedString::from(label), color).into_any_element(),
+            });
+        }
+    }
+    col = col.child(facts);
+
+    // Async git data.
+    col = col.child(branches_section(data, t, app));
+    col = col.child(worktrees_section(data, t, app));
+    col.child(dispatch_section(data, t, app))
+}
+
+/// "Dispatch agent" (#185): a task-prompt field, a fresh-worktree toggle, and
+/// the Dispatch button. Plain dispatch starts the configured agent in the repo
+/// with the task appended (`agent_dispatch_args`); the toggle first creates an
+/// `agent/…` branch + worktree and starts the agent there.
+fn dispatch_section(data: &DrawerData, t: &Theme, app: &Entity<RepoHarborApp>) -> impl IntoElement {
+    let repo = data.repo.clone();
+    let mut s = section(t, "Dispatch agent", None);
+    let Some(input) = &data.dispatch_input else {
+        return s;
+    };
+
+    let fresh = data.dispatch_fresh;
+    let toggle = {
+        let app = app.clone();
+        div()
+            .id("dispatch-fresh")
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(6.))
+            .cursor_pointer()
+            .child(lucide(
+                if fresh { "circle-check" } else { "circle-dot" },
+                14.,
+                if fresh { t.clean } else { t.fg3 },
+            ))
+            .child(
+                div()
+                    .text_size(px(t.text_data_sm))
+                    .text_color(rgb(t.fg1))
+                    .child("Fresh worktree"),
+            )
+            .on_click(move |_ev, _win, cx| {
+                app.update(cx, |this, cx| this.toggle_dispatch_fresh(cx));
+            })
+    };
+
+    let (app2, repo2, input2) = (app.clone(), repo, input.clone());
+    s = s.child(
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(6.))
+            .mt(px(2.))
+            .child(gpui_component::input::Input::new(input))
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(10.))
+                    .child(toggle)
+                    .child(div().flex_1())
+                    .child(pr_btn(
+                        SharedString::from("dispatch-agent"),
+                        "Dispatch",
+                        t,
+                        move |_win, cx| {
+                            let repo = repo2.clone();
+                            let prompt = input2.read(cx).value().trim().to_string();
+                            if prompt.is_empty() {
+                                return;
+                            }
+                            app2.update(cx, |this, cx| {
+                                this.dispatch_agent(repo, prompt, fresh, cx)
+                            });
+                        },
+                    )),
+            ),
+    );
+    s
+}
+
+/// Section wrapper: an uppercase label (+ optional count) over a list.
+pub(super) fn section(t: &Theme, title: &str, count: Option<usize>) -> Div {
+    let mut head = div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(6.))
+        .font_family(MONO)
+        .text_size(px(t.text_data_sm))
+        .text_color(rgb(t.fg3))
+        .child(SharedString::from(title.to_uppercase()));
+    if let Some(n) = count {
+        head = head.child(SharedString::from(format!("· {n}")));
+    }
+    div().flex().flex_col().gap(px(3.)).child(head.mb(px(3.)))
+}
+
+/// A muted "Loading…" / empty / error placeholder line.
+pub(super) fn placeholder(text: impl Into<SharedString>, t: &Theme) -> impl IntoElement {
+    div()
+        .py(px(3.))
+        .text_size(px(t.text_data_sm))
+        .text_color(rgb(t.fg3))
+        .child(text.into())
+}
+
+/// A small bordered pill tag (merged / gone).
+fn tag(text: &str, color: u32, t: &Theme) -> impl IntoElement {
+    div()
+        .px(px(5.))
+        .py(px(1.))
+        .rounded(px(t.r_xs))
+        .border_1()
+        .border_color(rgb(t.border))
+        .font_family(MONO)
+        .text_size(px(t.text_data_sm))
+        .text_color(rgb(color))
+        .child(SharedString::from(text.to_string()))
+}
+
+fn branches_section(data: &DrawerData, t: &Theme, app: &Entity<RepoHarborApp>) -> impl IntoElement {
+    let mut s = section(t, "Branches", data.branches.as_ref().map(|b| b.len()));
+    match &data.branches {
+        None => s = s.child(placeholder("Loading…", t)),
+        Some(list) if list.is_empty() => s = s.child(placeholder("No branches.", t)),
+        Some(list) => {
+            for b in list {
+                s = s.child(branch_item(b, data.repo.clone(), t, app));
+            }
+        }
+    }
+    s
+}
+
+fn branch_item(
+    b: &BranchRow,
+    repo: SharedString,
+    t: &Theme,
+    app: &Entity<RepoHarborApp>,
+) -> impl IntoElement {
+    let fg = if b.current { t.accent_bright } else { t.fg1 };
+    let icon = if b.current { "check" } else { "git-branch" };
+    let mut item = div()
+        .id(SharedString::from(format!("br-{}", b.name)))
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(7.))
+        .px(px(8.))
+        .py(px(6.))
+        .rounded(px(t.r_sm))
+        .font_family(MONO)
+        .text_size(px(t.text_data_sm))
+        .text_color(rgb(fg))
+        .child(lucide(icon, 13., fg))
+        .child(
+            div()
+                .flex_1()
+                .min_w(px(0.))
+                .truncate()
+                .child(b.name.clone()),
+        );
+    if b.merged {
+        item = item.child(tag("merged", t.fg3, t));
+    }
+    if b.gone {
+        item = item.child(tag("gone", t.behind, t));
+    }
+    if b.current {
+        item = item.child(tag("current", t.accent_bright, t));
+    } else {
+        let (checkout_bg, checkout_border, checkout_fg) = (t.button_bg, t.border, t.fg1);
+        let (hov_border, hov_fg) = (t.accent_bright, t.fg0);
+        let name = b.name.clone();
+        let app2 = app.clone();
+        let repo2 = repo.clone();
+        item = item.child(
+            div()
+                .id(SharedString::from(format!("br-btn-{}", b.name)))
+                .px(px(7.))
+                .py(px(2.))
+                .rounded(px(t.r_xs))
+                .bg(rgb(checkout_bg))
+                .border_1()
+                .border_color(rgb(checkout_border))
+                .font_family(MONO)
+                .text_size(px(t.text_data_sm))
+                .text_color(rgb(checkout_fg))
+                .cursor_pointer()
+                .hover(move |s| s.border_color(rgb(hov_border)).text_color(rgb(hov_fg)))
+                .on_click(move |_ev, _win, cx| {
+                    let (repo, name) = (repo2.clone(), name.clone());
+                    app2.update(cx, |this, cx| {
+                        this.drawer.branches = None; // optimistic loading state
+                        switch_branch(repo, name, cx);
+                        cx.notify();
+                    });
+                })
+                .child("checkout"),
+        );
+        let app_m = app.clone();
+        let repo_m = repo.clone();
+        let name_m = b.name.clone();
+        item = item.child(
+            div()
+                .id(SharedString::from(format!("br-merge-{}", b.name)))
+                .px(px(7.))
+                .py(px(2.))
+                .rounded(px(t.r_xs))
+                .bg(rgb(checkout_bg))
+                .border_1()
+                .border_color(rgb(checkout_border))
+                .font_family(MONO)
+                .text_size(px(t.text_data_sm))
+                .text_color(rgb(checkout_fg))
+                .cursor_pointer()
+                .hover(move |s| s.border_color(rgb(hov_border)).text_color(rgb(hov_fg)))
+                .on_click(move |_ev, _win, cx| {
+                    let (repo, name) = (repo_m.clone(), name_m.clone());
+                    app_m.update(cx, |_this, cx| {
+                        merge_branch(
+                            repo,
+                            name,
+                            repoharbor_core::git_ops::MergeStrategy::Auto,
+                            cx,
+                        );
+                        cx.notify();
+                    });
+                })
+                .child("merge"),
+        );
+    }
+    // Clicking anywhere on the row also switches branch.
+    if !b.current {
+        let name = b.name.clone();
+        let app = app.clone();
+        item = item
+            .cursor_pointer()
+            .hover(|s| s.bg(rgb(t.surface_hover)))
+            .on_click(move |_ev, _win, cx| {
+                let (repo, name) = (repo.clone(), name.clone());
+                app.update(cx, |this, cx| {
+                    this.drawer.branches = None; // optimistic loading state
+                    switch_branch(repo, name, cx);
+                    cx.notify();
+                });
+            });
+    }
+    item
+}
+
+fn worktrees_section(
+    data: &DrawerData,
+    t: &Theme,
+    app: &Entity<RepoHarborApp>,
+) -> impl IntoElement {
+    let repo = data.repo.clone();
+    let mut s = section(t, "Worktrees", data.worktrees.as_ref().map(|w| w.len()));
+    match &data.worktrees {
+        None => s = s.child(placeholder("Loading…", t)),
+        Some(list) if list.is_empty() => s = s.child(placeholder("None.", t)),
+        Some(list) => {
+            for w in list {
+                let remove = {
+                    let (app, repo, name) = (app.clone(), repo.clone(), w.name.to_string());
+                    div()
+                        .id(SharedString::from(format!("wt-rm-{}", w.name)))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .w(px(22.))
+                        .h(px(22.))
+                        .rounded(px(t.r_xs))
+                        .cursor_pointer()
+                        .hover(|s| s.bg(rgb(t.surface_hover)))
+                        .child(lucide("x", 12., t.fg3))
+                        .on_click(move |_ev, _win, cx| {
+                            let (repo, name) = (repo.clone(), name.clone());
+                            app.update(cx, |_this, cx| remove_worktree(repo, name, cx));
+                        })
+                };
+                s = s.child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(7.))
+                        .py(px(4.))
+                        .font_family(MONO)
+                        .text_size(px(t.text_data_sm))
+                        .child(lucide("folder-tree", 13., t.fg2))
+                        .child(div().text_color(rgb(t.fg1)).child(w.name.clone()))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w(px(0.))
+                                .truncate()
+                                .text_color(rgb(t.fg3))
+                                .child(w.path.clone()),
+                        )
+                        .child(remove),
+                );
+            }
+        }
+    }
+
+    // Add a worktree: name field + Add button.
+    if let Some(input) = &data.worktree_input {
+        let (app, repo, input2) = (app.clone(), repo.clone(), input.clone());
+        s = s.child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(6.))
+                .mt(px(4.))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w(px(0.))
+                        .child(gpui_component::input::Input::new(input)),
+                )
+                .child(pr_btn(
+                    SharedString::from("wt-add"),
+                    "Add",
+                    t,
+                    move |_win, cx| {
+                        let repo = repo.clone();
+                        let name = input2.read(cx).value();
+                        if name.trim().is_empty() {
+                            return;
+                        }
+                        app.update(cx, |_this, cx| {
+                            add_worktree(repo, name.trim().to_string(), cx)
+                        });
+                    },
+                )),
+        );
+    }
+    s
+}
+
+/// Changes tab: a commit composer acting on the index, a push / open-PR row
+/// closing the commit → push → PR loop, the Unstaged/Staged file lists with
+/// per-file stage/unstage, then the selected file's diff.
+pub(super) fn changes_view(
+    row: &Row,
+    data: &DrawerData,
+    t: &Theme,
+    app: &Entity<RepoHarborApp>,
+    ai_ready: bool,
+    github_authed: bool,
+) -> impl IntoElement {
+    let mut col = div().flex().flex_col().gap(px(12.));
+    let has_staged = data
+        .changes
+        .as_ref()
+        .is_some_and(|list| list.iter().any(|c| c.staged));
+    let has_unstaged = data
+        .changes
+        .as_ref()
+        .is_some_and(|list| list.iter().any(|c| !c.staged));
+    let has_changes = has_staged || has_unstaged;
+    // Cursor/PyCharm: when anything is still unstaged, the primary action
+    // stages it then commits ("Commit All"). Pure staged → plain "Commit".
+    let commit_all = has_unstaged;
+
+    // Commit composer (the fields exist once the tab has been opened): a
+    // single-line subject + an optional multi-line body, joined by a blank
+    // line into the commit message.
+    if let (Some(input), Some(body_input)) = (&data.commit_input, &data.commit_body_input) {
+        let mut actions = div().flex().flex_row().items_center().gap(px(6.));
+        // External diff tool (meld / configured command).
+        {
+            let app_d = app.clone();
+            let repo_d = row.id.clone();
+            let file = data
+                .change_sel
+                .as_ref()
+                .map(|(p, _)| p.to_string())
+                .unwrap_or_default();
+            actions = actions.child(pr_btn(
+                SharedString::from("ext-diff"),
+                "Open external diff",
+                t,
+                move |_win, cx: &mut gpui::App| {
+                    let file = file.clone();
+                    app_d.update(cx, |this, cx| {
+                        this.open_external_diff(
+                            &repo_d,
+                            if file.is_empty() {
+                                None
+                            } else {
+                                Some(file.as_str())
+                            },
+                            cx,
+                        );
+                    });
+                },
+            ));
+        }
+        // AI: two one-click choices (no modal) — message only, or commit+push.
+        if ai_ready {
+            let app_only = app.clone();
+            actions = actions.child(pr_btn(
+                SharedString::from("gen-only"),
+                "Gen only",
+                t,
+                move |window, cx: &mut gpui::App| {
+                    app_only.update(cx, |this, cx| {
+                        this.run_generate_commit(
+                            crate::views::generate_commit::GenerateCommitChoice::MessageOnly,
+                            vec![this.drawer.repo.to_string()],
+                            true,
+                            window,
+                            cx,
+                        );
+                    });
+                },
+            ));
+            let app_push = app.clone();
+            actions = actions.child(pr_btn(
+                SharedString::from("gen-push"),
+                "Gen & push",
+                t,
+                move |window, cx: &mut gpui::App| {
+                    app_push.update(cx, |this, cx| {
+                        this.run_generate_commit(
+                            crate::views::generate_commit::GenerateCommitChoice::CommitAndPush,
+                            vec![this.drawer.repo.to_string()],
+                            true,
+                            window,
+                            cx,
+                        );
+                    });
+                },
+            ));
+        }
+        if has_changes {
+            let app_fast = app.clone();
+            actions = actions.child(pr_btn(
+                SharedString::from("fast-commit"),
+                "Fast commit",
+                t,
+                move |window, cx: &mut gpui::App| {
+                    app_fast.update(cx, |this, cx| {
+                        this.drawer_fast_commit(window, cx);
+                    });
+                },
+            ));
+        }
+        actions = actions.child(div().flex_1());
+        if has_changes {
+            let repo = row.id.clone();
+            let app2 = app.clone();
+            let input2 = input.clone();
+            let body2 = body_input.clone();
+            let stage_all = commit_all;
+            let label = if commit_all { "Commit All" } else { "Commit" };
+            actions = actions.child(pr_btn(
+                SharedString::from("commit"),
+                label,
+                t,
+                move |_win, cx: &mut gpui::App| {
+                    let repo = repo.clone();
+                    let subject = input2.read(cx).value();
+                    if subject.trim().is_empty() {
+                        return;
+                    }
+                    let msg = full_commit_message(&subject, &body2.read(cx).value());
+                    app2.update(cx, |_this, cx| {
+                        if stage_all {
+                            commit_all_changes(repo, msg, cx);
+                        } else {
+                            commit_staged(repo, msg, cx);
+                        }
+                    });
+                },
+            ));
+        } else {
+            // Working tree clean — say why (once lists have loaded).
+            if data.changes.is_some() {
+                actions = actions.child(
+                    div()
+                        .font_family(MONO)
+                        .text_size(px(t.text_data_sm))
+                        .text_color(rgb(t.fg3))
+                        .child(SharedString::from("Nothing to commit")),
+                );
+            }
+            actions = actions.child(disabled_btn("Commit", t));
+        }
+        col = col
+            .child(gpui_component::input::Input::new(input))
+            .child(gpui_component::input::Input::new(body_input))
+            .child(actions);
+    }
+
+    // The AI commit-message suggestion (subject + optional body), with a
+    // one-click Commit All using both (stages remaining changes first).
+    if let Some((subject, body)) = &data.commit_suggestion {
+        let generating = subject.as_ref() == "Generating…";
+        let repo = row.id.clone();
+        let app4 = app.clone();
+        let (subject2, body2) = (subject.clone(), body.clone());
+        let mut card = div()
+            .flex()
+            .flex_col()
+            .gap(px(6.))
+            .p(px(10.))
+            .rounded(px(t.r_sm))
+            .bg(rgb(t.surface))
+            .border_1()
+            .border_color(rgb(t.border))
+            .child(seg("sparkles", subject.clone(), t.fg1));
+        if !body.is_empty() {
+            // Multi-line body → markdown (reflowed first — the renderer panics
+            // on a run's embedded newlines, see data::unwrap_soft_breaks).
+            card = card.child(
+                div()
+                    .text_size(px(t.text_small))
+                    .text_color(rgb(t.fg2))
+                    .child(gpui_component::text::markdown(
+                        crate::data::unwrap_soft_breaks(body),
+                    )),
+            );
+        }
+        if !generating {
+            card = card.child(div().flex().flex_row().justify_end().child(pr_btn(
+                SharedString::from("commit-ai"),
+                if commit_all || !has_staged {
+                    "Commit All"
+                } else {
+                    "Commit this"
+                },
+                t,
+                move |_win, cx: &mut gpui::App| {
+                    let repo = repo.clone();
+                    if subject2.trim().is_empty() {
+                        return;
+                    }
+                    let msg = full_commit_message(&subject2, &body2);
+                    // Always stage-all first so Generate → Commit works without
+                    // a separate Stage all click (Cursor/PyCharm flow).
+                    app4.update(cx, |_this, cx| commit_all_changes(repo, msg, cx));
+                },
+            )));
+        }
+        col = col.child(card);
+    }
+
+    // Push / Open PR / Reset hard — the last mile after committing. Push shows when there's
+    // something to push (ahead, or a commit made in this drawer session while
+    // the row's ahead count may be stale), including pull-only checkouts that
+    // Needs me already marked "Not pushed".
+    // Open PR shows only when it can work: a GitHub remote, a GitHub token, a
+    // known default branch, and the current branch isn't it — hidden otherwise,
+    // never broken (the aiReady philosophy; only the AI *drafting* inside the
+    // flow is gated on aiReady).
+    let show_push = row.ahead > 0 || data.committed;
+    let show_reset = !row.branch.is_empty();
+    let show_pr = github_authed
+        && github_slug(row).is_some()
+        && data
+            .default_branch
+            .as_ref()
+            .is_some_and(|d| *d != row.branch);
+    if show_push || show_pr || show_reset || data.pr_url.is_some() {
+        let mut sync = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(6.))
+            .flex_wrap();
+        if show_push {
+            if data.push_busy {
+                sync = sync.child(disabled_btn("Pushing…", t));
+            } else {
+                let app6 = app.clone();
+                sync = sync.child(pr_btn(
+                    SharedString::from("push"),
+                    "Push",
+                    t,
+                    move |_win, cx: &mut gpui::App| {
+                        app6.update(cx, |this, cx| this.drawer_push(cx));
+                    },
+                ));
+            }
+        }
+        if show_reset {
+            if data.reset_hard_busy {
+                sync = sync.child(disabled_btn("Resetting…", t));
+            } else {
+                let app_r = app.clone();
+                let label = if data.reset_hard_armed {
+                    format!("Confirm reset --hard origin/{}", row.branch)
+                } else {
+                    format!("Reset hard origin/{}", row.branch)
+                };
+                sync = sync.child(pr_btn(
+                    SharedString::from("reset-hard"),
+                    &label,
+                    t,
+                    move |_win, cx: &mut gpui::App| {
+                        app_r.update(cx, |this, cx| this.drawer_reset_hard(cx));
+                    },
+                ));
+            }
+        }
+        if show_pr {
+            if data.pr_busy {
+                sync = sync.child(disabled_btn("Opening PR…", t));
+            } else {
+                let app7 = app.clone();
+                sync = sync.child(pr_btn(
+                    SharedString::from("open-pr"),
+                    "Open PR",
+                    t,
+                    move |_win, cx: &mut gpui::App| {
+                        app7.update(cx, |this, cx| this.drawer_open_pr(cx));
+                    },
+                ));
+            }
+        }
+        if let Some(url) = &data.pr_url {
+            let url = url.clone();
+            sync = sync.child(
+                div()
+                    .id("view-pr")
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(4.))
+                    .px(px(8.))
+                    .py(px(5.))
+                    .rounded(px(t.r_sm))
+                    .font_family(MONO)
+                    .text_size(px(t.text_data_sm))
+                    .text_color(rgb(t.fg1))
+                    .cursor_pointer()
+                    .hover(|s| s.bg(rgb(t.surface_hover)))
+                    .child(lucide("external-link", 12., t.fg2))
+                    .child(SharedString::from("View PR"))
+                    .on_click(move |_ev, _win, _cx| {
+                        let _ = launch::open(&url);
+                    }),
+            );
+        }
+        col = col.child(sync);
+    }
+
+    // Unstaged / Staged file lists, then the selected file's diff.
+    col = col.child(changes_section(row.id.clone(), data, false, t, app));
+    col = col.child(changes_section(row.id.clone(), data, true, t, app));
+    col = col.child(diff_pane(row.id.clone(), data, t, app));
+
+    // AI changelog from recent commits (gated on aiReady).
+    if ai_ready {
+        let app5 = app.clone();
+        col = col.child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(6.))
+                .child(pr_btn(
+                    SharedString::from("gen-changelog"),
+                    "Generate changelog",
+                    t,
+                    move |_win, cx: &mut gpui::App| {
+                        app5.update(cx, |this, cx| this.drawer_generate_changelog(cx));
+                    },
+                )),
+        );
+    }
+    if let Some(log) = &data.changelog {
+        col = col.child(
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(4.))
+                .p(px(10.))
+                .rounded(px(t.r_sm))
+                .bg(rgb(t.surface))
+                .border_1()
+                .border_color(rgb(t.border))
+                .child(seg("sparkles", "Changelog".into(), t.fg3))
+                .child(
+                    div()
+                        .text_size(px(t.text_small))
+                        .text_color(rgb(t.fg1))
+                        .child(
+                            // The prompt asks for markdown bullets, so render as
+                            // markdown — reflowed first, like the Readme tab, since
+                            // the renderer panics on a run's embedded newlines.
+                            gpui_component::text::markdown(crate::data::unwrap_soft_breaks(log)),
+                        ),
+                ),
+        );
+    }
+    col
+}
+
+/// The kind marker for a change row: git's one-letter convention, coloured by
+/// sentiment (M/A/D/R and "?" for untracked — each kind visibly distinct).
+fn kind_badge(kind: git_ops::ChangeKind, t: &Theme) -> (&'static str, u32) {
+    match kind {
+        git_ops::ChangeKind::Modified => ("M", t.dirty),
+        git_ops::ChangeKind::Added => ("A", t.clean),
+        git_ops::ChangeKind::Deleted => ("D", t.behind),
+        git_ops::ChangeKind::Renamed => ("R", t.accent_bright),
+        git_ops::ChangeKind::Untracked => ("?", t.fg2),
+    }
+}
+
+/// One of the Changes tab's file lists (`staged` picks which). Header: label +
+/// count + a "Stage all"/"Unstage all" action; body: one row per file.
+fn changes_section(
+    repo: SharedString,
+    data: &DrawerData,
+    staged: bool,
+    t: &Theme,
+    app: &Entity<RepoHarborApp>,
+) -> Div {
+    let title = if staged { "STAGED" } else { "UNSTAGED" };
+    let mut head = div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(6.))
+        .font_family(MONO)
+        .text_size(px(t.text_data_sm))
+        .text_color(rgb(t.fg3))
+        .child(SharedString::from(title));
+
+    let mut col = div().flex().flex_col().gap(px(2.));
+    match &data.changes {
+        None => col = col.child(placeholder("Loading…", t)),
+        Some(list) => {
+            let files: Vec<&ChangeRow> = list.iter().filter(|c| c.staged == staged).collect();
+            head = head.child(SharedString::from(format!("· {}", files.len())));
+            if files.is_empty() {
+                let empty = if staged {
+                    "Nothing staged."
+                } else {
+                    "No unstaged changes."
+                };
+                col = col.child(placeholder(empty, t));
+            } else {
+                // Stage all / Unstage all on the section header.
+                let label = if staged { "Unstage all" } else { "Stage all" };
+                let all: Vec<String> = files.iter().map(|c| c.path.to_string()).collect();
+                let (app2, repo2) = (app.clone(), repo.clone());
+                head = head.child(div().flex_1()).child(pr_btn(
+                    SharedString::from(format!("stage-all-{staged}")),
+                    label,
+                    t,
+                    move |_win, cx: &mut gpui::App| {
+                        let (repo, all) = (repo2.clone(), all.clone());
+                        app2.update(cx, |_this, cx| set_staged(repo, all, !staged, cx));
+                    },
+                ));
+                for c in files {
+                    col = col.child(change_item(c, repo.clone(), data, t, app));
+                }
+            }
+        }
+    }
+    div()
+        .flex()
+        .flex_col()
+        .gap(px(3.))
+        .child(head.mb(px(3.)))
+        .child(col)
+}
+
+/// One file row: kind letter + path + copy + stage/unstage. Clicking the row
+/// selects it for the diff pane; the copy icon (or right-click → Copy path)
+/// puts the relative path on the clipboard; the trailing button moves it
+/// between the index and the working tree ("+" stages, "x" unstages).
+fn change_item(
+    c: &ChangeRow,
+    repo: SharedString,
+    data: &DrawerData,
+    t: &Theme,
+    app: &Entity<RepoHarborApp>,
+) -> impl IntoElement {
+    let selected = data
+        .change_sel
+        .as_ref()
+        .is_some_and(|(p, s)| *p == c.path && *s == c.staged);
+    let (letter, color) = kind_badge(c.kind, t);
+
+    let full_path = std::path::Path::new(repo.as_ref())
+        .join(c.path.as_ref())
+        .to_string_lossy()
+        .to_string();
+    let rel_path = c.path.to_string();
+    let file_name = std::path::Path::new(c.path.as_ref())
+        .file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| c.path.to_string());
+
+    let open_btn = {
+        let (app, path) = (app.clone(), full_path.clone());
+        div()
+            .id(SharedString::from(format!(
+                "chg-open-{}-{}",
+                c.staged, c.path
+            )))
+            .flex()
+            .items_center()
+            .justify_center()
+            .w(px(22.))
+            .h(px(22.))
+            .rounded(px(t.r_xs))
+            .cursor_pointer()
+            .hover(|s| s.bg(rgb(t.surface_hover)))
+            .child(lucide("external-link", 12., t.fg3))
+            .on_click(move |_ev, _win, cx| {
+                cx.stop_propagation();
+                let path = path.clone();
+                app.update(cx, |this, cx| {
+                    if let Err(e) = launch::open(&path) {
+                        this.push_toast(ToastKind::Error, "Couldn't open file", Some(e.into()), cx);
+                    }
+                });
+            })
+    };
+
+    let loc_btn = {
+        let (app, path) = (app.clone(), full_path.clone());
+        div()
+            .id(SharedString::from(format!(
+                "chg-loc-{}-{}",
+                c.staged, c.path
+            )))
+            .flex()
+            .items_center()
+            .justify_center()
+            .w(px(22.))
+            .h(px(22.))
+            .rounded(px(t.r_xs))
+            .cursor_pointer()
+            .hover(|s| s.bg(rgb(t.surface_hover)))
+            .child(lucide("folder-open", 12., t.fg3))
+            .on_click(move |_ev, _win, cx| {
+                cx.stop_propagation();
+                let path = path.clone();
+                app.update(cx, |this, cx| {
+                    if let Err(e) = launch::open_location(&path) {
+                        this.push_toast(
+                            ToastKind::Error,
+                            "Couldn't open location",
+                            Some(e.into()),
+                            cx,
+                        );
+                    }
+                });
+            })
+    };
+
+    let copy_btn = {
+        let (app, path) = (app.clone(), full_path.clone());
+        div()
+            .id(SharedString::from(format!(
+                "chg-copy-{}-{}",
+                c.staged, c.path
+            )))
+            .flex()
+            .items_center()
+            .justify_center()
+            .w(px(22.))
+            .h(px(22.))
+            .rounded(px(t.r_xs))
+            .cursor_pointer()
+            .hover(|s| s.bg(rgb(t.surface_hover)))
+            .child(lucide("copy", 12., t.fg3))
+            .on_click(move |_ev, _win, cx| {
+                cx.stop_propagation();
+                copy_text(&app, path.clone(), "Full path copied", cx);
+            })
+    };
+
+    let action = {
+        let (app, repo, path) = (app.clone(), repo.clone(), c.path.to_string());
+        let (staged, icon) = (c.staged, if c.staged { "x" } else { "plus" });
+        div()
+            .id(SharedString::from(format!(
+                "chg-act-{}-{}",
+                c.staged, c.path
+            )))
+            .flex()
+            .items_center()
+            .justify_center()
+            .w(px(22.))
+            .h(px(22.))
+            .rounded(px(t.r_xs))
+            .cursor_pointer()
+            .hover(|s| s.bg(rgb(t.surface_hover)))
+            .child(lucide(icon, 12., t.fg3))
+            .on_click(move |_ev, _win, cx| {
+                // Don't also select the row underneath.
+                cx.stop_propagation();
+                let (repo, path) = (repo.clone(), path.clone());
+                app.update(cx, |_this, cx| set_staged(repo, vec![path], !staged, cx));
+            })
+    };
+
+    let row = div()
+        .id(SharedString::from(format!("chg-{}-{}", c.staged, c.path)))
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(7.))
+        .px(px(8.))
+        .py(px(4.))
+        .rounded(px(t.r_sm))
+        .font_family(MONO)
+        .text_size(px(t.text_data_sm))
+        .cursor_pointer()
+        .child(
+            div()
+                .w(px(12.))
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(rgb(color))
+                .child(SharedString::from(letter)),
+        )
+        .child(
+            div()
+                .flex_1()
+                .min_w(px(0.))
+                .truncate()
+                .text_color(rgb(if selected { t.fg0 } else { t.fg1 }))
+                .child(c.path.clone()),
+        )
+        .child(open_btn)
+        .child(loc_btn)
+        .child(copy_btn)
+        .child(action);
+    let row = if selected {
+        row.bg(rgb(t.accent_wash))
+    } else {
+        row.hover(|s| s.bg(rgb(t.surface_hover)))
+    };
+    let (app_click, path_click, staged) = (app.clone(), c.path.clone(), c.staged);
+    let (app_menu, full_path_menu, rel_path_menu, file_name_menu) = (
+        app.clone(),
+        full_path.clone(),
+        rel_path.clone(),
+        file_name.clone(),
+    );
+    row.on_click(move |_ev, _win, cx| {
+        let path = path_click.clone();
+        app_click.update(cx, |this, cx| select_change(this, path, staged, cx));
+    })
+    .context_menu(move |menu, _win, _cx| {
+        let (app_open, path_open) = (app_menu.clone(), full_path_menu.clone());
+        let (app_ide, path_ide) = (app_menu.clone(), full_path_menu.clone());
+        let (app_loc, path_loc) = (app_menu.clone(), full_path_menu.clone());
+        let (app_cp_full, path_full) = (app_menu.clone(), full_path_menu.clone());
+        let (app_cp_rel, path_rel) = (app_menu.clone(), rel_path_menu.clone());
+        let (app_cp_name, path_name) = (app_menu.clone(), file_name_menu.clone());
+        menu.item(
+            PopupMenuItem::new("Open file").on_click(move |_win, _w, cx| {
+                let path = path_open.clone();
+                app_open.update(cx, |this, cx| {
+                    if let Err(e) = launch::open(&path) {
+                        this.push_toast(ToastKind::Error, "Couldn't open file", Some(e.into()), cx);
+                    }
+                });
+            }),
+        )
+        .item(
+            PopupMenuItem::new("Open in IDE").on_click(move |_win, _w, cx| {
+                let path = path_ide.clone();
+                app_ide.update(cx, |this, cx| {
+                    let cmd = this.config.ide_command.clone();
+                    if let Err(e) = launch::launch(&cmd, &path) {
+                        this.push_toast(ToastKind::Error, "Couldn't open IDE", Some(e.into()), cx);
+                    }
+                });
+            }),
+        )
+        .item(
+            PopupMenuItem::new("Open location").on_click(move |_win, _w, cx| {
+                let path = path_loc.clone();
+                app_loc.update(cx, |this, cx| {
+                    if let Err(e) = launch::open_location(&path) {
+                        this.push_toast(
+                            ToastKind::Error,
+                            "Couldn't open location",
+                            Some(e.into()),
+                            cx,
+                        );
+                    }
+                });
+            }),
+        )
+        .separator()
+        .item(
+            PopupMenuItem::new("Copy full path").on_click(move |_win, _w, cx| {
+                copy_text(&app_cp_full, path_full.clone(), "Full path copied", cx);
+            }),
+        )
+        .item(
+            PopupMenuItem::new("Copy relative path").on_click(move |_win, _w, cx| {
+                copy_text(&app_cp_rel, path_rel.clone(), "Relative path copied", cx);
+            }),
+        )
+        .item(
+            PopupMenuItem::new("Copy file name").on_click(move |_win, _w, cx| {
+                copy_text(&app_cp_name, path_name.clone(), "File name copied", cx);
+            }),
+        )
+    })
+}
+
+/// The selected file's diff, under a header naming the file and its side.
+fn diff_pane(repo: SharedString, data: &DrawerData, t: &Theme, app: &Entity<RepoHarborApp>) -> Div {
+    let mut head = div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(6.))
+        .font_family(MONO)
+        .text_size(px(t.text_data_sm))
+        .text_color(rgb(t.fg3))
+        .child(SharedString::from("DIFF"));
+    if let Some((path, staged)) = &data.change_sel {
+        let side = if *staged { "staged" } else { "unstaged" };
+        head = head.child(
+            div()
+                .flex_1()
+                .min_w(px(0.))
+                .truncate()
+                .child(SharedString::from(format!("· {path} ({side})"))),
+        );
+        let full_path = std::path::Path::new(repo.as_ref())
+            .join(path.as_ref())
+            .to_string_lossy()
+            .to_string();
+
+        // Open file button
+        let (app_open, path_open) = (app.clone(), full_path.clone());
+        head = head.child(
+            div()
+                .id(SharedString::from(format!(
+                    "diff-open-file-{staged}-{path}"
+                )))
+                .flex()
+                .items_center()
+                .justify_center()
+                .w(px(22.))
+                .h(px(22.))
+                .rounded(px(t.r_xs))
+                .cursor_pointer()
+                .hover(|s| s.bg(rgb(t.surface_hover)))
+                .child(lucide("external-link", 12., t.fg3))
+                .on_click(move |_ev, _win, cx| {
+                    let path = path_open.clone();
+                    app_open.update(cx, |this, cx| {
+                        if let Err(e) = launch::open(&path) {
+                            this.push_toast(
+                                ToastKind::Error,
+                                "Couldn't open file",
+                                Some(e.into()),
+                                cx,
+                            );
+                        }
+                    });
+                }),
+        );
+
+        // Open in IDE button
+        let (app_ide, path_ide) = (app.clone(), full_path.clone());
+        head = head.child(
+            div()
+                .id(SharedString::from(format!("diff-open-ide-{staged}-{path}")))
+                .flex()
+                .items_center()
+                .justify_center()
+                .w(px(22.))
+                .h(px(22.))
+                .rounded(px(t.r_xs))
+                .cursor_pointer()
+                .hover(|s| s.bg(rgb(t.surface_hover)))
+                .child(lucide("code", 12., t.fg3))
+                .on_click(move |_ev, _win, cx| {
+                    let path = path_ide.clone();
+                    app_ide.update(cx, |this, cx| {
+                        let cmd = this.config.ide_command.clone();
+                        if let Err(e) = launch::launch(&cmd, &path) {
+                            this.push_toast(
+                                ToastKind::Error,
+                                "Couldn't open IDE",
+                                Some(e.into()),
+                                cx,
+                            );
+                        }
+                    });
+                }),
+        );
+
+        // Open location button
+        let (app_loc, path_loc) = (app.clone(), full_path.clone());
+        head = head.child(
+            div()
+                .id(SharedString::from(format!("diff-open-loc-{staged}-{path}")))
+                .flex()
+                .items_center()
+                .justify_center()
+                .w(px(22.))
+                .h(px(22.))
+                .rounded(px(t.r_xs))
+                .cursor_pointer()
+                .hover(|s| s.bg(rgb(t.surface_hover)))
+                .child(lucide("folder-open", 12., t.fg3))
+                .on_click(move |_ev, _win, cx| {
+                    let path = path_loc.clone();
+                    app_loc.update(cx, |this, cx| {
+                        if let Err(e) = launch::open_location(&path) {
+                            this.push_toast(
+                                ToastKind::Error,
+                                "Couldn't open location",
+                                Some(e.into()),
+                                cx,
+                            );
+                        }
+                    });
+                }),
+        );
+
+        // Copy full path
+        let (app_path, path_copy) = (app.clone(), full_path.clone());
+        head = head.child(
+            div()
+                .id(SharedString::from(format!(
+                    "diff-copy-path-{staged}-{path}"
+                )))
+                .flex()
+                .items_center()
+                .justify_center()
+                .w(px(22.))
+                .h(px(22.))
+                .rounded(px(t.r_xs))
+                .cursor_pointer()
+                .hover(|s| s.bg(rgb(t.surface_hover)))
+                .child(lucide("copy", 12., t.fg3))
+                .on_click(move |_ev, _win, cx| {
+                    copy_text(&app_path, path_copy.clone(), "Full path copied", cx);
+                }),
+        );
+        let can_copy_diff = matches!(&data.diff, DiffState::Ready(h) if !h.is_empty());
+        if can_copy_diff {
+            let (app_d, repo_d, path_d, staged_d) =
+                (app.clone(), repo.clone(), path.clone(), *staged);
+            head = head.child(pr_btn(
+                SharedString::from(format!("copy-diff-{staged}-{path}")),
+                "Copy diff",
+                t,
+                move |_win, cx: &mut gpui::App| {
+                    let (repo, path) = (repo_d.clone(), path_d.clone());
+                    app_d.update(cx, |_this, cx| copy_file_diff(repo, path, staged_d, cx));
+                },
+            ));
+        }
+    }
+
+    let body = match (&data.changes, &data.diff) {
+        (None, _) => placeholder("Loading…", t).into_any_element(),
+        (Some(list), _) if list.is_empty() => {
+            placeholder("Working tree clean — nothing to commit.", t).into_any_element()
+        }
+        (_, DiffState::Ready(hunks)) if hunks.is_empty() => {
+            placeholder("No diff for this file.", t).into_any_element()
+        }
+        (_, DiffState::Ready(hunks)) => match &data.change_sel {
+            Some((path, staged)) => {
+                diff_block(repo, path.clone(), *staged, hunks, t, app).into_any_element()
+            }
+            None => placeholder("No diff for this file.", t).into_any_element(),
+        },
+        _ => placeholder("Loading…", t).into_any_element(),
+    };
+    div()
+        .flex()
+        .flex_col()
+        .gap(px(3.))
+        .child(head.mb(px(3.)))
+        .child(body)
+}
+
+/// Cap on rendered diff *content* lines. The whole app re-renders on any
+/// `cx.notify()` (agents poll, attention poll, appearance signals), so an
+/// unbounded diff would rebuild thousands of elements on every background
+/// tick. Hunk headers don't count against the cap.
+const DIFF_MAX_LINES: usize = 500;
+
+/// Render the selected file's hunks: each gets a header row — the `@@` line
+/// plus a "Stage hunk"/"Unstage hunk" affordance matching the pane's side —
+/// then its sentiment-coloured body lines. Content is truncated to
+/// [`DIFF_MAX_LINES`] total with a muted "… n more" footer.
+fn diff_block(
+    repo: SharedString,
+    path: SharedString,
+    staged: bool,
+    hunks: &[HunkRow],
+    t: &Theme,
+    app: &Entity<RepoHarborApp>,
+) -> impl IntoElement {
+    let mut block = div()
+        .id(SharedString::from(format!("diff-block-{staged}-{path}")))
+        .flex()
+        .flex_col()
+        .p(px(10.))
+        .rounded(px(t.r_sm))
+        .bg(rgb(t.surface))
+        .border_1()
+        .border_color(rgb(t.border))
+        .font_family(MONO)
+        .text_size(px(t.text_data_sm));
+    let mut budget = DIFF_MAX_LINES;
+    for (ix, hunk) in hunks.iter().enumerate() {
+        if budget == 0 {
+            // Cap hit: one muted footer counting everything left.
+            let lines: usize = hunks[ix..].iter().map(|h| h.lines.len()).sum();
+            let hunks_left = hunks.len() - ix;
+            block = block.child(
+                div()
+                    .pt(px(6.))
+                    .text_color(rgb(t.fg3))
+                    .child(SharedString::from(format!(
+                        "… {lines} more lines in {hunks_left} more hunks"
+                    ))),
+            );
+            break;
+        }
+
+        // Hunk header: the @@ line + the stage/unstage-this-hunk affordance.
+        let action = {
+            let (app, repo, path) = (app.clone(), repo.clone(), path.clone());
+            let label = if staged { "Unstage hunk" } else { "Stage hunk" };
+            div()
+                .id(SharedString::from(format!("hunk-act-{staged}-{ix}")))
+                .px(px(6.))
+                .py(px(1.))
+                .rounded(px(t.r_xs))
+                .text_color(rgb(t.fg3))
+                .cursor_pointer()
+                .hover(|s| s.bg(rgb(t.surface_hover)).text_color(rgb(t.fg1)))
+                .child(SharedString::from(label))
+                .on_click(move |_ev, _win, cx| {
+                    let (repo, path) = (repo.clone(), path.clone());
+                    app.update(cx, |_this, cx| hunk_op(repo, path, staged, ix, cx));
+                })
+        };
+        let mut header_row = div().flex().flex_row().items_center().gap(px(6.));
+        if ix > 0 {
+            header_row = header_row.mt(px(6.));
+        }
+        block = block.child(
+            header_row
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w(px(0.))
+                        .truncate()
+                        .text_color(rgb(t.accent_bright))
+                        .child(hunk.header.clone()),
+                )
+                .child(action),
+        );
+
+        for line in hunk.lines.iter().take(budget) {
+            let color = match line.as_bytes().first() {
+                Some(b'+') => t.clean,
+                Some(b'-') => t.behind,
+                _ => t.fg2,
+            };
+            block = block.child(div().text_color(rgb(color)).child(line.clone()));
+        }
+        if hunk.lines.len() > budget {
+            let hidden = hunk.lines.len() - budget;
+            block = block.child(
+                div()
+                    .pt(px(6.))
+                    .text_color(rgb(t.fg3))
+                    .child(SharedString::from(format!("… {hidden} more lines"))),
+            );
+        }
+        budget = budget.saturating_sub(hunk.lines.len());
+    }
+    let (app_menu, repo_menu, path_menu) = (app.clone(), repo.clone(), path.clone());
+    let full_path_menu = std::path::Path::new(repo.as_ref())
+        .join(path.as_ref())
+        .to_string_lossy()
+        .to_string();
+    let rel_path_menu = path.to_string();
+    let file_name_menu = std::path::Path::new(path.as_ref())
+        .file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| path.to_string());
+
+    block.context_menu(move |menu, _win, _cx| {
+        let (app_open, path_open) = (app_menu.clone(), full_path_menu.clone());
+        let (app_ide, path_ide) = (app_menu.clone(), full_path_menu.clone());
+        let (app_loc, path_loc) = (app_menu.clone(), full_path_menu.clone());
+        let (app_cp_full, path_full) = (app_menu.clone(), full_path_menu.clone());
+        let (app_cp_rel, path_rel) = (app_menu.clone(), rel_path_menu.clone());
+        let (app_cp_name, path_name) = (app_menu.clone(), file_name_menu.clone());
+        let (app_d, repo_d, path_d) = (app_menu.clone(), repo_menu.clone(), path_menu.clone());
+
+        menu.item(
+            PopupMenuItem::new("Open file").on_click(move |_win, _w, cx| {
+                let path = path_open.clone();
+                app_open.update(cx, |this, cx| {
+                    if let Err(e) = launch::open(&path) {
+                        this.push_toast(ToastKind::Error, "Couldn't open file", Some(e.into()), cx);
+                    }
+                });
+            }),
+        )
+        .item(
+            PopupMenuItem::new("Open in IDE").on_click(move |_win, _w, cx| {
+                let path = path_ide.clone();
+                app_ide.update(cx, |this, cx| {
+                    let cmd = this.config.ide_command.clone();
+                    if let Err(e) = launch::launch(&cmd, &path) {
+                        this.push_toast(ToastKind::Error, "Couldn't open IDE", Some(e.into()), cx);
+                    }
+                });
+            }),
+        )
+        .item(
+            PopupMenuItem::new("Open location").on_click(move |_win, _w, cx| {
+                let path = path_loc.clone();
+                app_loc.update(cx, |this, cx| {
+                    if let Err(e) = launch::open_location(&path) {
+                        this.push_toast(
+                            ToastKind::Error,
+                            "Couldn't open location",
+                            Some(e.into()),
+                            cx,
+                        );
+                    }
+                });
+            }),
+        )
+        .separator()
+        .item(
+            PopupMenuItem::new("Copy full path").on_click(move |_w, _win, cx| {
+                copy_text(&app_cp_full, path_full.clone(), "Full path copied", cx);
+            }),
+        )
+        .item(
+            PopupMenuItem::new("Copy relative path").on_click(move |_w, _win, cx| {
+                copy_text(&app_cp_rel, path_rel.clone(), "Relative path copied", cx);
+            }),
+        )
+        .item(
+            PopupMenuItem::new("Copy file name").on_click(move |_w, _win, cx| {
+                copy_text(&app_cp_name, path_name.clone(), "File name copied", cx);
+            }),
+        )
+        .separator()
+        .item(
+            PopupMenuItem::new("Copy diff").on_click(move |_w, _win, cx| {
+                let (repo, path) = (repo_d.clone(), path_d.clone());
+                app_d.update(cx, |_this, cx| copy_file_diff(repo, path, staged, cx));
+            }),
+        )
+    })
+}
+
+/// Pick an icon for an individual check state.
+fn check_icon(state: &str) -> &'static str {
+    match state {
+        "success" => "circle-check",
+        "failure" => "circle-alert",
+        "pending" => "clock",
+        _ => "circle-dot",
+    }
+}
+
+/// Colour a PR state string (checks / mergeable / review) by sentiment.
+fn state_color(s: &str, t: &Theme) -> u32 {
+    match s {
+        "success" | "clean" | "approved" => t.clean,
+        "failure" | "conflicting" | "changes_requested" => t.behind,
+        "pending" => t.fg2,
+        _ => t.fg3,
+    }
+}
+
+/// PR tab: the open pull requests with checks/review/mergeable rollups and inline
+/// approve / merge actions.
+pub(super) fn pr_view(
+    row: &Row,
+    data: &DrawerData,
+    t: &Theme,
+    app: &Entity<RepoHarborApp>,
+) -> impl IntoElement {
+    match &data.pr {
+        PrState::Ready { prs, .. } if prs.is_empty() => {
+            placeholder("No open pull requests.", t).into_any_element()
+        }
+        PrState::Ready { methods, prs } => {
+            let repo = row.id.clone();
+            let slug = row.slug.clone();
+            let mut col = div().flex().flex_col().gap(px(10.));
+            for pr in prs {
+                col = col.child(pr_card(pr, methods, repo.clone(), slug.clone(), t, app));
+            }
+            col.into_any_element()
+        }
+        PrState::Error(e) => placeholder(e.clone(), t).into_any_element(),
+        _ => placeholder("Loading…", t).into_any_element(),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn pr_card(
+    pr: &PrRow,
+    methods: &[SharedString],
+    repo: SharedString,
+    slug: SharedString,
+    t: &Theme,
+    app: &Entity<RepoHarborApp>,
+) -> impl IntoElement {
+    // Title row (click opens the PR on the host).
+    let title = {
+        let url = pr.url.clone();
+        let mut row = div()
+            .id(SharedString::from(format!("pr-{}", pr.number)))
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(6.))
+            .cursor_pointer()
+            .child(
+                div()
+                    .font_family(MONO)
+                    .text_size(px(t.text_data_sm))
+                    .text_color(rgb(t.fg3))
+                    .child(SharedString::from(format!("#{}", pr.number))),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.))
+                    .truncate()
+                    .text_size(px(t.text_small))
+                    .text_color(rgb(t.fg0))
+                    .child(pr.title.clone()),
+            )
+            .on_click(move |_ev, _win, _cx| {
+                let _ = launch::open(&url);
+            });
+        if pr.draft {
+            row = row.child(tag("draft", t.fg3, t));
+        }
+        row
+    };
+
+    // State rollups.
+    let states = div()
+        .flex()
+        .flex_row()
+        .flex_wrap()
+        .gap(px(8.))
+        .child(seg("git-pull-request", pr.refs.clone(), t.fg2))
+        .child(seg_str(
+            "circle-check",
+            &pr.checks,
+            state_color(&pr.checks, t),
+        ))
+        .child(seg_str(
+            "git-merge",
+            &pr.mergeable,
+            state_color(&pr.mergeable, t),
+        ))
+        .child(seg_str("eye", &pr.review, state_color(&pr.review, t)));
+
+    // Per-check breakdown: one clickable chip per status check / CI context,
+    // so you can see which check failed and jump to its run (not just the rollup).
+    let check_runs = (!pr.check_runs.is_empty()).then(|| {
+        let mut wrap = div().flex().flex_row().flex_wrap().gap(px(6.));
+        for c in &pr.check_runs {
+            let color = state_color(&c.state, t);
+            let chip = div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(4.))
+                .px(px(7.))
+                .py(px(3.))
+                .rounded(px(t.r_sm))
+                .bg(rgb(t.button_bg))
+                .text_color(rgb(color))
+                .child(lucide(check_icon(&c.state), 12., color))
+                .child(
+                    div()
+                        .font_family(MONO)
+                        .text_size(px(t.text_data_sm))
+                        .text_color(rgb(t.fg2))
+                        .child(c.name.clone()),
+                );
+            // Clickable (jumps to the CI run) only when the check carries a URL.
+            let chip = match &c.url {
+                Some(url) => {
+                    let (url, hov) = (url.clone(), t.surface_hover);
+                    chip.id(SharedString::from(format!(
+                        "check-{}-{}",
+                        pr.number, c.name
+                    )))
+                    .cursor_pointer()
+                    .hover(move |s| s.bg(rgb(hov)))
+                    .child(lucide("external-link", 11., t.fg3))
+                    .on_click(move |_ev, _win, _cx| {
+                        let _ = launch::open(&url);
+                    })
+                    .into_any_element()
+                }
+                None => chip.into_any_element(),
+            };
+            wrap = wrap.child(chip);
+        }
+        wrap
+    });
+
+    // Actions: approve + each allowed merge method.
+    let mut actions = div()
+        .flex()
+        .flex_row()
+        .flex_wrap()
+        .gap(px(6.))
+        .child(pr_btn(
+            SharedString::from(format!("approve-{}", pr.number)),
+            "Approve",
+            t,
+            {
+                let (repo, slug, number) = (repo.clone(), slug.clone(), pr.number);
+                let app = app.clone();
+                move |_win, cx: &mut gpui::App| {
+                    let (repo, slug) = (repo.clone(), slug.clone());
+                    app.update(cx, |this, cx| {
+                        this.drawer.pr = PrState::Loading;
+                        approve_pr(repo, slug, number, cx);
+                        cx.notify();
+                    });
+                }
+            },
+        ));
+    for method in methods {
+        let label = capitalize(method);
+        actions = actions.child(pr_btn(
+            SharedString::from(format!("merge-{}-{method}", pr.number)),
+            &label,
+            t,
+            {
+                let (repo, slug, number, method) =
+                    (repo.clone(), slug.clone(), pr.number, method.to_string());
+                let app = app.clone();
+                move |_win, cx: &mut gpui::App| {
+                    let (repo, slug, method) = (repo.clone(), slug.clone(), method.clone());
+                    app.update(cx, |this, cx| {
+                        this.drawer.pr = PrState::Loading;
+                        merge_pr(repo, slug, number, method, cx);
+                        cx.notify();
+                    });
+                }
+            },
+        ));
+    }
+
+    let mut card = div()
+        .flex()
+        .flex_col()
+        .gap(px(8.))
+        .p(px(11.))
+        .rounded(px(t.r_sm))
+        .bg(rgb(t.surface))
+        .border_1()
+        .border_color(rgb(t.border))
+        .child(title)
+        .child(states);
+    if let Some(check_runs) = check_runs {
+        card = card.child(check_runs);
+    }
+    if !pr.author.is_empty() {
+        card = card.child(
+            div()
+                .font_family(MONO)
+                .text_size(px(t.text_data_sm))
+                .text_color(rgb(t.fg3))
+                .child(SharedString::from(format!("by {}", pr.author))),
+        );
+    }
+    card.child(actions)
+}
+
+/// A small PR action button. Passes `Window` so callers that need InputState
+/// (e.g. Gen only → drawer_generate_commit) can use it.
+pub(super) fn pr_btn(
+    id: SharedString,
+    label: &str,
+    t: &Theme,
+    on: impl Fn(&mut Window, &mut gpui::App) + 'static,
+) -> impl IntoElement {
+    let (hov_border, hov_fg) = (t.border_strong, t.fg0);
+    div()
+        .id(id)
+        .px(px(10.))
+        .py(px(5.))
+        .rounded(px(t.r_sm))
+        .bg(rgb(t.button_bg))
+        .border_1()
+        .border_color(rgb(t.border))
+        .font_family(MONO)
+        .text_size(px(t.text_data_sm))
+        .text_color(rgb(t.fg1))
+        .cursor_pointer()
+        .hover(move |s| s.border_color(rgb(hov_border)).text_color(rgb(hov_fg)))
+        .child(SharedString::from(label.to_string()))
+        .on_click(move |_ev, win, cx| on(win, cx))
+}
+
+/// A [`pr_btn`]-shaped button in its disabled state: muted, inert, no hover.
+fn disabled_btn(label: &str, t: &Theme) -> impl IntoElement {
+    div()
+        .px(px(10.))
+        .py(px(5.))
+        .rounded(px(t.r_sm))
+        .bg(rgb(t.button_bg))
+        .border_1()
+        .border_color(rgb(t.border))
+        .font_family(MONO)
+        .text_size(px(t.text_data_sm))
+        .text_color(rgb(t.fg3))
+        .child(SharedString::from(label.to_string()))
+}
+
+/// Title-case a lowercase merge-method name ("squash" → "Squash").
+fn capitalize(s: &str) -> String {
+    let mut c = s.chars();
+    match c.next() {
+        Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
+        None => String::new(),
+    }
+}
+
+/// Like [`seg`] but takes a `&str` label.
+fn seg_str(icon: &str, label: &str, color: u32) -> impl IntoElement {
+    seg(icon, SharedString::from(label.to_string()), color)
+}
+
+/// Readme tab: the rendered README, or a placeholder while loading / when absent.
+pub(super) fn readme_view(
+    row: &Row,
+    data: &DrawerData,
+    t: &Theme,
+    app: &Entity<RepoHarborApp>,
+) -> impl IntoElement {
+    match &data.readme {
+        ReadmeState::Ready(Some(src)) => {
+            let cmds = repoharbor_core::terminal::extract_commands_from_markdown(src);
+            let mut col = div().flex().flex_col().gap(px(12.));
+            if !cmds.is_empty() {
+                let mut panel = div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(6.))
+                    .p(px(10.))
+                    .rounded(px(t.r_sm))
+                    .bg(rgb(t.surface))
+                    .border_1()
+                    .border_color(rgb(t.border))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap(px(6.))
+                            .child(lucide("terminal", 13., t.primary))
+                            .child(
+                                div()
+                                    .text_size(px(t.text_data_sm))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(rgb(t.fg2))
+                                    .child(SharedString::from(format!(
+                                        "Commands in README ({})",
+                                        cmds.len()
+                                    ))),
+                            ),
+                    );
+                for (i, cmd) in cmds.into_iter().take(12).enumerate() {
+                    let (repo_r, title_r, raw_r, app_r) = (
+                        row.id.clone(),
+                        row.name.clone(),
+                        cmd.command.clone(),
+                        app.clone(),
+                    );
+                    let (repo_p, title_p, raw_p, app_p) = (
+                        row.id.clone(),
+                        row.name.clone(),
+                        cmd.command.clone(),
+                        app.clone(),
+                    );
+                    let border_c = if cmd.dangerous { t.dirty } else { t.border };
+                    let fg_c = if cmd.dangerous { t.dirty } else { t.fg1 };
+                    let hover_c = t.border_strong;
+                    panel = panel.child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .justify_between()
+                            .gap(px(8.))
+                            .px(px(8.))
+                            .py(px(5.))
+                            .rounded(px(t.r_xs))
+                            .bg(rgb(t.page))
+                            .border_1()
+                            .border_color(rgb(border_c))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w(px(0.))
+                                    .truncate()
+                                    .font_family(MONO)
+                                    .text_size(px(t.text_data_sm))
+                                    .text_color(rgb(fg_c))
+                                    .child(SharedString::from(cmd.command)),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_row()
+                                    .items_center()
+                                    .gap(px(4.))
+                                    .child(
+                                        div()
+                                            .id(SharedString::from(format!("readme-run-{i}")))
+                                            .px(px(7.))
+                                            .py(px(2.))
+                                            .rounded(px(t.r_xs))
+                                            .bg(rgb(t.button_bg))
+                                            .border_1()
+                                            .border_color(rgb(border_c))
+                                            .cursor_pointer()
+                                            .hover(move |s| s.border_color(rgb(hover_c)))
+                                            .text_size(px(t.text_data_sm))
+                                            .text_color(rgb(if cmd.dangerous {
+                                                t.dirty
+                                            } else {
+                                                t.accent_bright
+                                            }))
+                                            .child("▶ Run")
+                                            .on_click(move |_ev, win, cx| {
+                                                app_r.update(cx, |this, cx| {
+                                                    this.open_terminal_in(
+                                                        &repo_r,
+                                                        &title_r,
+                                                        Some(&raw_r),
+                                                        true,
+                                                        Some(win),
+                                                        cx,
+                                                    );
+                                                });
+                                            }),
+                                    )
+                                    .child(
+                                        div()
+                                            .id(SharedString::from(format!("readme-paste-{i}")))
+                                            .px(px(6.))
+                                            .py(px(2.))
+                                            .rounded(px(t.r_xs))
+                                            .bg(rgb(t.button_bg))
+                                            .border_1()
+                                            .border_color(rgb(t.border))
+                                            .cursor_pointer()
+                                            .hover(move |s| s.border_color(rgb(hover_c)))
+                                            .text_size(px(t.text_data_sm))
+                                            .text_color(rgb(t.fg2))
+                                            .child("Paste")
+                                            .on_click(move |_ev, win, cx| {
+                                                app_p.update(cx, |this, cx| {
+                                                    this.open_terminal_in(
+                                                        &repo_p,
+                                                        &title_p,
+                                                        Some(&raw_p),
+                                                        false,
+                                                        Some(win),
+                                                        cx,
+                                                    );
+                                                });
+                                            }),
+                                    ),
+                            ),
+                    );
+                }
+                col = col.child(panel);
+            }
+            // Reflow soft-wrapped lines first — gpui-component's renderer panics
+            // on a paragraph's embedded newlines (see data::unwrap_soft_breaks).
+            col.child(gpui_component::text::markdown(
+                crate::data::unwrap_soft_breaks(src),
+            ))
+            .into_any_element()
+        }
+        ReadmeState::Ready(None) => placeholder("No README in this repo.", t).into_any_element(),
+        _ => placeholder("Loading…", t).into_any_element(),
+    }
+}
+
+/// Notes tab: a "resume where I left off" catch-up + an editable markdown note
+/// (gpui-component multiline input) with Save.
+pub(super) fn notes_view(
+    row: &Row,
+    data: &DrawerData,
+    t: &Theme,
+    app: &Entity<RepoHarborApp>,
+    ai_ready: bool,
+) -> Div {
+    let mut col = div().flex().flex_col().gap(px(14.));
+    let Some(n) = &data.notes else {
+        return col.child(placeholder("Loading…", t));
+    };
+
+    // Catch-up row.
+    let mut catch = div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(9.))
+        .p(px(11.))
+        .rounded(px(t.r_sm))
+        .bg(rgb(t.surface))
+        .border_1()
+        .border_color(rgb(t.border))
+        .child(lucide("history", 15., t.accent_bright))
+        .child(
+            div()
+                .flex_1()
+                .text_size(px(t.text_small))
+                .text_color(rgb(t.fg1))
+                .child(n.catchup.clone()),
+        );
+    // AI "what changed" catch-up (gated on aiReady; only when there are commits).
+    if ai_ready && n.count > 0 {
+        let app2 = app.clone();
+        catch = catch.child(pr_btn(
+            SharedString::from("gen-resume"),
+            "Catch me up",
+            t,
+            move |_win, cx| {
+                app2.update(cx, |this, cx| this.drawer_generate_resume(cx));
+            },
+        ));
+    }
+    if n.count > 0 || n.first_visit {
+        let (app, repo) = (app.clone(), row.id.clone());
+        catch = catch.child(pr_btn(
+            SharedString::from("mark-seen"),
+            "Mark caught up",
+            t,
+            move |_win, cx| {
+                let repo = repo.clone();
+                app.update(cx, |_this, cx| mark_seen(repo, cx));
+            },
+        ));
+    }
+    col = col.child(catch);
+
+    // The AI narrative, once generated.
+    if let Some(resume) = &n.resume {
+        col = col.child(
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(6.))
+                .p(px(11.))
+                .rounded(px(t.r_sm))
+                .bg(rgb(t.surface))
+                .border_1()
+                .border_color(rgb(t.border))
+                .child(seg("sparkles", "What changed".into(), t.fg3))
+                .child(
+                    div()
+                        .text_size(px(t.text_small))
+                        .text_color(rgb(t.fg1))
+                        .child(
+                            // Render as markdown (reflowed, like the Readme tab): the
+                            // prompt asks for plain sentences but models still emit
+                            // multi-line text, which plain text elements panic on.
+                            gpui_component::text::markdown(crate::data::unwrap_soft_breaks(resume)),
+                        ),
+                ),
+        );
+    }
+
+    // Editable note field + Save.
+    let mut note = section(t, "Note", None);
+    if let Some(input) = &data.note_input {
+        let (app, repo, input2) = (app.clone(), row.id.clone(), input.clone());
+        note = note
+            .child(
+                div()
+                    .min_h(px(160.))
+                    .child(gpui_component::input::Input::new(input).h_full()),
+            )
+            .child(div().flex().flex_row().justify_end().child(pr_btn(
+                SharedString::from("save-note"),
+                "Save note",
+                t,
+                move |_win, cx| {
+                    let (repo, text) = (repo.clone(), input2.read(cx).value());
+                    app.update(cx, |_this, cx| save_note(repo, text.to_string(), cx));
+                },
+            )));
+    }
+    col.child(note)
+}
+
+fn footer(
+    row: &Row,
+    t: &Theme,
+    app: &Entity<RepoHarborApp>,
+    ide_cmd: &str,
+    agent_cmd: &str,
+) -> impl IntoElement {
+    let mut bar = div()
+        .flex()
+        .flex_row()
+        .gap(px(8.))
+        .px(px(18.))
+        .py(px(14.))
+        .border_t_1()
+        .border_color(rgb(t.border))
+        .child(launch_btn(
+            "drawer-ide",
+            SharedString::from("Open in IDE"),
+            true,
+            t,
+            {
+                let (path, cmd, app) = (row.id.clone(), ide_cmd.to_string(), app.clone());
+                move |_win: &mut Window, cx: &mut App| {
+                    if let Err(e) = launch::launch(&cmd, &path) {
+                        app.update(cx, |this, cx| {
+                            this.push_toast(
+                                ToastKind::Error,
+                                "Couldn't open IDE",
+                                Some(e.into()),
+                                cx,
+                            );
+                        });
+                    }
+                }
+            },
+        ))
+        .child(launch_btn(
+            "drawer-agent",
+            SharedString::from(repoharbor_core::config::agent_launcher_label(agent_cmd)),
+            true,
+            t,
+            {
+                let (path, name, cmd, app) = (
+                    row.id.clone(),
+                    row.name.clone(),
+                    agent_cmd.to_string(),
+                    app.clone(),
+                );
+                move |win: &mut Window, cx: &mut App| {
+                    app.update(cx, |this, cx| {
+                        if this.config.terminal_embedded_default {
+                            this.open_terminal_in(&path, &name, None, false, Some(win), cx);
+                        } else if let Err(e) = launch::spawn(&cmd, &path) {
+                            this.push_toast(
+                                ToastKind::Error,
+                                "Couldn't open terminal",
+                                Some(e.into()),
+                                cx,
+                            );
+                        }
+                    });
+                }
+            },
+        ))
+        .child(launch_btn(
+            "drawer-folder",
+            lucide("folder-open", 15., t.fg1),
+            false,
+            t,
+            {
+                let (path, app) = (row.id.clone(), app.clone());
+                move |_win: &mut Window, cx: &mut App| {
+                    if let Err(e) = launch::open(&path) {
+                        app.update(cx, |this, cx| {
+                            this.push_toast(
+                                ToastKind::Error,
+                                "Couldn't open folder",
+                                Some(e.into()),
+                                cx,
+                            );
+                        });
+                    }
+                }
+            },
+        ));
+    if !row.url.is_empty() {
+        let url = row.url.clone();
+        let app = app.clone();
+        bar = bar.child(launch_btn(
+            "drawer-host",
+            lucide("external-link", 15., t.fg1),
+            false,
+            t,
+            move |_win: &mut Window, cx: &mut App| {
+                if let Err(e) = launch::open(&url) {
+                    app.update(cx, |this, cx| {
+                        this.push_toast(
+                            ToastKind::Error,
+                            "Couldn't open remote",
+                            Some(e.into()),
+                            cx,
+                        );
+                    });
+                }
+            },
+        ));
+    }
+    bar
+}
+
+/// A drawer launcher button. `on` receives `&mut Window` and `&mut App`.
+fn launch_btn(
+    id: &'static str,
+    content: impl IntoElement,
+    wide: bool,
+    t: &Theme,
+    on: impl Fn(&mut Window, &mut App) + 'static,
+) -> impl IntoElement {
+    let (hov_border, hov_fg) = (t.border_strong, t.fg0);
+    let b = div()
+        .id(id)
+        .flex()
+        .flex_row()
+        .items_center()
+        .justify_center()
+        .gap(px(6.))
+        .py(px(9.))
+        .rounded(px(t.r_sm))
+        .bg(rgb(t.button_bg))
+        .border_1()
+        .border_color(rgb(t.border))
+        .text_size(px(t.text_data_sm))
+        .text_color(rgb(t.fg1))
+        .font_family(MONO)
+        .cursor_pointer()
+        .hover(move |s| s.border_color(rgb(hov_border)).text_color(rgb(hov_fg)))
+        .on_click(move |_ev, win, cx| on(win, cx))
+        .child(content);
+    if wide {
+        b.flex_1().min_w(px(0.))
+    } else {
+        b.w(px(40.))
+    }
+}
+
+/// Inline icon+label segment (shared shape with the card's status segs).
+fn seg(icon: &str, label: SharedString, color: u32) -> impl IntoElement {
+    div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(4.))
+        .text_color(rgb(color))
+        .child(lucide(icon, 13., color))
+        .child(label)
+}

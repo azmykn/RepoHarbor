@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="#000" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+  <!-- RepoHarbor mark: stacked repos over a dock (monochrome for GPUI tint) -->
+  <rect x="5" y="3.5" width="14" height="3" rx="1"/>
+  <rect x="6" y="7.5" width="12" height="3" rx="1"/>
+  <rect x="7" y="11.5" width="10" height="3.5" rx="1"/>
+  <path d="M4 17h16"/>
+  <path d="M6 17v4"/>
+  <path d="M12 17v4"/>
+  <path d="M18 17v4"/>
+</svg>

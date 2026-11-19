@@ -1,0 +1,1271 @@
+//! Cross-host "dev inbox" (Phase 7): the things a dev checks constantly — open
+//! PRs, review requests, assigned issues, host notifications, CI status, and
+//! starred repos. GitHub is implemented via its REST/search API using the
+//! resolved token (RepoHarbor OAuth → unless signed out → env/`gh` when allowed);
+//! GitLab support can layer on the same shapes later.
+
+use serde::{Deserialize, Serialize};
+
+use crate::model::Host;
+use crate::oauth;
+
+const UA: &str = "RepoHarbor/0.1 (+https://repoharbor.app)";
+const GH: &str = "https://api.github.com";
+
+fn client() -> reqwest::Client {
+    // Shared client (Arc-backed) so the inbox's several GitHub calls reuse one
+    // connection pool instead of handshaking anew each time.
+    static CLIENT: std::sync::LazyLock<reqwest::Client> = std::sync::LazyLock::new(|| {
+        reqwest::Client::builder()
+            .user_agent(UA)
+            // Small JSON responses → bound both connect and overall time so a
+            // hung host can't stall an inbox refresh indefinitely.
+            .connect_timeout(std::time::Duration::from_secs(8))
+            .timeout(std::time::Duration::from_secs(20))
+            .build()
+            .unwrap_or_default()
+    });
+    CLIENT.clone()
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InboxItem {
+    /// "pr" | "review" | "issue"
+    pub kind: String,
+    pub title: String,
+    pub repo: String,
+    pub url: String,
+    pub number: u64,
+    pub draft: bool,
+    pub host: Host,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Notification {
+    pub title: String,
+    pub repo: String,
+    pub reason: String,
+    pub kind: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteRepo {
+    pub slug: String,
+    pub description: Option<String>,
+    pub stars: u32,
+    pub language: Option<String>,
+    pub clone_url: String,
+    pub host: Host,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CiStatus {
+    /// "success" | "failure" | "pending" | "none"
+    pub state: String,
+    /// The run's web page (GitHub's `html_url`), when a run was found — lets
+    /// surfaces link straight to the failing run.
+    pub url: Option<String>,
+}
+
+/// One entry in the activity feed. `kind` distinguishes a starred-repo release
+/// from a followed-user action so the UI can render the right sentence.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FeedItem {
+    /// "release" | "starred" | "created" | "forked" | "public"
+    pub kind: String,
+    /// The followed user who did it (activity events); None for starred releases.
+    pub actor: Option<String>,
+    pub repo: String,   // owner/name
+    pub title: String,  // release title, or empty for plain actions
+    pub tag: String,    // release tag, or empty
+    pub detail: String, // release notes, truncated
+    pub url: String,
+    pub timestamp: i64, // unix seconds
+    pub prerelease: bool,
+    pub host: Host,
+}
+
+/// Unix seconds from an ISO-8601 UTC timestamp ("2024-01-15T10:30:00Z").
+/// Dependency-free (no chrono); good enough for feed ordering/display.
+fn parse_iso8601(s: &str) -> Option<i64> {
+    if s.len() < 19 {
+        return None;
+    }
+    let y: i64 = s.get(0..4)?.parse().ok()?;
+    let mo: i64 = s.get(5..7)?.parse().ok()?;
+    let d: i64 = s.get(8..10)?.parse().ok()?;
+    let h: i64 = s.get(11..13)?.parse().ok()?;
+    let mi: i64 = s.get(14..16)?.parse().ok()?;
+    let se: i64 = s.get(17..19)?.parse().ok()?;
+    // days since 1970-01-01 (Howard Hinnant's days_from_civil)
+    let y2 = if mo <= 2 { y - 1 } else { y };
+    let era = (if y2 >= 0 { y2 } else { y2 - 399 }) / 400;
+    let yoe = y2 - era * 400;
+    let doy = (153 * (if mo > 2 { mo - 3 } else { mo + 9 }) + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    Some(days * 86_400 + h * 3_600 + mi * 60 + se)
+}
+
+fn truncate(mut s: String, max: usize) -> String {
+    if s.chars().count() > max {
+        s = s.chars().take(max).collect::<String>() + "…";
+    }
+    s
+}
+
+/// Latest releases across the repos you've starred, via GitHub GraphQL — one
+/// request fetches 100 stars *and* their latest release (far cheaper than
+/// per-repo REST). Up to ~200 most-recently-starred repos.
+async fn release_items(token: &str) -> Result<Vec<FeedItem>, String> {
+    const QUERY: &str = r#"query($cursor: String) {
+      viewer {
+        starredRepositories(first: 100, after: $cursor, orderBy: {field: STARRED_AT, direction: DESC}) {
+          pageInfo { hasNextPage endCursor }
+          nodes {
+            nameWithOwner
+            releases(first: 1, orderBy: {field: CREATED_AT, direction: DESC}) {
+              nodes { name tagName url publishedAt description isPrerelease isDraft }
+            }
+          }
+        }
+      }
+    }"#;
+
+    #[derive(Deserialize)]
+    struct Resp {
+        data: Option<Data>,
+    }
+    #[derive(Deserialize)]
+    struct Data {
+        viewer: Viewer,
+    }
+    #[derive(Deserialize)]
+    struct Viewer {
+        #[serde(rename = "starredRepositories")]
+        starred: Starred,
+    }
+    #[derive(Deserialize)]
+    struct Starred {
+        #[serde(rename = "pageInfo")]
+        page_info: PageInfo,
+        nodes: Vec<RepoNode>,
+    }
+    #[derive(Deserialize)]
+    struct PageInfo {
+        #[serde(rename = "hasNextPage")]
+        has_next_page: bool,
+        #[serde(rename = "endCursor")]
+        end_cursor: Option<String>,
+    }
+    #[derive(Deserialize)]
+    struct RepoNode {
+        #[serde(rename = "nameWithOwner")]
+        name_with_owner: String,
+        releases: Releases,
+    }
+    #[derive(Deserialize)]
+    struct Releases {
+        nodes: Vec<Rel>,
+    }
+    #[derive(Deserialize)]
+    struct Rel {
+        #[serde(default)]
+        name: Option<String>,
+        #[serde(rename = "tagName")]
+        tag_name: String,
+        url: String,
+        #[serde(rename = "publishedAt")]
+        published_at: Option<String>,
+        #[serde(default)]
+        description: Option<String>,
+        #[serde(rename = "isPrerelease", default)]
+        prerelease: bool,
+        #[serde(rename = "isDraft", default)]
+        draft: bool,
+    }
+
+    let mut items: Vec<FeedItem> = Vec::new();
+    let mut cursor: Option<String> = None;
+    for _ in 0..2 {
+        let body = serde_json::json!({ "query": QUERY, "variables": { "cursor": cursor } });
+        let resp = client()
+            .post(format!("{GH}/graphql"))
+            .bearer_auth(token)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+        if !resp.status().is_success() {
+            return Err(format!("GitHub GraphQL {}", resp.status()));
+        }
+        let parsed: Resp = resp.json().await.map_err(|e| e.to_string())?;
+        let Some(data) = parsed.data else { break };
+        let starred = data.viewer.starred;
+        for node in starred.nodes {
+            let Some(rel) = node.releases.nodes.into_iter().next() else {
+                continue;
+            };
+            if rel.draft {
+                continue;
+            }
+            let title = match rel.name {
+                Some(n) if !n.trim().is_empty() => n,
+                _ => rel.tag_name.clone(),
+            };
+            items.push(FeedItem {
+                kind: "release".into(),
+                actor: None,
+                repo: node.name_with_owner,
+                title,
+                tag: rel.tag_name,
+                detail: truncate(rel.description.unwrap_or_default(), 320),
+                url: rel.url,
+                timestamp: rel
+                    .published_at
+                    .as_deref()
+                    .and_then(parse_iso8601)
+                    .unwrap_or(0),
+                prerelease: rel.prerelease,
+                host: Host::Github,
+            });
+        }
+        if !starred.page_info.has_next_page {
+            break;
+        }
+        cursor = starred.page_info.end_cursor;
+    }
+    Ok(items)
+}
+
+/// Activity from the people you follow — GitHub's "received events" (the home
+/// dashboard feed). Surfaces the meaningful event types.
+async fn following_items(token: &str) -> Result<Vec<FeedItem>, String> {
+    #[derive(Deserialize)]
+    struct Event {
+        #[serde(rename = "type")]
+        kind: Option<String>,
+        actor: Option<Actor>,
+        repo: Option<EvRepo>,
+        payload: Option<Payload>,
+        created_at: Option<String>,
+    }
+    #[derive(Deserialize)]
+    struct Actor {
+        login: String,
+    }
+    #[derive(Deserialize)]
+    struct EvRepo {
+        name: String,
+    }
+    #[derive(Deserialize)]
+    struct Payload {
+        #[serde(default)]
+        ref_type: Option<String>,
+        #[serde(default)]
+        release: Option<EvRelease>,
+    }
+    #[derive(Deserialize)]
+    struct EvRelease {
+        #[serde(default)]
+        name: Option<String>,
+        #[serde(default)]
+        tag_name: Option<String>,
+        #[serde(default)]
+        html_url: Option<String>,
+        #[serde(default)]
+        body: Option<String>,
+        #[serde(default)]
+        prerelease: bool,
+    }
+
+    let login = github_user(token).await?;
+    let resp = client()
+        .get(format!("{GH}/users/{login}/received_events?per_page=100"))
+        .bearer_auth(token)
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    if !resp.status().is_success() {
+        return Err(format!("GitHub events {}", resp.status()));
+    }
+    let events: Vec<Event> = resp.json().await.map_err(|e| e.to_string())?;
+
+    let mut out = Vec::new();
+    for e in events {
+        let ts = e.created_at.as_deref().and_then(parse_iso8601).unwrap_or(0);
+        let actor = e.actor.map(|a| a.login);
+        let Some(repo) = e.repo.map(|r| r.name) else {
+            continue;
+        };
+        let repo_url = format!("https://github.com/{repo}");
+        let item =
+            |kind: &str, title: String, tag: String, detail: String, url: String, pre: bool| {
+                FeedItem {
+                    kind: kind.into(),
+                    actor: actor.clone(),
+                    repo: repo.clone(),
+                    title,
+                    tag,
+                    detail,
+                    url,
+                    timestamp: ts,
+                    prerelease: pre,
+                    host: Host::Github,
+                }
+            };
+        match e.kind.as_deref() {
+            Some("ReleaseEvent") => {
+                if let Some(rel) = e.payload.and_then(|p| p.release) {
+                    let tag = rel.tag_name.unwrap_or_default();
+                    let title = match rel.name {
+                        Some(n) if !n.trim().is_empty() => n,
+                        _ => tag.clone(),
+                    };
+                    out.push(item(
+                        "release",
+                        title,
+                        tag,
+                        truncate(rel.body.unwrap_or_default(), 320),
+                        rel.html_url.unwrap_or(repo_url),
+                        rel.prerelease,
+                    ));
+                }
+            }
+            Some("WatchEvent") => out.push(item(
+                "starred",
+                String::new(),
+                String::new(),
+                String::new(),
+                repo_url,
+                false,
+            )),
+            Some("CreateEvent")
+                if e.payload.as_ref().and_then(|p| p.ref_type.as_deref()) == Some("repository") =>
+            {
+                out.push(item(
+                    "created",
+                    String::new(),
+                    String::new(),
+                    String::new(),
+                    repo_url,
+                    false,
+                ));
+            }
+            Some("ForkEvent") => out.push(item(
+                "forked",
+                String::new(),
+                String::new(),
+                String::new(),
+                repo_url,
+                false,
+            )),
+            Some("PublicEvent") => out.push(item(
+                "public",
+                String::new(),
+                String::new(),
+                String::new(),
+                repo_url,
+                false,
+            )),
+            _ => {}
+        }
+    }
+    Ok(out)
+}
+
+/// The unified activity feed: starred-repo releases + activity from people you
+/// follow, merged newest-first and de-duplicated by URL. Each source is
+/// best-effort — a failure in one still returns the other.
+pub async fn github_feed() -> Result<Vec<FeedItem>, String> {
+    let token = oauth::github_token().ok_or("connect GitHub to see the feed")?;
+
+    let mut items: Vec<FeedItem> = Vec::new();
+    let mut errors = Vec::new();
+    // The two sources are independent network fetches, so run them concurrently:
+    // cold-load latency becomes the slower of the two rather than their sum.
+    let (releases, following) =
+        futures_util::future::join(release_items(&token), following_items(&token)).await;
+    for source in [releases, following] {
+        match source {
+            Ok(r) => items.extend(r),
+            Err(e) => errors.push(e),
+        }
+    }
+    if items.is_empty() && !errors.is_empty() {
+        return Err(errors.join("; "));
+    }
+
+    items.sort_by_key(|i| std::cmp::Reverse(i.timestamp));
+    let mut seen = std::collections::HashSet::new();
+    items.retain(|i| seen.insert(i.url.clone()));
+    items.truncate(80);
+    Ok(items)
+}
+
+async fn github_user(token: &str) -> Result<String, String> {
+    #[derive(Deserialize)]
+    struct User {
+        login: String,
+    }
+    let resp = client()
+        .get(format!("{GH}/user"))
+        .bearer_auth(token)
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    if !resp.status().is_success() {
+        return Err(format!(
+            "GitHub auth failed ({}) — check the token scopes",
+            resp.status()
+        ));
+    }
+    let user: User = resp.json().await.map_err(|e| e.to_string())?;
+    Ok(user.login)
+}
+
+/// Shared GitHub issue-search shape (covers PRs and issues).
+#[derive(Deserialize)]
+struct SearchResp {
+    #[serde(default)]
+    items: Vec<SearchItem>,
+}
+#[derive(Deserialize)]
+struct SearchItem {
+    title: String,
+    html_url: String,
+    number: u64,
+    repository_url: String,
+    #[serde(default)]
+    draft: bool,
+}
+
+fn repo_from_url(repository_url: &str) -> String {
+    repository_url
+        .rsplit("/repos/")
+        .next()
+        .unwrap_or("")
+        .to_string()
+}
+
+/// Whether a just-fetched page suggests more results exist: a full page means
+/// GitHub may have more, a short (or empty) page is the last one. Shared by
+/// the bounded pagination loops below so they all stop early the same way.
+fn page_may_have_more(page_len: usize, per_page: usize) -> bool {
+    page_len >= per_page
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        check_run_state, ci_error_for_status, page_may_have_more, repo_from_url, rollup_state,
+        split_slug, status_context_state, workflow_run_state,
+    };
+
+    #[test]
+    fn repo_from_url_extracts_owner_repo() {
+        assert_eq!(
+            repo_from_url("https://api.github.com/repos/acme/widget"),
+            "acme/widget"
+        );
+        assert_eq!(repo_from_url("https://api.github.com/repos/a/b"), "a/b");
+    }
+
+    #[test]
+    fn pagination_stops_on_short_page_and_continues_on_full_page() {
+        // A full page means GitHub may have more → keep going.
+        assert!(page_may_have_more(50, 50));
+        // A short or empty page is the last one → stop.
+        assert!(!page_may_have_more(49, 50));
+        assert!(!page_may_have_more(0, 50));
+        // A page longer than requested (shouldn't happen, but defensively):
+        // still "may have more".
+        assert!(page_may_have_more(61, 60));
+    }
+
+    #[test]
+    fn split_slug_splits_owner_and_name() {
+        assert_eq!(split_slug("acme/widget"), Ok(("acme", "widget")));
+        assert!(split_slug("noslash").is_err());
+    }
+
+    #[test]
+    fn check_run_state_maps_status_and_conclusion() {
+        assert_eq!(check_run_state(Some("IN_PROGRESS"), None), "pending");
+        assert_eq!(
+            check_run_state(Some("COMPLETED"), Some("SUCCESS")),
+            "success"
+        );
+        assert_eq!(
+            check_run_state(Some("COMPLETED"), Some("FAILURE")),
+            "failure"
+        );
+        assert_eq!(
+            check_run_state(Some("COMPLETED"), Some("CANCELLED")),
+            "failure"
+        );
+        assert_eq!(
+            check_run_state(Some("COMPLETED"), Some("SKIPPED")),
+            "neutral"
+        );
+    }
+
+    #[test]
+    fn rollup_and_status_context_states() {
+        assert_eq!(rollup_state("SUCCESS"), "success");
+        assert_eq!(rollup_state("ERROR"), "failure");
+        assert_eq!(rollup_state("EXPECTED"), "pending");
+        assert_eq!(status_context_state(Some("SUCCESS")), "success");
+        assert_eq!(status_context_state(Some("ERROR")), "failure");
+        assert_eq!(status_context_state(None), "pending");
+    }
+
+    #[test]
+    fn workflow_run_state_maps_status_and_conclusion() {
+        assert_eq!(workflow_run_state("in_progress", None), "pending");
+        assert_eq!(workflow_run_state("queued", Some("success")), "pending");
+        assert_eq!(workflow_run_state("completed", Some("success")), "success");
+        assert_eq!(workflow_run_state("completed", Some("failure")), "failure");
+        assert_eq!(
+            workflow_run_state("completed", Some("timed_out")),
+            "failure"
+        );
+        assert_eq!(
+            workflow_run_state("completed", Some("startup_failure")),
+            "failure"
+        );
+        assert_eq!(workflow_run_state("completed", Some("cancelled")), "none");
+        assert_eq!(workflow_run_state("completed", None), "none");
+    }
+
+    #[test]
+    fn ci_errors_surface_auth_and_rate_limit_but_not_missing_repo() {
+        use reqwest::StatusCode;
+        // 404 = repo not visible to this token — genuinely nothing to show.
+        assert_eq!(ci_error_for_status(StatusCode::NOT_FOUND, None, None), None);
+        // Expired/revoked token, permission 403, rate limit, and server errors
+        // must be errors — not a silent "none" that blanks CI across the grid.
+        let unauthorized = ci_error_for_status(StatusCode::UNAUTHORIZED, None, None).expect("401");
+        assert!(unauthorized.contains("401"), "{unauthorized}");
+        assert!(unauthorized.contains("reconnect"), "{unauthorized}");
+
+        let forbidden = ci_error_for_status(StatusCode::FORBIDDEN, Some("42"), None).expect("403");
+        assert!(forbidden.contains("403"), "{forbidden}");
+        assert!(
+            forbidden.contains("Actions") || forbidden.contains("SSO"),
+            "{forbidden}"
+        );
+
+        // 403 with remaining=0 is GitHub's rate-limit shape, not a scope issue.
+        let rate_via_403 =
+            ci_error_for_status(StatusCode::FORBIDDEN, Some("0"), None).expect("rate");
+        assert!(rate_via_403.contains("rate limited"), "{rate_via_403}");
+
+        let rate_429 = ci_error_for_status(StatusCode::TOO_MANY_REQUESTS, None, None).expect("429");
+        assert!(rate_429.contains("rate limited"), "{rate_429}");
+
+        for status in [StatusCode::INTERNAL_SERVER_ERROR, StatusCode::BAD_GATEWAY] {
+            let err = ci_error_for_status(status, None, None).expect("must surface");
+            assert!(err.contains(status.as_str()), "{err}");
+        }
+    }
+}
+
+/// GitHub issue/PR search, paginated up to 3 pages × 50 items (150 per query)
+/// — bounded because the search API has its own tight rate limit. Stops early
+/// when a page comes back short. Any page failing (401 expired token, 403/429
+/// rate limit) propagates as an error rather than a misleading empty inbox.
+async fn gh_search(token: &str, query: &str, kind: &str) -> Result<Vec<InboxItem>, String> {
+    const PER_PAGE: usize = 50;
+    const MAX_PAGES: usize = 3;
+    let mut items = Vec::new();
+    for page in 1..=MAX_PAGES {
+        let url = format!(
+            "{GH}/search/issues?per_page={PER_PAGE}&page={page}&q={}",
+            urlencoding::encode(query)
+        );
+        let resp = client()
+            .get(url)
+            .bearer_auth(token)
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+        if !resp.status().is_success() {
+            // Surface auth/rate-limit failures instead of a misleading empty inbox.
+            return Err(format!("GitHub search {}", resp.status()));
+        }
+        let parsed: SearchResp = resp.json().await.map_err(|e| e.to_string())?;
+        let page_len = parsed.items.len();
+        items.extend(parsed.items.into_iter().map(|i| InboxItem {
+            kind: kind.to_string(),
+            title: i.title,
+            repo: repo_from_url(&i.repository_url),
+            url: i.html_url,
+            number: i.number,
+            draft: i.draft,
+            host: Host::Github,
+        }));
+        if !page_may_have_more(page_len, PER_PAGE) {
+            break;
+        }
+    }
+    Ok(items)
+}
+
+/// Open PRs authored by the user, PRs awaiting their review, and issues
+/// assigned to them.
+pub async fn github_inbox() -> Result<Vec<InboxItem>, String> {
+    let token = oauth::github_token().ok_or("connect GitHub to use the inbox")?;
+    let login = github_user(&token).await?;
+
+    let mut items = Vec::new();
+    items.extend(gh_search(&token, &format!("is:open is:pr author:{login}"), "pr").await?);
+    items.extend(
+        gh_search(
+            &token,
+            &format!("is:open is:pr review-requested:{login}"),
+            "review",
+        )
+        .await?,
+    );
+    items.extend(
+        gh_search(
+            &token,
+            &format!("is:open is:issue assignee:{login}"),
+            "issue",
+        )
+        .await?,
+    );
+    Ok(items)
+}
+
+/// Unread notifications, paginated up to 3 pages × 50 (150 total) so a busy
+/// account isn't silently cut off at the first page. Stops early when a page
+/// comes back short; any page failing propagates as an error (same rule as
+/// `gh_search`).
+pub async fn github_notifications() -> Result<Vec<Notification>, String> {
+    #[derive(Deserialize)]
+    struct N {
+        reason: String,
+        subject: Subject,
+        repository: Repo,
+    }
+    #[derive(Deserialize)]
+    struct Subject {
+        title: String,
+        #[serde(rename = "type")]
+        kind: String,
+    }
+    #[derive(Deserialize)]
+    struct Repo {
+        full_name: String,
+    }
+    const PER_PAGE: usize = 50;
+    const MAX_PAGES: usize = 3;
+    let token = oauth::github_token().ok_or("connect GitHub to see notifications")?;
+    let mut items = Vec::new();
+    for page in 1..=MAX_PAGES {
+        let resp = client()
+            .get(format!(
+                "{GH}/notifications?per_page={PER_PAGE}&page={page}"
+            ))
+            .bearer_auth(&token)
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+        if !resp.status().is_success() {
+            return Err(format!("GitHub API {}", resp.status()));
+        }
+        let raw: Vec<N> = resp.json().await.map_err(|e| e.to_string())?;
+        let page_len = raw.len();
+        items.extend(raw.into_iter().map(|n| Notification {
+            title: n.subject.title,
+            repo: n.repository.full_name,
+            reason: n.reason,
+            kind: n.subject.kind,
+        }));
+        if !page_may_have_more(page_len, PER_PAGE) {
+            break;
+        }
+    }
+    Ok(items)
+}
+
+/// The user's starred repos, paginated up to 3 pages × 60 (180 total,
+/// most-recently-starred first) — same order of cap as the feed's ~200-star
+/// GraphQL fetch in `release_items`. Stops early when a page comes back
+/// short; any page failing propagates as an error (same rule as `gh_search`).
+pub async fn github_starred() -> Result<Vec<RemoteRepo>, String> {
+    #[derive(Deserialize)]
+    struct R {
+        full_name: String,
+        description: Option<String>,
+        #[serde(default)]
+        stargazers_count: u32,
+        language: Option<String>,
+        clone_url: String,
+    }
+    const PER_PAGE: usize = 60;
+    const MAX_PAGES: usize = 3;
+    let token = oauth::github_token().ok_or("connect GitHub to browse stars")?;
+    let mut items = Vec::new();
+    for page in 1..=MAX_PAGES {
+        let resp = client()
+            .get(format!("{GH}/user/starred?per_page={PER_PAGE}&page={page}"))
+            .bearer_auth(&token)
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+        if !resp.status().is_success() {
+            return Err(format!("GitHub API {}", resp.status()));
+        }
+        let raw: Vec<R> = resp.json().await.map_err(|e| e.to_string())?;
+        let page_len = raw.len();
+        items.extend(raw.into_iter().map(|r| RemoteRepo {
+            slug: r.full_name,
+            description: r.description,
+            stars: r.stargazers_count,
+            language: r.language,
+            clone_url: r.clone_url,
+            host: Host::Github,
+        }));
+        if !page_may_have_more(page_len, PER_PAGE) {
+            break;
+        }
+    }
+    Ok(items)
+}
+
+// ── PR action panel (#67): per-repo checks / review / mergeable + merge ──────
+
+/// One open PR for a repo, with enough detail to decide whether to merge.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PrDetail {
+    pub number: u64,
+    pub title: String,
+    pub url: String,
+    pub draft: bool,
+    pub base: String,
+    pub head: String,
+    pub author: Option<String>,
+    /// "clean" | "conflicting" | "unknown"
+    pub mergeable: String,
+    /// "approved" | "changes_requested" | "review_required" | "none"
+    pub review_decision: String,
+    /// Aggregate check rollup: "success" | "failure" | "pending" | "none"
+    pub checks_state: String,
+    pub checks: Vec<CheckRun>,
+    pub reviews: Vec<PrReview>,
+}
+
+/// One status check / CI context on a PR's head commit.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CheckRun {
+    pub name: String,
+    /// "success" | "failure" | "pending" | "neutral"
+    pub state: String,
+    pub url: Option<String>,
+}
+
+/// A submitted review that affects mergeability (approval or change request).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PrReview {
+    pub author: String,
+    /// "approved" | "changes_requested"
+    pub state: String,
+}
+
+/// A repo's open PRs plus the merge methods the repo actually permits, so the
+/// UI can offer only valid choices (squash / rebase / merge).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PrPanel {
+    /// Subset of ["squash", "rebase", "merge"] allowed by repo settings.
+    pub merge_methods: Vec<String>,
+    pub prs: Vec<PrDetail>,
+}
+
+fn split_slug(slug: &str) -> Result<(&str, &str), String> {
+    slug.split_once('/')
+        .ok_or_else(|| format!("not an owner/name slug: {slug}"))
+}
+
+/// Open PRs for a repo with checks, reviews, and mergeable state — one GraphQL
+/// round-trip. Also reports which merge methods the repo allows.
+pub async fn github_prs(slug: &str) -> Result<PrPanel, String> {
+    const QUERY: &str = r#"query($owner: String!, $name: String!) {
+      repository(owner: $owner, name: $name) {
+        mergeCommitAllowed
+        squashMergeAllowed
+        rebaseMergeAllowed
+        pullRequests(first: 20, states: OPEN, orderBy: {field: UPDATED_AT, direction: DESC}) {
+          nodes {
+            number title url isDraft baseRefName headRefName
+            mergeable reviewDecision
+            author { login }
+            commits(last: 1) {
+              nodes {
+                commit {
+                  statusCheckRollup {
+                    state
+                    contexts(first: 50) {
+                      nodes {
+                        __typename
+                        ... on CheckRun { name conclusion status detailsUrl }
+                        ... on StatusContext { context state targetUrl }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+            reviews(last: 30, states: [APPROVED, CHANGES_REQUESTED]) {
+              nodes { author { login } state }
+            }
+          }
+        }
+      }
+    }"#;
+
+    #[derive(Deserialize)]
+    struct Resp {
+        data: Option<Data>,
+    }
+    #[derive(Deserialize)]
+    struct Data {
+        repository: Option<RepoNode>,
+    }
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct RepoNode {
+        merge_commit_allowed: bool,
+        squash_merge_allowed: bool,
+        rebase_merge_allowed: bool,
+        pull_requests: PrNodes,
+    }
+    #[derive(Deserialize)]
+    struct PrNodes {
+        nodes: Vec<PrNode>,
+    }
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct PrNode {
+        number: u64,
+        title: String,
+        url: String,
+        is_draft: bool,
+        base_ref_name: String,
+        head_ref_name: String,
+        mergeable: Option<String>,
+        review_decision: Option<String>,
+        author: Option<Login>,
+        commits: Commits,
+        reviews: ReviewNodes,
+    }
+    #[derive(Deserialize)]
+    struct Login {
+        login: String,
+    }
+    #[derive(Deserialize)]
+    struct Commits {
+        nodes: Vec<CommitNode>,
+    }
+    #[derive(Deserialize)]
+    struct CommitNode {
+        commit: Commit,
+    }
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Commit {
+        status_check_rollup: Option<Rollup>,
+    }
+    #[derive(Deserialize)]
+    struct Rollup {
+        state: Option<String>,
+        contexts: Contexts,
+    }
+    #[derive(Deserialize)]
+    struct Contexts {
+        nodes: Vec<ContextNode>,
+    }
+    // A union of CheckRun and StatusContext — fields are optional per variant.
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct ContextNode {
+        #[serde(rename = "__typename")]
+        typename: String,
+        // CheckRun
+        name: Option<String>,
+        conclusion: Option<String>,
+        status: Option<String>,
+        details_url: Option<String>,
+        // StatusContext
+        context: Option<String>,
+        state: Option<String>,
+        target_url: Option<String>,
+    }
+    #[derive(Deserialize)]
+    struct ReviewNodes {
+        nodes: Vec<ReviewNode>,
+    }
+    #[derive(Deserialize)]
+    struct ReviewNode {
+        author: Option<Login>,
+        state: String,
+    }
+
+    let token = oauth::github_token().ok_or("connect GitHub to view PRs")?;
+    let (owner, name) = split_slug(slug)?;
+    let body = serde_json::json!({
+        "query": QUERY,
+        "variables": { "owner": owner, "name": name },
+    });
+    let resp = client()
+        .post(format!("{GH}/graphql"))
+        .bearer_auth(&token)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    if !resp.status().is_success() {
+        return Err(format!("GitHub GraphQL {}", resp.status()));
+    }
+    let parsed: Resp = resp.json().await.map_err(|e| e.to_string())?;
+    let repo = parsed
+        .data
+        .and_then(|d| d.repository)
+        .ok_or("repository not found (or no access)")?;
+
+    let mut merge_methods = Vec::new();
+    if repo.squash_merge_allowed {
+        merge_methods.push("squash".to_string());
+    }
+    if repo.rebase_merge_allowed {
+        merge_methods.push("rebase".to_string());
+    }
+    if repo.merge_commit_allowed {
+        merge_methods.push("merge".to_string());
+    }
+
+    let prs = repo
+        .pull_requests
+        .nodes
+        .into_iter()
+        .map(|p| {
+            let rollup = p
+                .commits
+                .nodes
+                .into_iter()
+                .next()
+                .and_then(|c| c.commit.status_check_rollup);
+            let checks_state = rollup
+                .as_ref()
+                .and_then(|r| r.state.as_deref())
+                .map(rollup_state)
+                .unwrap_or("none")
+                .to_string();
+            let checks = rollup
+                .map(|r| {
+                    r.contexts
+                        .nodes
+                        .into_iter()
+                        .map(|c| {
+                            if c.typename == "CheckRun" {
+                                CheckRun {
+                                    name: c.name.unwrap_or_default(),
+                                    state: check_run_state(
+                                        c.status.as_deref(),
+                                        c.conclusion.as_deref(),
+                                    )
+                                    .to_string(),
+                                    url: c.details_url,
+                                }
+                            } else {
+                                CheckRun {
+                                    name: c.context.unwrap_or_default(),
+                                    state: status_context_state(c.state.as_deref()).to_string(),
+                                    url: c.target_url,
+                                }
+                            }
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            let reviews = p
+                .reviews
+                .nodes
+                .into_iter()
+                .map(|r| PrReview {
+                    author: r.author.map(|a| a.login).unwrap_or_default(),
+                    state: if r.state == "APPROVED" {
+                        "approved"
+                    } else {
+                        "changes_requested"
+                    }
+                    .to_string(),
+                })
+                .collect();
+            PrDetail {
+                number: p.number,
+                title: p.title,
+                url: p.url,
+                draft: p.is_draft,
+                base: p.base_ref_name,
+                head: p.head_ref_name,
+                author: p.author.map(|a| a.login),
+                mergeable: match p.mergeable.as_deref() {
+                    Some("MERGEABLE") => "clean",
+                    Some("CONFLICTING") => "conflicting",
+                    _ => "unknown",
+                }
+                .to_string(),
+                review_decision: match p.review_decision.as_deref() {
+                    Some("APPROVED") => "approved",
+                    Some("CHANGES_REQUESTED") => "changes_requested",
+                    Some("REVIEW_REQUIRED") => "review_required",
+                    _ => "none",
+                }
+                .to_string(),
+                checks_state,
+                checks,
+                reviews,
+            }
+        })
+        .collect();
+
+    Ok(PrPanel { merge_methods, prs })
+}
+
+/// Map GitHub's StatusState rollup enum to our four-state vocabulary.
+fn rollup_state(s: &str) -> &'static str {
+    match s {
+        "SUCCESS" => "success",
+        "FAILURE" | "ERROR" => "failure",
+        "PENDING" | "EXPECTED" => "pending",
+        _ => "none",
+    }
+}
+
+/// Map a CheckRun's (status, conclusion) to our four-state vocabulary.
+fn check_run_state(status: Option<&str>, conclusion: Option<&str>) -> &'static str {
+    if status != Some("COMPLETED") {
+        return "pending";
+    }
+    match conclusion {
+        Some("SUCCESS") => "success",
+        Some("FAILURE")
+        | Some("TIMED_OUT")
+        | Some("STARTUP_FAILURE")
+        | Some("CANCELLED")
+        | Some("ACTION_REQUIRED") => "failure",
+        Some("NEUTRAL") | Some("SKIPPED") => "neutral",
+        _ => "pending",
+    }
+}
+
+/// Map a legacy commit-status StatusState to our four-state vocabulary.
+fn status_context_state(s: Option<&str>) -> &'static str {
+    match s {
+        Some("SUCCESS") => "success",
+        Some("FAILURE") | Some("ERROR") => "failure",
+        _ => "pending",
+    }
+}
+
+/// Squash/rebase/merge a PR via REST. GitHub enforces branch protection and
+/// rejects with a descriptive error if the merge isn't permitted — we surface
+/// that rather than pre-judging it client-side.
+pub async fn github_merge_pr(slug: &str, number: u64, method: &str) -> Result<(), String> {
+    let method = match method {
+        "squash" | "rebase" | "merge" => method,
+        other => return Err(format!("invalid merge method: {other}")),
+    };
+    let token = oauth::github_token().ok_or("connect GitHub to merge")?;
+    let resp = client()
+        .put(format!("{GH}/repos/{slug}/pulls/{number}/merge"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({ "merge_method": method }))
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    if resp.status().is_success() {
+        return Ok(());
+    }
+    // GitHub returns a JSON { message } explaining why (e.g. "Required status
+    // checks must pass"); prefer it over the bare status code.
+    let status = resp.status();
+    let msg = resp
+        .json::<serde_json::Value>()
+        .await
+        .ok()
+        .and_then(|v| {
+            v.get("message")
+                .and_then(|m| m.as_str())
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| format!("GitHub merge {status}"));
+    Err(msg)
+}
+
+/// Approve a PR (submit an APPROVE review with no body).
+pub async fn github_approve_pr(slug: &str, number: u64) -> Result<(), String> {
+    let token = oauth::github_token().ok_or("connect GitHub to approve")?;
+    let resp = client()
+        .post(format!("{GH}/repos/{slug}/pulls/{number}/reviews"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({ "event": "APPROVE" }))
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    if resp.status().is_success() {
+        return Ok(());
+    }
+    let status = resp.status();
+    let msg = resp
+        .json::<serde_json::Value>()
+        .await
+        .ok()
+        .and_then(|v| {
+            v.get("message")
+                .and_then(|m| m.as_str())
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| format!("GitHub approve {status}"));
+    Err(msg)
+}
+
+/// Latest GitHub Actions run conclusion for a repo, filtered to `branch` when
+/// given (the central CI pass passes the default branch so PR-branch runs
+/// can't masquerade as trunk state).
+///
+/// "No CI" (`state: "none"`) is only reported when GitHub answers
+/// definitively: a 2xx with an empty run list, or a 404 (the repo isn't
+/// visible to this token — deleted, renamed, or private without access — so
+/// there is nothing to show). Auth failures (401 expired token), permission
+/// denials (403 without a depleted rate-limit header), rate limits (429 or
+/// 403 + `x-ratelimit-remaining: 0`), and server errors surface as `Err` —
+/// same rule as `gh_search` above — so a broken token reads as an error, not
+/// as CI vanishing. A linked account is not enough by itself: the token still
+/// needs Actions read access (`repo` on classic OAuth/PAT, or Actions:read on
+/// a fine-grained PAT) and org SSO authorization when the remote is under an
+/// org that requires it.
+pub async fn github_ci(slug: &str, branch: Option<&str>) -> Result<CiStatus, String> {
+    #[derive(Deserialize)]
+    struct Runs {
+        #[serde(default)]
+        workflow_runs: Vec<Run>,
+    }
+    #[derive(Deserialize)]
+    struct Run {
+        status: String,
+        conclusion: Option<String>,
+        html_url: Option<String>,
+    }
+    // No token → forge calls are gated off entirely; an unconnected app
+    // legitimately shows no CI (this is absence of a source, not a failure).
+    let Some(token) = oauth::github_token() else {
+        return Ok(CiStatus {
+            state: "none".into(),
+            url: None,
+        });
+    };
+    let mut req = client()
+        .get(format!("{GH}/repos/{slug}/actions/runs"))
+        .query(&[("per_page", "1")]);
+    if let Some(branch) = branch {
+        req = req.query(&[("branch", branch)]);
+    }
+    let resp = req
+        .bearer_auth(&token)
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    let status = resp.status();
+    if !status.is_success() {
+        // Peek rate-limit headers before consuming the body — GitHub often
+        // answers a depleted quota with 403 + remaining=0, which must not be
+        // misread as a missing Actions permission.
+        let rate_remaining = resp
+            .headers()
+            .get("x-ratelimit-remaining")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned);
+        let body_msg = resp
+            .json::<serde_json::Value>()
+            .await
+            .ok()
+            .and_then(|v| v.get("message").and_then(|m| m.as_str()).map(str::to_owned));
+        if let Some(err) =
+            ci_error_for_status(status, rate_remaining.as_deref(), body_msg.as_deref())
+        {
+            return Err(err);
+        }
+        return Ok(CiStatus {
+            state: "none".into(),
+            url: None,
+        });
+    }
+    let runs: Runs = resp.json().await.map_err(|e| e.to_string())?;
+    let run = runs.workflow_runs.into_iter().next();
+    let state = run
+        .as_ref()
+        .map(|r| workflow_run_state(&r.status, r.conclusion.as_deref()))
+        .unwrap_or("none");
+    Ok(CiStatus {
+        state: state.to_string(),
+        url: run.and_then(|r| r.html_url),
+    })
+}
+
+/// How a non-2xx from the workflow-runs endpoint is treated: 404 means the
+/// repo isn't visible with this token (deleted/renamed/no access) — genuinely
+/// no CI to show, so `None`. Auth/permission problems, rate limits, and 5xx
+/// are transport failures the caller must see (with an actionable hint when
+/// we can tell permission 403 apart from a depleted rate limit).
+fn ci_error_for_status(
+    status: reqwest::StatusCode,
+    rate_remaining: Option<&str>,
+    body_msg: Option<&str>,
+) -> Option<String> {
+    if status == reqwest::StatusCode::NOT_FOUND {
+        return None;
+    }
+    let rate_limited = status == reqwest::StatusCode::TOO_MANY_REQUESTS
+        || (status == reqwest::StatusCode::FORBIDDEN && rate_remaining == Some("0"));
+    if rate_limited {
+        return Some("GitHub CI rate limited — try again later".into());
+    }
+    if status == reqwest::StatusCode::UNAUTHORIZED {
+        return Some("GitHub CI 401 — reconnect GitHub in Settings".into());
+    }
+    if status == reqwest::StatusCode::FORBIDDEN {
+        // Linked ≠ authorized for Actions: org SSO, blocked OAuth app, stale
+        // token without `repo`, or a fine-grained PAT missing Actions:read.
+        // Hint text depends on whether the token is RepoHarbor OAuth vs gh/PAT.
+        return Some(oauth::ci_forbidden_hint());
+    }
+    if let Some(msg) = body_msg.filter(|m| !m.is_empty()) {
+        return Some(format!("GitHub CI {status}: {msg}"));
+    }
+    Some(format!("GitHub CI {status}"))
+}
+
+/// Map a workflow run's REST (status, conclusion) to our four-state vocabulary.
+fn workflow_run_state(status: &str, conclusion: Option<&str>) -> &'static str {
+    if status != "completed" {
+        return "pending";
+    }
+    match conclusion {
+        Some("success") => "success",
+        Some("failure") | Some("timed_out") | Some("startup_failure") => "failure",
+        _ => "none",
+    }
+}

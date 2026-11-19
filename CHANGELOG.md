@@ -1,0 +1,395 @@
+# Changelog
+
+All notable changes to [RepoHarbor](https://github.com/azmykn/RepoHarbor) by DigitsCode are documented here.
+
+The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
+and this project (upstream) uses calendar versioning (`YYYY.M.P`).
+
+## [2026.10.14] - 2026-11-18
+
+### Added
+
+- **Embedded Interactive PTY Terminal Dock**:
+  - Built a native GPUI terminal dock (`portable-pty` + `vt100`) rendered with single-line `StyledText` runs and exact `TextSystem` cursor measurement (eliminating horizontal cursor drift across colored/bold prompts), full ANSI 16/256/truecolor/italic/underline styling, 2,000-line scrollback history, multi-tab repository sessions, ``Ctrl+` `` toggle (``Cmd+` `` on macOS), drag-to-resize splitter persisted in `terminal_height`, quick-command `$` bar (`Run` / `Paste`), `Ctrl+Shift+C/V` copy/paste (bracketed paste for multi-line text), `Ctrl+Shift+T/W` tab controls, and full keyboard/mouse forwarding.
+- **Live Terminal Action Log (`Action Log` Tab)**:
+  - Clicking toolbar, fleet, or repository action buttons (**Refresh**, **Pull behind**, **Fetch**, **Pull**, **Push**, **Submodules**, **Enrich hosts**, **Summarize**, **Commit**, **Gen & push**, **Prune**, **Reset**, **Discard**, Drawer push/reset, etc.) streams color-coded CLI headers (`[HH:MM:SS] $ git ...`) and live per-repo outcomes (`✓` / `↷` / `✗`) directly into a dedicated read-only **Action Log** tab inside the terminal dock, with an inline **Auto-log: On/Off** pill and Settings toggle (`terminal_auto_show_log`).
+- **One-Click Execution for Commands Surfaced Across the UI**:
+  - Added markdown & log command extraction (`extract_commands_from_markdown`, `extract_commands_from_text`) with `Run` and `Paste` chips in the **Repo Drawer About → README**, **Notice detail modal**, and **Activity Log** rows.
+  - Added destructive-command classification (`is_potentially_destructive`) that stages risky commands (`rm -rf`, `sudo`, `--force`, `reset --hard`, `clean -fd`, piped `curl|sh`, `git branch -D`) unexecuted on the PTY prompt behind an inline confirmation strip (`Press Enter` / `Dismiss`) when enabled.
+  - Wired repo card buttons, right-click context menus (*Open built-in terminal* / *Open external terminal*), Drawer footer, Command Palette (*Toggle built-in terminal*), header **Terminal** button with live tab count badge, Agents view, and optional built-in agent dispatch (`terminal_dispatch_embedded`), plus configurable toggles and shell override in **Settings → Launchers**.
+
+## [2026.10.13] - 2026-11-18
+
+### Added
+
+- **Full Interactive Provider List View (`model_pool`)**:
+  - Added a 4-field **Add custom provider / model / key** form (provider/name, base URL with auto-defaults, model id, masked API key) in **Settings → AI & search**, shown across all backends including Ollama and llama.cpp.
+  - Added `↑` / `↓` priority reordering, `Edit`, per-row `Test` latency probing, `Enabled / Disabled` toggles, live key-source & cooldown pills, and quick-add presets for Groq, Mistral, OpenRouter, Cerebras, DeepSeek, Together, and Local Ollama.
+- **Secure Per-Row Key Store (`pool_keys.toml`)**:
+  - Dedicated per-deployment API keys are stored owner-only (`0600`) under `~/.local/share/repoharbor/pool_keys.toml` and never serialized back into `config.toml`; legacy inline keys migrate automatically on save, and orphaned keys are pruned on removal.
+- **Router Hardening**:
+  - Added keyless loopback endpoint support (`localhost` / `127.0.0.1` / `[::1]`), `normalize_base` HTTPS egress validation on all pool URLs, key-isolated 60s cooldown buckets, broader failover on auth/404/transport errors, and pool-first execution on local backends.
+
+## [2026.10.9] - 2026-11-18
+
+DigitsCode RepoHarbor — multi-repo workspaces (hundreds of checkouts across
+versioned trees, including nested submodule parents).
+
+### Added
+
+- **First-Class OpenRouter AI Backend**:
+  - **Direct Backend Picker Option**: Added a dedicated `[OpenRouter]` option in Settings → AI & search alongside `Ollama`, `llama.cpp`, and `Cloud`.
+  - **Auto-Configured Base URL**: Automatically sets and defaults the base URL to `https://openrouter.ai/api/v1`.
+  - **1-Click Recommended Model Presets**: Added quick-select buttons for top-performing OpenRouter models (`DeepSeek V3`, `Llama 3.3 70B`, `GPT-4o Mini`, `Claude 3.5 Haiku`, `Gemini 2.0 Flash`).
+  - **Isolated API Key Storage**: Stores OpenRouter keys securely in `openrouter_api_key`, preserving both Cloud and OpenRouter credentials independently when switching back and forth. Supports `$OPENROUTER_API_KEY` and `$REPOHARBOR_OPENROUTER_API_KEY` environment variables.
+  - **OpenRouter Analytics & Rankings Headers**: Automatically attaches `HTTP-Referer` and `X-Title` headers for requests directed to OpenRouter endpoints.
+  - **Reasoning Tag Sanitization**: Automatically strips `<think>...</think>` tags from reasoning models (e.g. DeepSeek R1) so generated commit messages and summaries remain clean and concise.
+
+## [2026.10.8] - 2026-10-29
+
+DigitsCode RepoHarbor — multi-repo workspaces (hundreds of checkouts across
+versioned trees, including nested submodule parents).
+
+### Added
+
+- **File Path Copy & Launch Actions in Drawer**:
+  - **Full Absolute Path by Default**: The inline copy button on modified file rows and the diff pane header now copies the full absolute path of the file on disk, rather than just the relative file name.
+  - **Comprehensive Context Menu**: Right-clicking any change row or diff block now provides:
+    - `Open file`: Launches the file directly with the system default application (`xdg-open`).
+    - `Open in IDE`: Opens the specific file in the user-configured IDE (`ideCommand`, e.g. Cursor, VS Code, Zed).
+    - `Open location`: Opens the containing folder in the system file manager and reveals/selects the file via D-Bus (`org.freedesktop.FileManager1.ShowItems`), safely falling back to opening the parent folder.
+    - `Copy full path`: Puts the absolute file path on clipboard.
+    - `Copy relative path`: Puts the repository-relative path on clipboard.
+    - `Copy file name`: Puts the bare filename on clipboard.
+    - `Copy diff`: (In diff view) copies unified diff patch.
+  - **Inline Action Buttons**: Added quick-access inline buttons (`Open file`, `Open location`, `Copy path`) directly on the file change rows and in the Diff pane header.
+
+## [2026.10.7] - 2026-10-26
+
+DigitsCode RepoHarbor — multi-repo workspaces (hundreds of checkouts across
+versioned trees, including nested submodule parents).
+
+### Added
+
+- **Native Git Branch Merge** — added comprehensive branch merge capabilities:
+  - **Quick Merge in Branch Switcher & Drawer**: Added one-click `[merge]` action button beside `[checkout]` in the branch dropdown and Drawer branch list to merge any local or remote branch directly into HEAD.
+  - **Fleet Multi-Repo Merge**: Added `Merge branch into HEAD…` under `Actions ▾` with a dedicated prompt strip to batch-merge a specified branch across all selected repositories with real-time progress.
+  - **Conflict Resolution & Abort**: Directly surfaced an `[Abort merge]` action in the Work tab's conflict banner alongside diff tool and IDE launchers, safely restoring clean pre-merge working state.
+  - **Safety Pre-flight**: Added checks preventing dirty tree corruption or collisions with in-progress rebases.
+
+## [2026.10.6] - 2026-10-26
+
+DigitsCode RepoHarbor — multi-repo workspaces (hundreds of checkouts across
+versioned trees, including nested submodule parents).
+
+### Fixed
+
+- **Consolidated duplicate Fetch & Pull buttons** — removed the redundant Fetch and Pull buttons from the left toolbar, retaining the single, scope-aware action buttons at the end alongside the fleet actions. When no repositories are selected, they show `Fetch (N)` / `Pull (N)` and target all visible repositories; when repositories are selected, they show `Fetch (N)` / `Pull (N)` for the exact selection.
+
+## [2026.10.5] - 2026-10-26
+
+DigitsCode RepoHarbor — multi-repo workspaces (hundreds of checkouts across
+versioned trees, including nested submodule parents).
+
+### Added
+
+- **Scope-aware Fetch and Pull** — applied the Submodules empty→all pattern to git Fetch and Pull buttons: when no repos are selected, Fetch and Pull target all visible repositories (`Fetch (N)` / `Pull (N)`); when repos are selected, they target only the checked repositories (`Fetch (N)` / `Pull (N)`).
+- **In-app version pill in top TitleBar** — displayed the application version number (`vYYYY.M.P`) in the top window title bar right beside the RepoHarbor logo and name.
+- **Quick branch switcher & checkout on branch badges** — clicking the branch badge next to the repo name (in the drawer header or on cards in grid/list views) opens an instant branch switcher dropdown with explicit `checkout` buttons to switch branches seamlessly.
+- **Commit generation acceleration and Fast commit** — added smart diff compaction to strip noisy lockfiles/assets from AI context, lowered token generation budget to 160 tokens for 2x faster LLM responses, added automatic Conventional Commit scope extraction, and added a 0ms "Fast commit" button in the Changes drawer.
+- **Explicit checkout on branches** — added direct Checkout action to non-current branches in the drawer branch list.
+- **Commit activity sparkline** — added 14-day mini commit pulse in the drawer header.
+- **Smart search syntax** — added filter tokens (`is:dirty`, `is:behind`, `is:ahead`, `lang:`, `host:`, `root:`, etc.) and `/` quick shortcut.
+
+- **Stale settings are repaired on launch** — a missing IDE binary (for example `subl`) is rewritten to the first installed editor (`cursor`, `code`, `codium`, `zed`, `subl`, then `nvim` / `vim`, else `xdg-open`). A file-manager diff fallback is replaced when Cursor, VS Code, or Meld is installed. Scan roots whose directory no longer exists are dropped.
+- **Cleanup skips worktree checkouts** — a merged or gone branch that is checked out in a linked worktree is not offered for Prune (deleting it fails and the row used to stay with no error). A real delete failure now shows a toast.
+- **Repo workspace follow-ups** — History draws a vertical rail per lane. Work can stash the dirty tree. A conflict banner opens the IDE as well as the diff tool, and the card subtitle names the first conflicted path. Blame is one row per line (capped). The drawer opens on Work; About loads when that tab is selected.
+- **Repo workspace** — the drawer is three tabs. **Work** keeps stage, hunks, commit, and AI, and adds the stash list (apply / drop), a conflict-path banner that opens the external diff tool, and blame for the selected file. **History** draws a flat lane graph (first parent keeps the lane; merges open a side lane) and blames a file as of the selected commit. **About** stacks the old overview, pull requests, notes, and README on one scroll.
+- **Fleet job queue** — starting Fetch / Pull / Push / Submodules / … while a
+  fleet run is already active enqueues the next job (`Queued: Pull (3 repos)`)
+  instead of a silent no-op. One job still executes at a time (same-repo writes
+  stay sequential); the strip shows `· N queued`; **Cancel** clears the queue
+  with the active run.
+- **Changes drawer copy** — Unstaged/Staged rows expose a copy icon (and
+  right-click → **Copy path**) for the relative file path; the DIFF header
+  has **Copy diff** (plus right-click on the patch) for the full unified
+  patch, and a copy icon for the path. Commit subject/body inputs unchanged.
+- **Mute attention paths** — Settings → Workspace lists `muteAttentionPrefixes`
+  (absolute or `~`-expandable). Repos under those prefixes are excluded from
+  Needs me, attention chips, and tray actionable items without editing anything
+  inside the repo. Right-click / Actions → **Mute attention** appends the
+  selected path(s). Pull-only still only silences Ahead + upstream CI; dirty
+  vendor trees (e.g. `odooplm` under `custom/`) need an explicit mute.
+- **Gen & push confirm (multi-repo)** — fleet **Gen & push** on two or more
+  dirty repos opens a centered confirm modal (title, short explanation,
+  scrollable repo list, Confirm / Cancel; Esc / backdrop cancel) before AI
+  message → commit all → push. **Gen only** stays one-click; single-repo Gen &
+  push (drawer / one dirty target) stays one-click. Destructive fleet ops
+  (Discard / Prune / Reset) keep bottom confirm strips; Push / Pull / Fetch /
+  Submodules / Empty commit stay one-click.
+- **Submodules empty→all cue** — idle empty selection shows **Submodules (N)**
+  for visible parents with nested checkouts; starting Submodules toasts the
+  parent name list before the progress counter.
+
+### Fixed
+
+- **Armed fleet confirms block shortcuts / palette** — `Ctrl+Shift+F` /
+  `Ctrl+Shift+P` and palette Fetch/Pull no longer clear a pending prune /
+  reset / discard / commit strip or Gen & push modal by starting another job.
+  Same idle gate as the ops-row; blocked starts toast **Confirm pending**
+  (*Finish or cancel the pending fleet confirm first.*).
+- **Pull-only Settings removals survive restart** — removing an Odoo
+  `core`/`custom` (or other) pull-only prefix records `pullOnlyOptOut` so
+  cold-load heal/seed will not re-append it. New untouched `core`/`custom`
+  trees under added roots still auto-heal; re-adding a path in Settings
+  clears that opt-out.
+- **Gen & push respects pull-only** — same filter as Push / Empty commit:
+  pull-only targets are dropped with **Skipped pull-only**; all–pull-only →
+  **Gen & push blocked**. The multi-repo confirm modal lists only pushable
+  repos; the button dims when the selection has no dirty non–pull-only path.
+  **Gen only** still works on vendor trees.
+- **Gen & push commit+push-fail toast** — when AI commit succeeds but push
+  fails (e.g. DNS `Temporary failure in name resolution`), the resolution
+  toast is titled **Committed, push failed** (not “Generate, commit & push
+  failed”), with hash/subject + an actionable network/DNS hint; notice/Log
+  totals likewise say committed locally. Mixed fleets report
+  **Committed, some pushes failed**.
+- **Submodules progress names parents** — the `done/total` counter is parent
+  repos in the run (not nested children). Progress reads
+  `Updating submodules — name (2/3)…` / `… 0/3 parents…`; start toasts list
+  parent names; completion writes Log lines
+  `Submodules: parent — child: status; …`. Off-filter leftover selection ids
+  are pruned so Actions (N) matches visible checkboxes, and empty→all still
+  shows **Submodules (N)** when nothing visible is checked.
+- **Fleet ops ignore off-filter selections** — Fetch / Pull / Push / Gen /
+  Empty commit / Actions / context-menu selection scope only target repos that
+  are both selected and currently visible under Mission Control filters
+  (work mode, chips, root, language, workspace group, TREE, Needs me, search).
+  Search prunes the selection; chip / mode / group / TREE / saved-view changes
+  still clear it. The “N selected” badge matches the visible set.
+- **Odoo `core`/`custom` pull-only heals when a version root is added later**
+  — e.g. adding `odoo20` while 17–19 were already listed no longer leaves
+  OCA vendor trees (like `odoo20/custom/l10n-*`) as pushable Needs-me CI.
+  Missing `<root>/core` and `<root>/custom` prefixes are appended on load;
+  `digits/` stays writable. Upstream CI on those paths stays out of Needs me.
+- **Drawer Gen only** — Changes-tab **Gen only** again fills the commit
+  composer (was calling a removed helper); uses the real Window path.
+- **Needs me no longer lies about an empty list** — submodule children that
+  need you (e.g. unpushed `digits_hr` under TREE parents) stay visible on
+  **Needs me** even without a TREE focus, and the Mission Control badge /
+  work-mode chip / header count only listable work. Host-only review/CI
+  (no local checkout) still appears under Needs me instead of **All clear**
+  with a non-zero badge.
+- **Push respects pull-only** — like Empty commit: Push drops pull-only paths
+  with **Skipped pull-only**; all–pull-only → Error and no run. **can_push** /
+  the Push button enable only when a *non–pull-only* selected repo is ahead
+  (vendor Ahead alone no longer lights Push). Mixed selection runs only on
+  pushable repos.
+
+### Changed
+
+- **Changelog-prior commit prompts** — Gen only / Gen & push prefer **added
+  lines** from staged `CHANGELOG.md` (and similar log files) as the primary
+  WHAT/WHY prior. When those Unreleased notes are rich enough, the code diff
+  in the prompt is truncated tightly so local/hosted models draft Conventional
+  Commits faster and closer to the log the user already wrote; thin or missing
+  log edits still use the full clamped working diff plus nearest on-disk notes.
+- **Submodules without a selection** — ops-row **Submodules** stays visible
+  when nothing is checked and updates every *visible* parent with nested
+  checkouts (`child_count > 0`); with a selection it still runs only
+  selected ∩ visible. Progress toast names the current parent and says
+  **parents** so `N/…` is unambiguous.
+- **Gen commit without a popup** — Mission Control ops row and drawer Changes
+  show side-by-side **Gen only** (AI message) and **Gen & push** (message →
+  commit all → push); no choice modal (multi-repo Gen & push uses the confirm
+  modal).
+- **Actions ▾ no longer duplicates ops-row sync** — Fetch / Pull / Push /
+  Gen only / Gen & push / Empty commit stay on the selection primaries;
+  **Submodules** is always-on next to Pull behind / Fetch all; the gear keeps
+  Stage / Commit / Discard / Prune / Reset / Mute / IDE. Card / TREE
+  right-click still includes the full sync set.
+- **Summarize feedback** — ops-row **Summarize** toasts **Summarizing…** then
+  *N* new summaries / **Already up to date** / error (never silent). List rows
+  show the same truncated sparkles AI line as Grid cards; hover tooltip
+  explains one-line summaries cached by commit.
+- **Fleet Pull rebases diverged pushable repos** — a clean tree that is both
+  ahead and behind (e.g. one local empty commit + upstream commits) is
+  recovered with `git rebase --empty=keep` onto upstream instead of failing
+  `diverged`. Pull-only vendor trees (`core` / `custom`) stay fast-forward
+  only. Conflicts abort the rebase and fail with an open-in-IDE message;
+  never force-push.
+- **Mission Control chrome** — top row is filters only (search, work modes,
+  Public / Private / Starred / Stale, Working chips, Sort, Grid | List). The
+  bottom row is execute ops: always-on **Refresh**, **Pull behind**, **Fetch
+  all**, **Submodules**, and **Summarize** (when AI is ready); selection
+  Fetch / Pull / Push / Gen only / Gen & push / Empty commit / Actions when
+  something is checked.
+  **More ⋮** is gone from the filter row.
+- **Mission Control Refresh** — labeled icon+text **Refresh** on the ops row
+  (accent wash / `fg0`) and chrome bar; click re-scans roots and toasts when
+  the grid is updated.
+- **Toast dismiss** — right-click or middle-click closes an in-app toast; left-click still opens the notice and dismisses.
+- **Mission Control defaults to List** — compact rows (not card Grid) on first launch and whenever `config.toml` has no `layout` key. The Grid | List control still persists an explicit choice (`layout = "list"` / `"grid"`). TREE stays a sidebar.
+- **Needs me ignores live agents** — a running `cursor-agent` / `claude` /
+  … session no longer puts a repo on **Needs me** or replaces the card
+  subtitle with “Let it finish”. The terminal icon still marks the session;
+  dirty / ahead / commit status stay visible. **Agent finished** still needs
+  you.
+- **Needs me ignores pull-only Ahead** — vendor / `core` / `custom` checkouts
+  with local-only commits (e.g. `odoopim`) no longer raise **Not pushed** /
+  “Push when ready”. The git ↑ count stays on the card; Push stays hidden.
+- **Mission Control work modes** — toolbar segmented control **Needs me |
+  Behind | Working | All** replaces the dense chip strip. Needs me shows the
+  attention count; Working offers Dirty / Stageable / Pushable only; All offers
+  Public / Private / Starred / Stale. **Fetch all** / **Summarize** sit on the
+  ops row (not under **More**); **Actions** appears only with a selection; sort
+  labels are **Sort: recent** / **Sort: name** (heatmap stays hidden).
+- **Brand icon** — new harbor + repo-stack mark (SVG + packaging PNGs + tray
+  glyphs); default accent aligned to harbor teal `#1dd3c4`.
+- **Docs shots** — removed Orrery-branded screenshots from `docs/public/shots/`
+  and unlinked them from the guide (re-capture pending from the native app).
+- **Docs truth** — [Fleet](docs/guide/fleet.md), [Mission Control](docs/guide/mission-control.md),
+  and [Repo drawer](docs/guide/repo-drawer.md) match Gen only / Gen & push,
+  selection∩visible, Submodules empty→visible parents, slim Actions, and
+  pull-only Push (no stale Stash / Checkout default / Run command).
+
+### Added
+
+- **About & license** — Settings → About shows crate version `2026.8.1`, the
+  GitHub repository, email (`azmykn@gmail.com`), phone (`+966559622034`), MIT
+  public-use terms, and Orrery attribution. Same notice in [COPYRIGHT.md](COPYRIGHT.md)
+  and the docs [Copyright & contact](docs/guide/copyright.md) page (version is
+  read from `Cargo.toml`).
+- **Cloud AI backend (opt-in)** — a third choice in **Settings → AI & search**
+  next to Ollama and llama.cpp: any OpenAI-compatible endpoint (Ollama Cloud,
+  Groq, OpenAI, OpenRouter, Gemini, LM Studio, …) via `POST /chat/completions`.
+  Hosted models draft a full commit message in ~1.5 s where a tiny local model
+  needs tens of seconds. Reasoning models get `reasoning_effort: "low"` so
+  hidden thinking can't eat the whole token budget and return an empty answer,
+  with a retry for providers that reject the field.
+  Local stays the default; the panel warns that prompts leave
+  the machine on this backend. The API key lives owner-only in
+  `~/.local/share/repoharbor/openai_api_key` (or `$REPOHARBOR_OPENAI_API_KEY`),
+  never in `config.toml`, is only ever sent to the configured base URL, and that
+  URL must be `https` unless it's loopback. Embeddings — and therefore semantic
+  search — remain local on every backend.
+- **Changelog-aware commit messages** — **Generate commit** now walks up from
+  each changed file to the repo root, takes the nearest `CHANGELOG.md` (also
+  `.rst`/`.txt`, `CHANGES.md`, `HISTORY.md`, `NEWS.md`) up to three across a
+  multi-module commit, prefers its `## [Unreleased]` section, and feeds that
+  plus the last five commit subjects into the prompt. In a monorepo this picks
+  the touched module's changelog rather than every changelog in the tree.
+
+- **Empty commit** — Mission Control selection primary + Actions menu item
+  creates `git commit --allow-empty` with message `Empty commit` on pushable
+  paths (hidden/blocked for pull-only selections, same gating as Push).
+
+- **Submodule discovery** — after scanning top-level checkouts, parse each
+  parent’s `.gitmodules` and register checked-out submodules with `parent_id` /
+  `submodule_path` (no deep WalkDir into every repo).
+- **TREE sidebar** — expandable parent → submodule children under GROUPS;
+  click parent to focus Mission Control on parent + children; children hidden
+  from the flat grid by default (avoids duplicating shared modules × N).
+- **Submodule Update** — Actions / context menu discovers children and
+  fast-forward-pulls each on its configured (or current) branch; the fleet toast
+  detail lists per-path outcomes (`path: pulled` / `skipped` / error).
+- **Action filters** — Mission Control chips **Stageable** (`unstaged > 0`),
+  **Commitable** (`dirty > 0`), **Pushable** (`ahead > 0`), with counts; TREE
+  keeps a parent visible when a child matches the active filter.
+- **Context menus** — right-click on repo cards, Mission Control **list** rows,
+  and TREE rows: Open drawer, Stage all, Commit All…, Generate & commit
+  (shown only when `aiReady`), Push, Fetch, Pull, Update submodules.
+- **Actions ⚙** — toolbar gear dropdown for fleet Stage / Commit / Push /
+  Fetch / Pull / Discard / Reset / Submodule Update / Prune on the selection.
+- **Fleet Discard** — discard working-tree changes (with confirm) across the
+  selection; keeps commits.
+- **Pull behind** — toolbar / palette action fleet-pulls every repo with
+  `behind > 0` (upstream checkouts stay current without hunting chips).
+- **Pull-only prefixes** — Settings editor for upstream path prefixes: Pull to
+  update, hide Push, and **silence** upstream CI on Attention chips (no demoted
+  UpstreamCi noise); digits modules outside the list stay Pushable. Push
+  attempts on pull-only trees toast an error instead.
+- **Activity Log** — top-nav **Log** view: in-memory ring of recent scans,
+  toasts, fleet push/pull/fetch outcomes, and soft CI refresh notices (home
+  directory redacted to `~` in Log lines).
+- **Docs privacy** — publish notes for keeping local config/cache out of git and
+  avoiding client paths in screenshots ([Privacy](docs/guide/privacy.md)).
+- **Attention chips** — Mission Control cards/list show top reason badges plus a
+  suggested-action subtitle; **Merge conflict** is Urgent; empty Attention filter
+  shows **All clear**.
+- **External diff** — Changes drawer **Open external diff** runs
+  `diff_command` (`{path}` / `{file}`; default detects `meld` / `code` /
+  `xdg-open`).
+- **Terminal launcher** — open a configured terminal / agent command at the repo.
+- **AI commit** — Generate & commit (fleet + drawer) when `aiReady`; Settings
+  notes restarting Ollama and preferring `qwen2.5:3b`+.
+- **Fleet shortcuts** — <kbd>Ctrl/Cmd+Shift+F</kbd> Fetch selected,
+  <kbd>Ctrl/Cmd+Shift+P</kbd> Pull selected.
+- **Fleet ops** — `FleetOp::StageAll`, `Push`, `Fetch`, `Pull`, `Discard`,
+  `SubmoduleUpdate`, and related multi-select bar actions.
+- **Smart “+” add flow** — header **+** opens one modal with tabs: Add local
+  path (single repo **or** scan folder), Clone from GitHub, New repository
+  (shared `prepare_workspace_root` with Settings).
+- **Commit All / Generate** in the Changes drawer from the full working tree
+  (not staged-only), with clearer AI error toasts.
+- **Top navigation tabs** — primary views (Mission Control, Inbox, Feed, …)
+  moved to a horizontal tab bar under the header; left rail is context-only
+  (GROUPS / TREE / ROOTS / LANGUAGES).
+- **gpui-component icon assets** — register `gpui-component-assets` alongside
+  RepoHarbor’s lucide pack so TitleBar window controls and Button icons render.
+
+### Changed
+
+- **Header chrome contrast** — `+` is a single secondary (solid) chip (no
+  dropdown; tabs live in the add modal); sidebar toggle and rescan sit on
+  visible button backgrounds; TitleBar uses a lifted surface and bright
+  foreground so minimize / maximize / close stay readable.
+- **Deleted-file detection** — deeper watcher + status refresh so removals show
+  reliably in Changes.
+- **Repo name filter** — Mission Control toolbar query (`grid.query`) filters by
+  name / slug / path.
+- **Workspace groups** — GROUPS section with Fetch / Pull on the active group.
+- **CI 403** — soft Info toast (not sticky Error); when the hint mentions org
+  SSO, the toast links to Authorize SSO / the OAuth app settings page.
+
+### Fixed
+
+- **Log timestamps** — the Log view shows the laptop's local clock (`HH:MM:SS`),
+  not UTC. A UTC+3 machine was painting `07:59` for a `10:59` event.
+- **Generate, commit & push** — if the AI backend is unreachable (network blip,
+  Ollama Cloud down), one retry runs first; on a second failure the op still
+  commits and pushes with a local fallback message from the nearest changelog /
+  changed files instead of aborting with no git write.
+- **Activity Log completeness** — every in-app toast is mirrored (including
+  the first Progress line of a fleet/clone/push op; in-flight ticks stay out
+  of the ring), plus desktop notifications (new PRs, urgent attention) and
+  watcher/tray-driven scans that previously never appeared.
+- **Notice detail** — clicking a toast or a Log row opens a panel with the
+  full message plus repository, path, branch, HEAD commit, git ahead/behind/
+  dirty, and per-repo fleet outcomes, with Open drawer / IDE / link actions.
+
+- Invisible **minimize / maximize / close** and header **+** when only RepoHarbor
+  lucide assets were registered (gpui-component `IconName` paths never loaded).
+- Single-repo add path (e.g. `/home/user/Projects/RepoHarbor`) without requiring a parent of
+  many repos.
+
+### Screenshots
+
+Pre-rebrand UI shots that showed the old product name in chrome were removed.
+Re-capture from the native RepoHarbor app before linking images here again.
+
+| Surface | Shot |
+|---------|------|
+| Header: **+** chip + window controls | ![Header add](docs/public/shots/header-add-and-window-controls.png) |
+| Header before contrast fix (reference) | ![Header before](docs/public/shots/header-before-contrast-fix.png) |
+
+> When re-capturing shots, keep private repos and machine-specific home paths out
+> of published images (use generic `~/dev/…` layouts).
+
+---
+
+## Attribution
+
+Includes software originally published as Orrery by Seb Burrell (MIT).
+This is an independent DigitsCode product, not an official fork continuation.
+See [NOTICE](NOTICE) and [COPYRIGHT.md](COPYRIGHT.md).
