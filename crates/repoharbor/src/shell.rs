@@ -7916,6 +7916,15 @@ impl Render for RepoHarborApp {
                         let _ = repoharbor_core::config::save(&this.config);
                         cx.notify();
                     }
+                    if let Some(sel) = &mut this.terminal.selection
+                        && sel.dragging
+                    {
+                        sel.dragging = false;
+                        if !sel.has_range() {
+                            this.terminal.selection = None;
+                        }
+                        cx.notify();
+                    }
                     if this.sidebar_dragging {
                         this.sidebar_dragging = false;
                         this.persist_sidebar_chrome();
@@ -8585,6 +8594,7 @@ impl RepoHarborApp {
     pub fn select_terminal_tab(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
         if self.terminal.active_tab.as_deref() != Some(id) {
             self.terminal.pending_confirm = None;
+            self.terminal.selection = None;
         }
         self.terminal.active_tab = Some(id.to_string());
         if let Some(tab) = self.terminal.active() {
@@ -8618,6 +8628,7 @@ impl RepoHarborApp {
     }
 
     pub fn terminal_clear(&mut self, cx: &mut Context<Self>) {
+        self.terminal.selection = None;
         if let Some(tab) = self.terminal.active_mut() {
             match &tab.backend {
                 crate::terminal_view::TerminalBackend::Pty(pty) => {
@@ -8636,6 +8647,14 @@ impl RepoHarborApp {
         let Some(tab) = self.terminal.active() else {
             return;
         };
+        if let Some(sel) = self.terminal.selection.filter(|s| s.has_range()) {
+            let selected = crate::terminal_view::extract_selected_text(&tab.snapshot, sel);
+            if !selected.is_empty() {
+                cx.write_to_clipboard(gpui::ClipboardItem::new_string(selected));
+                self.push_toast(ToastKind::Info, "Copied terminal selection", None, cx);
+                return;
+            }
+        }
         let text = tab.backend.plain_text();
         if text.is_empty() {
             self.push_toast(

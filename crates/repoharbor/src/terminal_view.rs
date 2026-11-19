@@ -5,13 +5,15 @@
 //! truecolor spans, interactive key forwarding, quick-command execution, and
 //! safety confirmation for destructive commands.
 
+use std::cell::Cell;
+use std::rc::Rc;
 use std::sync::Arc;
 
 use gpui::{
-    Context, Entity, FocusHandle, FontStyle, FontWeight, Hsla, InteractiveElement, IntoElement,
-    KeyDownEvent, MouseButton, ParentElement, Pixels, ScrollDelta, SharedString,
-    StatefulInteractiveElement, Styled, StyledText, Subscription, TextRun, UnderlineStyle, Window,
-    div, px, rgb,
+    Bounds, Context, Entity, FocusHandle, FontStyle, FontWeight, Hsla, InteractiveElement,
+    IntoElement, KeyDownEvent, MouseButton, ParentElement, Pixels, Point, ScrollDelta,
+    SharedString, StatefulInteractiveElement, Styled, StyledText, Subscription, TextRun,
+    UnderlineStyle, Window, canvas, div, px, rgb, rgba,
 };
 use gpui_component::input::{Input, InputState};
 use repoharbor_core::terminal::{
@@ -110,6 +112,53 @@ pub struct PendingCommand {
     pub command: SharedString,
 }
 
+/// Zero-based `(row, col)` cell coordinate in the visible terminal viewport.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct TermCellPos {
+    pub row: usize,
+    pub col: usize,
+}
+
+/// Active mouse drag / word / line selection inside the terminal viewport.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TermSelection {
+    pub anchor: TermCellPos,
+    pub head: TermCellPos,
+    pub dragging: bool,
+}
+
+impl TermSelection {
+    pub fn ordered(&self) -> (TermCellPos, TermCellPos) {
+        if self.anchor <= self.head {
+            (self.anchor, self.head)
+        } else {
+            (self.head, self.anchor)
+        }
+    }
+
+    pub fn has_range(&self) -> bool {
+        self.anchor != self.head
+    }
+
+    /// Inclusive `(start_col, end_col)` range on `row`, or `None` if `row` is unselected.
+    pub fn row_range(&self, row: usize, max_cols: usize) -> Option<(usize, usize)> {
+        if !self.has_range() || max_cols == 0 {
+            return None;
+        }
+        let (start, end) = self.ordered();
+        if row < start.row || row > end.row {
+            return None;
+        }
+        let c0 = if row == start.row { start.col } else { 0 };
+        let c1 = if row == end.row {
+            end.col.min(max_cols.saturating_sub(1))
+        } else {
+            max_cols.saturating_sub(1)
+        };
+        if c0 <= c1 { Some((c0, c1)) } else { None }
+    }
+}
+
 /// Dock-wide UI + session state stored directly inside [`RepoHarborApp`].
 pub struct TerminalDockState {
     pub open: bool,
@@ -127,6 +176,8 @@ pub struct TerminalDockState {
     pub pending_focus: bool,
     pub next_seq: u64,
     pub last_dims: (u16, u16),
+    pub selection: Option<TermSelection>,
+    pub viewport_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
 }
 
 impl TerminalDockState {
@@ -148,6 +199,8 @@ impl TerminalDockState {
             pending_focus: false,
             next_seq: 1,
             last_dims: (16, 180),
+            selection: None,
+            viewport_bounds: Rc::new(Cell::new(None)),
         }
     }
 
@@ -533,11 +586,16 @@ pub fn render_dock(
                 app_sig.update(cx, |this, cx| this.terminal_send_interrupt(cx));
             }));
         }
+        let copy_label = if dock.selection.is_some_and(|s| s.has_range()) {
+            "Copy sel"
+        } else {
+            "Copy"
+        };
         bar = bar
             .child(term_btn("term-clear", "Clear", t, move |_, cx| {
                 app_clr.update(cx, |this, cx| this.terminal_clear(cx));
             }))
-            .child(term_btn("term-copy", "Copy", t, move |_, cx| {
+            .child(term_btn("term-copy", copy_label, t, move |_, cx| {
                 app_cp.update(cx, |this, cx| this.terminal_copy_visible(cx));
             }));
         if !active_is_log {
@@ -707,7 +765,17 @@ pub fn render_dock(
 
     // 5. Interactive VT100 terminal screen viewport.
     let viewport = match dock.active() {
-        Some(tab) => render_viewport(tab, cell_w, t, app, window, cx).into_any_element(),
+        Some(tab) => render_viewport(
+            tab,
+            dock.selection,
+            &dock.viewport_bounds,
+            cell_w,
+            t,
+            app,
+            window,
+            cx,
+        )
+        .into_any_element(),
         None => div()
             .flex()
             .flex_1()
@@ -882,8 +950,101 @@ fn build_line_runs(spans: &[TermSpan], cursor_col: Option<u16>, t: &Theme) -> Bu
     }
 }
 
+/// Expand a row's spans into an indexed character vector (gap spaces preserved).
+fn row_chars(spans: &[TermSpan]) -> Vec<char> {
+    let mut out = Vec::new();
+    let mut cur_col = 0usize;
+    for span in spans {
+        let start = span.start_col as usize;
+        while cur_col < start {
+            out.push(' ');
+            cur_col += 1;
+        }
+        for ch in span.text.chars() {
+            out.push(ch);
+            cur_col += 1;
+        }
+    }
+    out
+}
+
+/// Extract text covered by `sel` from `snap`, trimming trailing spaces per line.
+pub fn extract_selected_text(snap: &TerminalSnapshot, sel: TermSelection) -> String {
+    if !sel.has_range() || snap.lines.is_empty() {
+        return String::new();
+    }
+    let (start, end) = sel.ordered();
+    let max_row = snap.lines.len().saturating_sub(1);
+    let r0 = start.row.min(max_row);
+    let r1 = end.row.min(max_row);
+    let mut lines_out = Vec::with_capacity(r1 - r0 + 1);
+    for r_idx in r0..=r1 {
+        let chars = row_chars(&snap.lines[r_idx]);
+        if chars.is_empty() {
+            lines_out.push(String::new());
+            continue;
+        }
+        let c0 = if r_idx == r0 { start.col } else { 0 };
+        let c1 = if r_idx == r1 {
+            end.col.min(chars.len().saturating_sub(1))
+        } else {
+            chars.len().saturating_sub(1)
+        };
+        if c0 <= c1 && c0 < chars.len() {
+            let slice: String = chars[c0..=c1].iter().collect();
+            lines_out.push(slice.trim_end().to_string());
+        } else {
+            lines_out.push(String::new());
+        }
+    }
+    lines_out.join("\n")
+}
+
+/// Find `(start_col, end_col)` of the word/token around `col` on `spans` for double-click.
+fn word_range_at(spans: &[TermSpan], col: usize) -> (usize, usize) {
+    let chars = row_chars(spans);
+    if chars.is_empty() {
+        return (col, col);
+    }
+    let idx = col.min(chars.len() - 1);
+    let is_word = |c: char| !c.is_whitespace();
+    if !is_word(chars[idx]) {
+        return (idx, idx);
+    }
+    let mut start = idx;
+    while start > 0 && is_word(chars[start - 1]) {
+        start -= 1;
+    }
+    let mut end = idx;
+    while end + 1 < chars.len() && is_word(chars[end + 1]) {
+        end += 1;
+    }
+    (start, end)
+}
+
+fn point_to_cell(
+    pos: Point<Pixels>,
+    bounds: Option<Bounds<Pixels>>,
+    cell_w: f32,
+    row_count: usize,
+    max_cols: usize,
+) -> TermCellPos {
+    let (ox, oy) = match bounds {
+        Some(b) => (f32::from(b.origin.x), f32::from(b.origin.y)),
+        None => (0.0, 0.0),
+    };
+    let rx = (f32::from(pos.x) - ox).max(0.0);
+    let ry = (f32::from(pos.y) - oy).max(0.0);
+    let col = ((rx / cell_w.max(3.0)).floor() as usize).min(max_cols.saturating_sub(1));
+    let row = ((ry / LINE_H).floor() as usize).min(row_count.saturating_sub(1));
+    TermCellPos { row, col }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn render_viewport(
     tab: &TerminalTab,
+    selection: Option<TermSelection>,
+    viewport_bounds: &Rc<Cell<Option<Bounds<Pixels>>>>,
     cell_w: f32,
     t: &Theme,
     app: &Entity<RepoHarborApp>,
@@ -892,6 +1053,8 @@ fn render_viewport(
 ) -> impl IntoElement {
     let snap = &tab.snapshot;
     let show_cursor = snap.cursor_visible && snap.scrollback_offset == 0 && snap.exited.is_none();
+    let max_cols = snap.cols as usize;
+    let row_count = snap.lines.len().max(1);
     let mut rows_col = div()
         .relative()
         .flex()
@@ -904,6 +1067,7 @@ fn render_viewport(
     for (r_idx, spans) in snap.lines.iter().enumerate() {
         let active_cursor_col =
             (show_cursor && r_idx == snap.cursor_row as usize).then_some(snap.cursor_col);
+        let sel_range = selection.and_then(|s| s.row_range(r_idx, max_cols));
         let mut line_box = div()
             .relative()
             .h(px(LINE_H))
@@ -913,6 +1077,18 @@ fn render_viewport(
             .font_family("monospace")
             .text_size(px(13.))
             .line_height(px(LINE_H));
+
+        if let Some((c0, c1)) = sel_range {
+            line_box = line_box.child(
+                div()
+                    .absolute()
+                    .left(px(c0 as f32 * cell_w))
+                    .top(px(0.))
+                    .w(px(((c1 - c0 + 1) as f32) * cell_w))
+                    .h(px(LINE_H))
+                    .bg(rgba((t.primary << 8) | 0x48)),
+            );
+        }
 
         if spans.is_empty() && active_cursor_col.is_none() {
             rows_col = rows_col.child(line_box);
@@ -949,7 +1125,33 @@ fn render_viewport(
         rows_col = rows_col.child(line_box);
     }
 
-    let (app_focus, app_key, app_wheel, app_esc, app_slash, app_cp, app_ps) = (
+    let bounds_record = Rc::clone(viewport_bounds);
+    rows_col = rows_col.child(
+        canvas(
+            move |bounds, _win, _cx| {
+                bounds_record.set(Some(bounds));
+            },
+            |_, _, _, _| {},
+        )
+        .absolute()
+        .inset_0(),
+    );
+
+    let (
+        app_down,
+        app_move,
+        app_up,
+        app_rclick,
+        app_key,
+        app_wheel,
+        app_esc,
+        app_slash,
+        app_cp,
+        app_ps,
+    ) = (
+        app.clone(),
+        app.clone(),
+        app.clone(),
         app.clone(),
         app.clone(),
         app.clone(),
@@ -958,12 +1160,15 @@ fn render_viewport(
         app.clone(),
         app.clone(),
     );
+    let bounds_down = Rc::clone(viewport_bounds);
+    let bounds_move = Rc::clone(viewport_bounds);
     let focus_handle = tab.focus.clone();
 
     let mut vp = div()
         .id("terminal-viewport")
         .key_context("Terminal")
         .track_focus(&tab.focus)
+        .cursor_text()
         .flex_1()
         .min_w(px(0.))
         .min_h(px(0.))
@@ -971,14 +1176,106 @@ fn render_viewport(
         .px(px(12.))
         .py(px(6.))
         .bg(rgb(t.page))
-        .on_mouse_down(MouseButton::Left, move |_ev, window, cx| {
+        .on_mouse_down(MouseButton::Left, move |ev, window, cx| {
             window.focus(&focus_handle, cx);
-            app_focus.update(cx, |_, cx| cx.notify());
+            let cell = point_to_cell(ev.position, bounds_down.get(), cell_w, row_count, max_cols);
+            app_down.update(cx, |this, cx| {
+                if ev.click_count >= 3 {
+                    this.terminal.selection = Some(TermSelection {
+                        anchor: TermCellPos {
+                            row: cell.row,
+                            col: 0,
+                        },
+                        head: TermCellPos {
+                            row: cell.row,
+                            col: max_cols.saturating_sub(1),
+                        },
+                        dragging: false,
+                    });
+                } else if ev.click_count == 2 {
+                    let (c0, c1) = this
+                        .terminal
+                        .active()
+                        .and_then(|t| t.snapshot.lines.get(cell.row))
+                        .map(|spans| word_range_at(spans, cell.col))
+                        .unwrap_or((cell.col, cell.col));
+                    this.terminal.selection = Some(TermSelection {
+                        anchor: TermCellPos {
+                            row: cell.row,
+                            col: c0,
+                        },
+                        head: TermCellPos {
+                            row: cell.row,
+                            col: c1,
+                        },
+                        dragging: false,
+                    });
+                } else {
+                    this.terminal.selection = Some(TermSelection {
+                        anchor: cell,
+                        head: cell,
+                        dragging: true,
+                    });
+                }
+                cx.notify();
+            });
+        })
+        .on_mouse_move(move |ev, _window, cx| {
+            let bounds = bounds_move.get();
+            app_move.update(cx, |this, cx| {
+                if let Some(sel) = &mut this.terminal.selection
+                    && sel.dragging
+                {
+                    let cell = point_to_cell(ev.position, bounds, cell_w, row_count, max_cols);
+                    if sel.head != cell {
+                        sel.head = cell;
+                        cx.notify();
+                    }
+                }
+            });
+        })
+        .on_mouse_up(MouseButton::Left, move |_ev, _window, cx| {
+            app_up.update(cx, |this, cx| {
+                if let Some(sel) = &mut this.terminal.selection {
+                    sel.dragging = false;
+                    if !sel.has_range() {
+                        this.terminal.selection = None;
+                    }
+                    cx.notify();
+                }
+            });
+        })
+        .on_mouse_down(MouseButton::Right, move |_ev, _window, cx| {
+            app_rclick.update(cx, |this, cx| {
+                if this.terminal.selection.is_some_and(|s| s.has_range()) {
+                    this.terminal_copy_visible(cx);
+                    this.terminal.selection = None;
+                    cx.notify();
+                }
+            });
         })
         .on_key_down(move |ev, _window, cx| {
+            let m = ev.keystroke.modifiers;
+            let key = ev.keystroke.key.as_str();
+            if m.control && !m.shift && key == "c" {
+                let mut copied = false;
+                app_key.update(cx, |this, cx| {
+                    if this.terminal.selection.is_some_and(|s| s.has_range()) {
+                        this.terminal_copy_visible(cx);
+                        this.terminal.selection = None;
+                        copied = true;
+                        cx.notify();
+                    }
+                });
+                if copied {
+                    cx.stop_propagation();
+                    return;
+                }
+            }
             if let Some(bytes) = encode_keystroke(ev) {
                 cx.stop_propagation();
                 app_key.update(cx, |this, cx| {
+                    this.terminal.selection = None;
                     if let Some(tab) = this.terminal.active()
                         && let Some(pty) = tab.backend.as_pty()
                     {
@@ -1239,5 +1536,52 @@ mod tests {
         assert_eq!(built.text, "git status");
         assert_eq!(built.cursor_bytes, Some((4, 5)));
         assert_eq!(built.runs[1].color, Hsla::from(rgb(t.page)));
+    }
+
+    #[test]
+    fn extract_selected_text_and_word_range_handle_multiline() {
+        let span = |text: &str, start_col: u16| TermSpan {
+            text: text.into(),
+            fg: TermColor::Default,
+            bg: TermColor::Default,
+            bold: false,
+            italic: false,
+            underline: false,
+            inverse: false,
+            start_col,
+            cols: text.len() as u16,
+        };
+        let snap = TerminalSnapshot {
+            rows: 3,
+            cols: 40,
+            lines: vec![
+                vec![span("git push -u origin main", 0)],
+                vec![span("To github.com:user/repo.git", 0)],
+                vec![span("Everything up-to-date", 0)],
+            ],
+            cursor_row: 2,
+            cursor_col: 0,
+            cursor_visible: true,
+            scrollback_offset: 0,
+            max_scrollback: 0,
+            exited: None,
+            alternate_screen: false,
+        };
+
+        assert_eq!(word_range_at(&snap.lines[0], 13), (12, 17));
+        let sel = TermSelection {
+            anchor: TermCellPos { row: 0, col: 12 },
+            head: TermCellPos { row: 1, col: 2 },
+            dragging: false,
+        };
+        assert_eq!(extract_selected_text(&snap, sel), "origin main\nTo");
+
+        // Backward drag (head < anchor) must extract the exact same range.
+        let rev = TermSelection {
+            anchor: TermCellPos { row: 1, col: 2 },
+            head: TermCellPos { row: 0, col: 12 },
+            dragging: false,
+        };
+        assert_eq!(extract_selected_text(&snap, rev), "origin main\nTo");
     }
 }
