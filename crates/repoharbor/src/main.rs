@@ -222,11 +222,20 @@ fn cli_update(args: &[String]) -> i32 {
             match rt.block_on(download_and_apply_release_update(&release, &kind)) {
                 Ok(dest) => {
                     println!("Updated {} to {}.", dest.display(), release.tag_name);
+                    let restarted = repoharbor_core::updater::restart_running_gui_instances(&dest);
+                    if restarted && !quiet {
+                        println!("Restarting running RepoHarbor application…");
+                    }
                     let _ = rt.block_on(repoharbor_platform::notify::send(
                         "RepoHarbor Updated",
                         &format!(
-                            "Updated to {} — relaunch to use the new build.",
-                            release.tag_name
+                            "Updated to {} — {}",
+                            release.tag_name,
+                            if restarted {
+                                "restarting automatically."
+                            } else {
+                                "launch RepoHarbor to use the new build."
+                            }
                         ),
                     ));
                     0

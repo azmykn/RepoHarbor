@@ -8822,20 +8822,12 @@ impl RepoHarborApp {
         .detach();
     }
 
-    /// Download, verify SHA-256, atomically replace binary, and restart RepoHarbor.
+    /// Download, verify SHA-256, atomically replace binary, and automatically restart RepoHarbor.
     pub fn apply_app_update(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let release = match &self.update_state {
             AppUpdateState::Available(r) => r.clone(),
             _ => return,
         };
-        if let repoharbor_core::updater::InstallKind::SourceCheckout { repo_dir, .. } =
-            &self.install_kind
-        {
-            let cmd = self.install_kind.external_update_command();
-            let dir = repo_dir.to_string_lossy().into_owned();
-            self.open_terminal_in(&dir, "RepoHarbor", Some(&cmd), true, Some(window), cx);
-            return;
-        }
         if !self.install_kind.can_self_update_in_place() {
             let cmd = self.install_kind.external_update_command();
             let dir = std::env::var("HOME").unwrap_or_else(|_| "/".to_string());
@@ -8853,8 +8845,14 @@ impl RepoHarborApp {
             .await;
             let _ = this.update(cx, |this, cx| match res {
                 Ok(new_exe) => {
-                    match std::process::Command::new(&new_exe).spawn() {
-                        Ok(_) => cx.quit(),
+                    match repoharbor_core::updater::spawn_detached_relaunch(&new_exe) {
+                        Ok(()) => {
+                            std::thread::spawn(|| {
+                                std::thread::sleep(std::time::Duration::from_millis(200));
+                                std::process::exit(0);
+                            });
+                            cx.quit();
+                        }
                         Err(e) => {
                             this.update_state = AppUpdateState::Error(format!(
                                 "Updated on disk, but relaunch failed: {e}"

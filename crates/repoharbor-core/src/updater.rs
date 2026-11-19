@@ -494,6 +494,126 @@ pub fn extract_binary_from_tar_gz(archive_bytes: &[u8]) -> Result<Vec<u8>, Strin
     Err("release archive did not contain a `repoharbor` binary".to_string())
 }
 
+/// Spawn a detached background helper that waits ~350ms for the current process
+/// to exit (releasing D-Bus, tray, and file locks) and then launches `exe`.
+pub fn spawn_detached_relaunch(exe: &Path) -> Result<(), String> {
+    use std::process::{Command, Stdio};
+    let exe_str = exe.to_string_lossy().into_owned();
+    #[cfg(windows)]
+    {
+        Command::new("cmd")
+            .args([
+                "/C",
+                &format!("ping -n 2 127.0.0.1 >nul & start \"\" \"{exe_str}\""),
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .map(|_| ())
+            .map_err(|e| format!("failed to schedule Windows relaunch: {e}"))
+    }
+    #[cfg(not(windows))]
+    {
+        Command::new("sh")
+            .args([
+                "-c",
+                "trap '' HUP; sleep 0.35; if command -v setsid >/dev/null 2>&1; then setsid \"$1\" </dev/null >/dev/null 2>&1 & else nohup \"$1\" </dev/null >/dev/null 2>&1 & fi",
+                "repoharbor-relaunch",
+                &exe_str,
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .map(|_| ())
+            .map_err(|e| format!("failed to schedule relaunch: {e}"))
+    }
+}
+
+/// If any other `repoharbor` GUI processes are currently running, schedule a
+/// detached restart that terminates the old process(es) and launches `new_exe`.
+/// Returns `true` when at least one running GUI instance was detected and restarted.
+pub fn restart_running_gui_instances(new_exe: &Path) -> bool {
+    use std::process::{Command, Stdio};
+    let self_pid = std::process::id();
+    let exe_str = new_exe.to_string_lossy().into_owned();
+
+    #[cfg(windows)]
+    {
+        let out = Command::new("powershell")
+            .args([
+                "-NoProfile",
+                "-Command",
+                &format!(
+                    "Get-Process repoharbor -ErrorAction SilentlyContinue | Where-Object {{ $_.Id -ne {self_pid} }} | Select-Object -ExpandProperty Id"
+                ),
+            ])
+            .output();
+        let Ok(out) = out else {
+            return false;
+        };
+        let pids: Vec<u32> = String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter_map(|l| l.trim().parse::<u32>().ok())
+            .collect();
+        if pids.is_empty() {
+            return false;
+        }
+        let kill_list = pids
+            .iter()
+            .map(|p| p.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        let _ = Command::new("powershell")
+            .args([
+                "-NoProfile",
+                "-WindowStyle",
+                "Hidden",
+                "-Command",
+                &format!(
+                    "Start-Sleep -Milliseconds 250; Stop-Process -Id {kill_list} -Force -ErrorAction SilentlyContinue; Start-Sleep -Milliseconds 300; Start-Process '{exe_str}'"
+                ),
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn();
+        true
+    }
+
+    #[cfg(not(windows))]
+    {
+        let out = Command::new("pgrep").args(["-x", "repoharbor"]).output();
+        let Ok(out) = out else {
+            return false;
+        };
+        let pids: Vec<u32> = String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter_map(|l| l.trim().parse::<u32>().ok())
+            .filter(|&pid| pid != self_pid)
+            .collect();
+        if pids.is_empty() {
+            return false;
+        }
+        let pid_args = pids
+            .iter()
+            .map(|p| p.to_string())
+            .collect::<Vec<_>>()
+            .join(" ");
+        let script = format!(
+            "trap '' HUP; sleep 0.2; kill -TERM {pid_args} 2>/dev/null || true; sleep 0.35; if command -v setsid >/dev/null 2>&1; then setsid \"$1\" </dev/null >/dev/null 2>&1 & else nohup \"$1\" </dev/null >/dev/null 2>&1 & fi"
+        );
+        let _ = Command::new("sh")
+            .args(["-c", &script, "repoharbor-restart", &exe_str])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn();
+        true
+    }
+}
+
 /// Download the appropriate release artifact for `kind`, verify SHA-256 when published,
 /// and atomically swap the executable in place.
 pub async fn download_and_apply_release_update(
@@ -502,13 +622,15 @@ pub async fn download_and_apply_release_update(
 ) -> Result<PathBuf, String> {
     let expected_suffix = expected_tarball_suffix();
     let default_tarball_name = format!("repoharbor-{expected_suffix}");
-    let (target_path, asset_url, asset_name, is_tarball) = match kind {
+    let (target_path, asset_url_opt, asset_name, is_tarball) = match kind {
         InstallKind::AppImage(path) => (
             path.clone(),
-            release
-                .appimage_url
-                .clone()
-                .ok_or("release has no AppImage asset")?,
+            Some(
+                release
+                    .appimage_url
+                    .clone()
+                    .ok_or("release has no AppImage asset")?,
+            ),
             release
                 .appimage_name
                 .clone()
@@ -517,17 +639,30 @@ pub async fn download_and_apply_release_update(
         ),
         InstallKind::UserBinary(path) => (
             path.clone(),
-            release
-                .tarball_url
-                .clone()
-                .ok_or_else(|| format!("release has no {expected_suffix} asset"))?,
+            Some(
+                release
+                    .tarball_url
+                    .clone()
+                    .ok_or_else(|| format!("release has no {expected_suffix} asset"))?,
+            ),
             release
                 .tarball_name
                 .clone()
                 .unwrap_or_else(|| default_tarball_name.clone()),
             true,
         ),
-        InstallKind::SourceCheckout { bin_path, .. } => {
+        InstallKind::SourceCheckout { repo_dir, bin_path } => {
+            // Keep the local git checkout fast-forwarded when clean.
+            let dirty = std::process::Command::new("git")
+                .args(["-C", &repo_dir.to_string_lossy(), "status", "--porcelain"])
+                .output()
+                .ok()
+                .is_some_and(|o| !o.stdout.is_empty());
+            if !dirty {
+                let _ = std::process::Command::new("git")
+                    .args(["-C", &repo_dir.to_string_lossy(), "pull", "--ff-only"])
+                    .status();
+            }
             let exe_name = format!("repoharbor{}", std::env::consts::EXE_SUFFIX);
             let user_bin = paths::user_bin_dir()
                 .map(|d| d.join(&exe_name))
@@ -543,10 +678,7 @@ pub async fn download_and_apply_release_update(
             };
             (
                 target,
-                release
-                    .tarball_url
-                    .clone()
-                    .ok_or_else(|| format!("release has no {expected_suffix} asset"))?,
+                release.tarball_url.clone(),
                 release.tarball_name.clone().unwrap_or(default_tarball_name),
                 true,
             )
@@ -559,39 +691,56 @@ pub async fn download_and_apply_release_update(
         }
     };
 
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(120))
-        .user_agent("RepoHarbor-Updater")
-        .build()
-        .map_err(|e| e.to_string())?;
+    let final_bytes = if let Some(asset_url) = asset_url_opt {
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(120))
+            .user_agent("RepoHarbor-Updater")
+            .build()
+            .map_err(|e| e.to_string())?;
 
-    let artifact_bytes = client
-        .get(&asset_url)
-        .send()
-        .await
-        .map_err(|e| format!("failed downloading update: {e}"))?
-        .error_for_status()
-        .map_err(|e| format!("update download error: {e}"))?
-        .bytes()
-        .await
-        .map_err(|e| format!("failed reading update stream: {e}"))?;
+        let artifact_bytes = client
+            .get(&asset_url)
+            .send()
+            .await
+            .map_err(|e| format!("failed downloading update: {e}"))?
+            .error_for_status()
+            .map_err(|e| format!("update download error: {e}"))?
+            .bytes()
+            .await
+            .map_err(|e| format!("failed reading update stream: {e}"))?;
 
-    if let Some(sums_url) = &release.checksums_url {
-        if let Ok(resp) = client.get(sums_url).send().await {
-            if resp.status().is_success() {
-                if let Ok(sums_txt) = resp.text().await {
-                    if let Some(expected) = parse_sha256_for_asset(&sums_txt, &asset_name) {
-                        verify_sha256(&artifact_bytes, &expected)?;
+        if let Some(sums_url) = &release.checksums_url {
+            if let Ok(resp) = client.get(sums_url).send().await {
+                if resp.status().is_success() {
+                    if let Ok(sums_txt) = resp.text().await {
+                        if let Some(expected) = parse_sha256_for_asset(&sums_txt, &asset_name) {
+                            verify_sha256(&artifact_bytes, &expected)?;
+                        }
                     }
                 }
             }
         }
-    }
 
-    let final_bytes = if is_tarball {
-        extract_binary_from_tar_gz(&artifact_bytes)?
+        if is_tarball {
+            extract_binary_from_tar_gz(&artifact_bytes)?
+        } else {
+            artifact_bytes.to_vec()
+        }
+    } else if let InstallKind::SourceCheckout { repo_dir, .. } = kind {
+        let status = std::process::Command::new("cargo")
+            .args(["build", "--release", "-p", "repoharbor"])
+            .current_dir(repo_dir)
+            .status()
+            .map_err(|e| format!("failed to run cargo build: {e}"))?;
+        if !status.success() {
+            return Err("cargo build --release failed in source checkout".to_string());
+        }
+        let exe_name = format!("repoharbor{}", std::env::consts::EXE_SUFFIX);
+        let built = repo_dir.join("target").join("release").join(exe_name);
+        fs::read(&built)
+            .map_err(|e| format!("failed reading built binary {}: {e}", built.display()))?
     } else {
-        artifact_bytes.to_vec()
+        return Err(format!("release has no {expected_suffix} asset"));
     };
 
     atomic_replace_executable(&target_path, &final_bytes)?;
@@ -600,14 +749,16 @@ pub async fn download_and_apply_release_update(
         let _ = fs::remove_dir_all(cache_dir);
     }
 
-    let meta_kind = match kind {
-        InstallKind::AppImage(_) => "appimage",
-        InstallKind::SourceCheckout { .. } => "binary",
-        _ => "binary",
+    let (meta_kind, meta_src) = match kind {
+        InstallKind::AppImage(_) => ("appimage", None),
+        InstallKind::SourceCheckout { repo_dir, .. } => {
+            ("source", Some(repo_dir.to_string_lossy().into_owned()))
+        }
+        _ => ("binary", None),
     };
     let _ = save_install_meta(&InstallMeta {
         kind: meta_kind.to_string(),
-        source_dir: None,
+        source_dir: meta_src,
         version: release.version.clone(),
         installed_at: chrono::Utc::now().to_rfc3339(),
     });

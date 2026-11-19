@@ -299,3 +299,17 @@ ok "Update anytime: repoharbor update  (or click Update inside the app)"
 if [[ ":$PATH:" != *":$BIN_DIR:"* ]]; then
   warn "add $BIN_DIR to PATH in ~/.bashrc / ~/.zshrc: export PATH=\"$BIN_DIR:\$PATH\""
 fi
+
+# If a RepoHarbor GUI instance is currently running, restart it into the newly installed binary.
+if have pgrep; then
+  RUNNING_PIDS="$(pgrep -x repoharbor 2>/dev/null | tr '\n' ' ' || true)"
+  if [[ -n "${RUNNING_PIDS// /}" ]]; then
+    ok "Restarting running RepoHarbor instance (${RUNNING_PIDS% })…"
+    RESTART_CMD="trap '' HUP; sleep 0.2; kill -TERM $RUNNING_PIDS 2>/dev/null || true; sleep 0.35; nohup \"$BIN_DST\" </dev/null >/dev/null 2>&1 &"
+    if have setsid; then
+      setsid sh -c "$RESTART_CMD" </dev/null >/dev/null 2>&1 &
+    else
+      nohup sh -c "$RESTART_CMD" </dev/null >/dev/null 2>&1 &
+    fi
+  fi
+fi

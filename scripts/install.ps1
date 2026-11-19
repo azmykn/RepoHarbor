@@ -188,3 +188,10 @@ if ($FromSource) {
 Write-Step "Done!"
 Write-Ok "Launch RepoHarbor from the Start Menu or run: repoharbor"
 Write-Ok "Update anytime with: repoharbor update (or click Update inside the app)"
+
+$running = Get-Process repoharbor -ErrorAction SilentlyContinue
+if ($running) {
+    Write-Ok "Restarting running RepoHarbor application..."
+    $pids = ($running | Select-Object -ExpandProperty Id) -join ","
+    Start-Process powershell -WindowStyle Hidden -ArgumentList "-NoProfile", "-Command", "Start-Sleep -Milliseconds 300; Stop-Process -Id $pids -Force -ErrorAction SilentlyContinue; Start-Sleep -Milliseconds 300; Start-Process '$BinDst'"
+}

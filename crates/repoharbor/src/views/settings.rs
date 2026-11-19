@@ -2363,9 +2363,6 @@ fn about_updates(
 
     if let AppUpdateState::Available(_) = update_state {
         let label = match install_kind {
-            repoharbor_core::updater::InstallKind::SourceCheckout { .. } => {
-                "Pull & rebuild in terminal"
-            }
             repoharbor_core::updater::InstallKind::SystemPackage(_) => {
                 "Run user installer in terminal"
             }
