@@ -27,11 +27,8 @@ pub const WEBSITE: &str = "https://www.digitscode.com";
 pub const LICENSE_SPDX: &str = "MIT";
 
 /// One-line MIT credit required for the included Orrery portions.
-pub const UPSTREAM_CREDIT: &str = "Includes software originally published as Orrery by Seb Burrell (MIT). This is an independent DigitsCode product, not an official fork continuation.";
-
-/// Short public-use summary (not a substitute for LICENSE).
-pub const PUBLIC_USE: &str =
-    "Open-source under the MIT License for commercial, personal, and internal use.";
+pub const UPSTREAM_CREDIT: &str =
+    "Includes software originally published as Orrery by Seb Burrell (MIT).";
 
 #[cfg(test)]
 mod tests {

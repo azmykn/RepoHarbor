@@ -2557,16 +2557,13 @@ fn about_overview(
             t.border,
         ),
         AppUpdateState::UpToDate(tag) => {
-            let latest = tag
-                .clone()
-                .unwrap_or_else(|| format!("v{}", id::APP_VERSION));
-            (
-                Some("circle-check"),
-                format!("Up to date ({latest})"),
-                t.clean,
-                t.page,
-                t.border,
-            )
+            let label = match tag.as_deref() {
+                Some(latest) if latest.trim_start_matches('v') != id::APP_VERSION => {
+                    format!("Up to date (latest: {latest})")
+                }
+                _ => "Up to date".to_string(),
+            };
+            (Some("circle-check"), label, t.clean, t.page, t.border)
         }
         AppUpdateState::Available(rel) => (
             Some("cloud-download"),
@@ -2592,7 +2589,7 @@ fn about_overview(
     };
 
     let env_label = format!(
-        "{} · {} ({})",
+        "{} · {} · {}",
         std::env::consts::OS,
         std::env::consts::ARCH,
         install_kind.label()
@@ -2605,13 +2602,13 @@ fn about_overview(
         .flex()
         .flex_row()
         .flex_wrap()
-        .items_start()
+        .items_center()
         .justify_between()
         .gap(px(12.))
         .child(
             div()
                 .flex_1()
-                .min_w(px(280.))
+                .min_w(px(260.))
                 .flex()
                 .flex_row()
                 .items_center()
@@ -2636,7 +2633,7 @@ fn about_overview(
                         .min_w_0()
                         .flex()
                         .flex_col()
-                        .gap(px(4.))
+                        .gap(px(3.))
                         .child(
                             div()
                                 .flex()
@@ -2666,26 +2663,21 @@ fn about_overview(
                                     status_bg,
                                     status_border,
                                     t,
-                                ))
-                                .child(about_pill_badge(
-                                    Some("box"),
-                                    env_label,
-                                    t.fg2,
-                                    t.page,
-                                    t.border,
-                                    t,
                                 )),
                         )
-                        .child(note_line(
-                            SharedString::from("Native GPU-rendered git fleet command center."),
-                            t.fg2,
-                            t,
-                        )),
+                        .child(
+                            div()
+                                .text_size(px(t.text_data_sm))
+                                .text_color(rgb(t.fg3))
+                                .truncate()
+                                .child(SharedString::from(env_label)),
+                        ),
                 ),
         )
         .child(
             div()
                 .flex()
+                .flex_none()
                 .flex_row()
                 .items_center()
                 .gap(px(10.))
@@ -3020,7 +3012,6 @@ fn about_publisher_and_license(t: &Theme) -> impl IntoElement {
                                 )),
                         ),
                 )
-                .child(note_line(SharedString::from(id::PUBLIC_USE), t.fg2, t))
                 .child(note_line(SharedString::from(id::UPSTREAM_CREDIT), t.fg3, t)),
         )
 }
