@@ -1790,7 +1790,13 @@ impl RepoHarborApp {
         self.close_overlay();
         match item {
             PaletteItem::Action(PaletteAction::Rescan) => self.rescan_user(cx),
-            PaletteItem::Action(PaletteAction::Settings) => self.view = View::Settings,
+            PaletteItem::Action(PaletteAction::Settings) => {
+                self.view = View::Settings;
+                self.view_filter = Some("roots".into());
+                if let Some(w) = window {
+                    self.maybe_load_view(View::Settings, w, cx);
+                }
+            }
             PaletteItem::Action(PaletteAction::ToggleTerminal) => {
                 self.toggle_terminal(window, cx);
             }
@@ -5258,11 +5264,22 @@ impl RepoHarborApp {
     /// Set/toggle the current view's contextual sub-filter (Feed/Inbox panels).
     /// Passing the already-active key clears it; `None` clears unconditionally.
     pub fn set_view_filter(&mut self, key: Option<SharedString>, cx: &mut Context<Self>) {
+        if self.view == View::Settings {
+            self.view_filter = Some(key.unwrap_or_else(|| "roots".into()));
+            cx.notify();
+            return;
+        }
         self.view_filter = if key.is_some() && key == self.view_filter {
             None
         } else {
             key
         };
+        cx.notify();
+    }
+
+    /// Select an explicit Settings category tab without toggling off on re-click.
+    pub fn set_settings_tab(&mut self, key: SharedString, cx: &mut Context<Self>) {
+        self.view_filter = Some(key);
         cx.notify();
     }
 
@@ -5844,11 +5861,21 @@ impl RepoHarborApp {
             .flex()
             .flex_row()
             .items_center()
-            .gap(px(1.))
+            .gap(px(2.))
             .flex_1()
             .min_w(px(0.))
             .overflow_x_scroll();
-        for (view, icon_name, label) in NAV {
+        for (idx, (view, icon_name, label)) in NAV.iter().copied().enumerate() {
+            // Subtle separator between workspace views (Mission Control..Agents) and utility/system tabs.
+            if idx == 5 {
+                tabs = tabs.child(
+                    div()
+                        .w(px(1.))
+                        .h(px(18.))
+                        .mx(px(4.))
+                        .bg(rgb(t.border_strong)),
+                );
+            }
             let active = self.view == view;
             let fg = if active { t.accent_bright } else { t.fg2 };
             let mut item = div()
@@ -5857,17 +5884,23 @@ impl RepoHarborApp {
                 .flex_row()
                 .flex_shrink_0()
                 .items_center()
-                .gap(px(4.))
-                .px(px(7.))
-                .py(px(6.))
+                .gap(px(5.))
+                .px(px(8.))
+                .py(px(5.))
                 .rounded(px(t.r_sm))
+                .border_1()
+                .border_color(rgb(if active { t.border_accent } else { t.page }))
                 .text_size(px(t.text_small))
                 .text_color(rgb(fg))
                 .cursor_pointer()
                 .hover(|s| s.text_color(rgb(t.fg0)).bg(rgb(t.surface_hover)))
                 .on_click(cx.listener(move |this, _ev, window, cx| {
                     this.view = view;
-                    this.view_filter = None;
+                    this.view_filter = if view == View::Settings {
+                        Some("roots".into())
+                    } else {
+                        None
+                    };
                     this.maybe_load_view(view, window, cx);
                     cx.notify();
                 }))
@@ -6428,41 +6461,45 @@ impl RepoHarborApp {
         )
     }
 
-    /// Settings: jump to a section (gates which section the view renders). No
-    /// counts — these are section selectors, not filters.
+    /// Settings: jump to a section (gates which section the view renders).
     fn settings_panel(&self, t: &Theme, cx: &mut Context<Self>) -> gpui::AnyElement {
         self.category_panel(
             t,
             cx,
             "SECTIONS",
             vec![
-                (None, "settings", "All".into(), None),
-                (
-                    Some("account".into()),
-                    "user",
-                    "GitHub account".into(),
-                    None,
-                ),
                 (
                     Some("roots".into()),
                     "folder",
-                    "Workspace roots".into(),
+                    "Workspace & Roots".into(),
                     None,
                 ),
-                (Some("launchers".into()), "rocket", "Launchers".into(), None),
-                (Some("ai".into()), "sparkles", "AI".into(), None),
+                (
+                    Some("account".into()),
+                    "user",
+                    "GitHub Account".into(),
+                    None,
+                ),
+                (
+                    Some("launchers".into()),
+                    "rocket",
+                    "Launchers & Terminal".into(),
+                    None,
+                ),
+                (Some("ai".into()), "sparkles", "AI & Providers".into(), None),
                 (
                     Some("notifications".into()),
                     "bell",
-                    "Notifications".into(),
+                    "Notifications & System".into(),
                     None,
                 ),
                 (
                     Some("about".into()),
                     "harbor",
-                    "About & license".into(),
+                    "About & License".into(),
                     None,
                 ),
+                (Some("all".into()), "settings", "All Sections".into(), None),
             ],
         )
     }
@@ -7192,13 +7229,23 @@ impl RepoHarborApp {
     /// Execute ops live on [`Self::ops_row`].
     fn toolbar(&self, t: &Theme, cx: &mut Context<Self>, count: usize) -> impl IntoElement {
         let title = format!("{} · {count}", self.grid.mode.label());
+        let sep = || {
+            div()
+                .w(px(1.))
+                .h(px(18.))
+                .mx(px(2.))
+                .bg(rgb(t.border_strong))
+        };
         let mut bar = div()
             .flex()
             .flex_row()
+            .flex_wrap()
             .items_center()
-            .gap(px(10.))
+            .gap(px(8.))
             .px(px(16.))
-            .pt(px(14.))
+            .py(px(10.))
+            .border_b_1()
+            .border_color(rgb(t.border))
             .child(
                 div()
                     .font_weight(FontWeight::SEMIBOLD)
@@ -7207,19 +7254,84 @@ impl RepoHarborApp {
                     .child(SharedString::from(title)),
             );
         if let Some(search) = &self.repo_search {
-            bar = bar.child(div().w(px(310.)).child(Input::new(search).cleanable(true)));
+            bar = bar.child(div().w(px(290.)).child(Input::new(search).cleanable(true)));
         }
-        bar = bar.child(div().flex_1()).child(self.mode_segments(t, cx));
+        bar = bar
+            .child(div().flex_1())
+            .child(self.mode_segments(t, cx))
+            .child(sep());
         // Always-visible filter chips in the upper toolbar (every work mode).
         for f in VISIBILITY_CHIPS {
             bar = bar.child(self.filter_chip(f, t, cx));
         }
         // Working-mode git chips (Dirty / Stageable / Pushable) — filters, not ops.
-        for f in self.grid.mode.chips() {
-            bar = bar.child(self.filter_chip(*f, t, cx));
+        let mode_chips = self.grid.mode.chips();
+        if !mode_chips.is_empty() {
+            bar = bar.child(sep());
+            for f in mode_chips {
+                bar = bar.child(self.filter_chip(*f, t, cx));
+            }
         }
-        bar = bar
-            // Sort order (cycles Sort: recent ↔ Sort: name). Not the heatmap.
+        // Unified segmented List | Grid control next to Sort.
+        let list_active = self.grid.layout == Layout::List;
+        let grid_active = self.grid.layout == Layout::Grid;
+        let layout_switch = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .rounded(px(t.r_sm))
+            .border_1()
+            .border_color(rgb(t.border))
+            .bg(rgb(t.button_bg))
+            .overflow_hidden()
+            .child(
+                div()
+                    .id("tb-list")
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .px(px(8.))
+                    .py(px(6.))
+                    .bg(rgb(if list_active {
+                        t.accent_wash
+                    } else {
+                        t.button_bg
+                    }))
+                    .cursor_pointer()
+                    .hover(|s| s.bg(rgb(t.surface_hover)))
+                    .child(lucide(
+                        "list",
+                        14.,
+                        if list_active { t.accent_bright } else { t.fg1 },
+                    ))
+                    .on_click(cx.listener(|this, _ev, _w, cx| this.set_layout(Layout::List, cx))),
+            )
+            .child(
+                div()
+                    .id("tb-grid")
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .px(px(8.))
+                    .py(px(6.))
+                    .border_l_1()
+                    .border_color(rgb(t.border))
+                    .bg(rgb(if grid_active {
+                        t.accent_wash
+                    } else {
+                        t.button_bg
+                    }))
+                    .cursor_pointer()
+                    .hover(|s| s.bg(rgb(t.surface_hover)))
+                    .child(lucide(
+                        "layout-grid",
+                        14.,
+                        if grid_active { t.accent_bright } else { t.fg1 },
+                    ))
+                    .on_click(cx.listener(|this, _ev, _w, cx| this.set_layout(Layout::Grid, cx))),
+            );
+
+        bar.child(sep())
             .child(tool_btn(
                 "tb-sort",
                 "arrow-up-down",
@@ -7229,26 +7341,7 @@ impl RepoHarborApp {
                 t,
                 cx.listener(|this, _ev, _w, cx| this.cycle_sort(cx)),
             ))
-            // Layout toggle: grid vs. compact list.
-            .child(tool_btn(
-                "tb-grid",
-                "layout-grid",
-                None,
-                None,
-                self.grid.layout == Layout::Grid,
-                t,
-                cx.listener(|this, _ev, _w, cx| this.set_layout(Layout::Grid, cx)),
-            ))
-            .child(tool_btn(
-                "tb-list",
-                "list",
-                None,
-                None,
-                self.grid.layout == Layout::List,
-                t,
-                cx.listener(|this, _ev, _w, cx| this.set_layout(Layout::List, cx)),
-            ));
-        bar
+            .child(layout_switch)
     }
 
     /// Segmented work-mode control: Needs me | Behind | Working | All.
@@ -7302,9 +7395,16 @@ impl RepoHarborApp {
         group
     }
 
-    /// Bottom Mission Control strip — execute ops only. Global verbs stay
-    /// visible with no selection so they are not mixed into the filter row.
+    /// Bottom Mission Control strip — execute ops only, cleanly grouped into
+    /// Selection, Maintenance/Discovery, and Fleet Sync/AI Commit verbs.
     fn ops_row(&self, t: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
+        let sep = || {
+            div()
+                .w(px(1.))
+                .h(px(18.))
+                .mx(px(2.))
+                .bg(rgb(t.border_strong))
+        };
         let mut row = div()
             .flex()
             .flex_row()
@@ -7312,16 +7412,21 @@ impl RepoHarborApp {
             .items_center()
             .gap(px(7.))
             .px(px(16.))
-            .py(px(12.));
+            .py(px(9.))
+            .bg(rgb(t.surface))
+            .border_b_1()
+            .border_color(rgb(t.border));
         row = row.child(self.select_all_checkbox(t, cx));
         // Disk/git rescan — labeled + accent so it isn’t a ghost icon.
-        row = row.child(tool_btn_primary(
-            "tb-refresh",
-            "refresh-cw",
-            "Refresh",
-            t,
-            cx.listener(|this, _ev, _w, cx| this.rescan_user(cx)),
-        ));
+        row = row
+            .child(tool_btn_primary(
+                "tb-refresh",
+                "refresh-cw",
+                "Refresh",
+                t,
+                cx.listener(|this, _ev, _w, cx| this.rescan_user(cx)),
+            ))
+            .child(sep());
 
         // One-click Pull for every repo behind its upstream (vendor trees).
         row = row.child(tool_btn(
@@ -7345,9 +7450,6 @@ impl RepoHarborApp {
         ));
         // Always-on Submodules: empty *visible* selection → all visible parents
         // with nested checkouts; with a visible selection → selected ∩ visible.
-        // Idle+empty: show the visible-parent count so empty→all is obvious.
-        // Use selected∩visible (not raw HashSet) so off-filter leftovers don't
-        // hide the (N) cue or disagree with the Actions badge.
         let sub_label = if self.selected_repos_ordered().is_empty() {
             let visible = self.visible_rows();
             let n =
@@ -7383,17 +7485,23 @@ impl RepoHarborApp {
             ));
         }
         // Fleet sync primaries (Fetch, Pull, and selection actions).
-        // Fetch and Pull are scope-aware: operate on all visible repos when
-        // empty selection, or on selected repos when checked.
-        row = row.child(self.fleet_primary_sync_buttons(t, cx));
+        row = row
+            .child(sep())
+            .child(self.fleet_primary_sync_buttons(t, cx));
 
         let selected_n = self.selected_repos_ordered().len();
         if selected_n > 0 {
             row = row.child(self.fleet_actions_button(t, cx)).child(
                 div()
+                    .px(px(7.))
+                    .py(px(2.))
+                    .rounded(px(t.r_xs))
+                    .bg(rgb(t.accent_wash))
+                    .border_1()
+                    .border_color(rgb(t.border_accent))
                     .font_family("monospace")
                     .text_size(px(t.text_data_sm))
-                    .text_color(rgb(t.fg2))
+                    .text_color(rgb(t.accent_bright))
                     .child(SharedString::from(format!("{selected_n} selected"))),
             );
         }
@@ -9098,6 +9206,7 @@ impl RepoHarborApp {
                             |this, _, win, cx| {
                                 if !this.services.github_authed {
                                     this.view = View::Settings;
+                                    this.view_filter = Some("account".into());
                                     self::RepoHarborApp::open_settings(this, win, cx);
                                 }
                             },

@@ -190,6 +190,16 @@ impl SettingsState {
     }
 }
 
+const SETTINGS_TABS: [(&str, &str, &str); 7] = [
+    ("roots", "folder", "Workspace & Roots"),
+    ("account", "user", "GitHub Account"),
+    ("launchers", "rocket", "Launchers & Terminal"),
+    ("ai", "sparkles", "AI & Providers"),
+    ("notifications", "bell", "Notifications & System"),
+    ("about", "harbor", "About & License"),
+    ("all", "settings", "All"),
+];
+
 #[allow(clippy::too_many_arguments)]
 pub fn render(
     s: &SettingsState,
@@ -205,17 +215,18 @@ pub fn render(
     t: &Theme,
     app: &Entity<RepoHarborApp>,
 ) -> impl IntoElement {
-    // The sidebar SECTIONS panel gates which section shows (None = all).
-    let show = |section: &str| filter.is_none() || filter == Some(section);
+    let active_tab = filter.unwrap_or("roots");
+    let show = |sec: &str| active_tab == "all" || active_tab == sec;
+
     let mut sections: Vec<gpui::AnyElement> = Vec::new();
-    if show("account") {
-        sections.push(
-            account_section(authed, device, s.draft.github_allow_cli_token, t, app)
-                .into_any_element(),
-        );
-    }
     if show("roots") {
         sections.push(roots_section(s, t, app).into_any_element());
+    }
+    if show("account") {
+        sections.push(
+            account_section(s, authed, device, s.draft.github_allow_cli_token, t, app)
+                .into_any_element(),
+        );
     }
     if show("launchers") {
         sections.push(launchers_section(s, t, app).into_any_element());
@@ -233,34 +244,108 @@ pub fn render(
         );
     }
 
-    let header_title = if filter == Some("about") {
-        "About & license"
-    } else {
-        "Settings"
-    };
+    let header_title = SETTINGS_TABS
+        .iter()
+        .find(|(id, _, _)| *id == active_tab)
+        .map(|(_, _, label)| *label)
+        .unwrap_or("Settings");
+
+    let mut tab_bar = div()
+        .id("settings-inpage-tabs")
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(6.))
+        .overflow_x_scroll()
+        .pb(px(2.));
+    for (id, icon_name, label) in SETTINGS_TABS {
+        let on = active_tab == id;
+        let app_tab = app.clone();
+        let fg = if on { t.accent_bright } else { t.fg2 };
+        let bg = if on { t.accent_wash } else { t.button_bg };
+        let border = if on { t.border_accent } else { t.border };
+        tab_bar = tab_bar.child(
+            div()
+                .id(SharedString::from(format!("settings-tab-{id}")))
+                .flex()
+                .flex_row()
+                .flex_shrink_0()
+                .items_center()
+                .gap(px(6.))
+                .px(px(10.))
+                .py(px(5.))
+                .rounded(px(t.r_sm))
+                .bg(rgb(bg))
+                .border_1()
+                .border_color(rgb(border))
+                .text_size(px(t.text_data_sm))
+                .font_weight(if on {
+                    FontWeight::MEDIUM
+                } else {
+                    FontWeight::NORMAL
+                })
+                .text_color(rgb(fg))
+                .cursor_pointer()
+                .hover(|st| {
+                    st.border_color(rgb(t.border_strong))
+                        .bg(rgb(t.surface_hover))
+                })
+                .child(lucide(icon_name, 13., fg))
+                .child(SharedString::from(label))
+                .on_click(move |_ev, _win, cx| {
+                    app_tab.update(cx, |this, cx| {
+                        this.set_settings_tab(id.into(), cx);
+                    });
+                }),
+        );
+    }
+
     let mut page = div()
         .flex()
         .flex_col()
         .size_full()
         .bg(rgb(t.page))
-        // Header
+        // Clean two-row Settings header: title + horizontal category switcher
         .child(
             div()
                 .flex()
-                .items_center()
-                .h(px(52.))
-                .px(px(20.))
+                .flex_col()
+                .gap(px(10.))
+                .px(px(24.))
+                .py(px(12.))
                 .border_b_1()
                 .border_color(rgb(t.border))
                 .child(
                     div()
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .text_size(px(t.text_h3))
-                        .text_color(rgb(t.fg0))
-                        .child(header_title),
-                ),
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .justify_between()
+                        .gap(px(12.))
+                        .child(
+                            div()
+                                .flex()
+                                .flex_row()
+                                .items_baseline()
+                                .gap(px(10.))
+                                .child(
+                                    div()
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .text_size(px(t.text_h3))
+                                        .text_color(rgb(t.fg0))
+                                        .child("Settings"),
+                                )
+                                .child(
+                                    div()
+                                        .text_size(px(t.text_data_sm))
+                                        .text_color(rgb(t.fg2))
+                                        .child(SharedString::from(header_title)),
+                                ),
+                        ),
+                )
+                .child(tab_bar),
         )
-        // Scrolling sections
+        // Scrolling sections inside a comfortable max-width container
         .child(
             div()
                 .id("settings-scroll")
@@ -269,18 +354,27 @@ pub fn render(
                 .flex_1()
                 .min_h(px(0.))
                 .overflow_y_scroll()
-                .p(px(20.))
-                .gap(px(16.))
-                .children(sections),
+                .px(px(24.))
+                .py(px(20.))
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .w_full()
+                        .max_w(px(1080.))
+                        .gap(px(18.))
+                        .children(sections),
+                ),
         );
-    if filter != Some("about") {
+    if active_tab != "about" {
         page = page.child(save_footer(s, t, app));
     }
     page
 }
 
-/// GitHub account panel: connection status + Connect (device flow) / Sign out.
+/// GitHub account panel: connection status + Connect (device flow) / Sign out + OAuth client id.
 fn account_section(
+    s: &SettingsState,
     authed: bool,
     device: &Option<GithubDevice>,
     allow_cli: bool,
@@ -491,60 +585,83 @@ fn account_section(
         t.fg3,
         t,
     ))
+    .child(
+        div()
+            .pt(px(8.))
+            .border_t_1()
+            .border_color(rgb(t.border))
+            .child(labeled("Custom GitHub OAuth client id (optional override)", s.client_id.clone(), t)),
+    )
 }
 
 // ── sections ────────────────────────────────────────────────────────────────
 
 fn roots_section(s: &SettingsState, t: &Theme, app: &Entity<RepoHarborApp>) -> impl IntoElement {
-    let mut col = section(t, "Workspace roots");
-    col = col.child(
-        div()
-            .text_size(px(t.text_data_sm))
-            .text_color(rgb(t.fg3))
-            .child("A single git repo or a folder of repos."),
-    );
-    for (i, root) in s.draft.roots.iter().enumerate() {
-        // Element ids must be unique — every row used to share `ib-x`, so GPUI
-        // dropped/misrouted clicks and × appeared dead.
-        let remove = {
-            let app = app.clone();
-            let (hb, _) = (t.surface_hover, t.fg3);
-            div()
-                .id(SharedString::from(format!("ib-x-root-{i}")))
-                .flex()
-                .items_center()
-                .justify_center()
-                .w(px(24.))
-                .h(px(24.))
-                .rounded(px(t.r_xs))
-                .cursor_pointer()
-                .hover(move |s| s.bg(rgb(hb)))
-                .child(lucide("x", 13., t.fg3))
-                .on_click(move |_ev, _win, cx| {
-                    app.update(cx, |this, cx| this.settings_remove_root(i, cx));
-                })
-        };
-        col = col.child(
-            div()
-                .flex()
-                .flex_row()
-                .items_center()
-                .gap(px(8.))
-                .child(lucide("folder", 13., t.fg3))
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w(px(0.))
-                        .truncate()
-                        .font_family("monospace")
-                        .text_size(px(t.text_data_sm))
-                        .text_color(rgb(t.fg1))
-                        .child(SharedString::from(root.clone())),
-                )
-                .child(remove),
-        );
+    let mut roots_list = div()
+        .id("settings-roots-list")
+        .flex()
+        .flex_col()
+        .gap(px(6.))
+        .max_h(px(210.))
+        .overflow_y_scroll()
+        .p(px(8.))
+        .rounded(px(t.r_sm))
+        .bg(rgb(t.page))
+        .border_1()
+        .border_color(rgb(t.border));
+
+    if s.draft.roots.is_empty() {
+        roots_list = roots_list.child(note_line(
+            "No workspace folders configured yet. Use Browse… or paste a path below.".into(),
+            t.fg3,
+            t,
+        ));
+    } else {
+        for (i, root) in s.draft.roots.iter().enumerate() {
+            let app_rm = app.clone();
+            roots_list = roots_list.child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(8.))
+                    .px(px(8.))
+                    .py(px(5.))
+                    .rounded(px(t.r_xs))
+                    .bg(rgb(t.surface))
+                    .border_1()
+                    .border_color(rgb(t.border))
+                    .child(lucide("folder", 13., t.primary))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .truncate()
+                            .font_family("monospace")
+                            .text_size(px(t.text_data_sm))
+                            .text_color(rgb(t.fg1))
+                            .child(SharedString::from(root.clone())),
+                    )
+                    .child(
+                        div()
+                            .id(SharedString::from(format!("ib-x-root-{i}")))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .w(px(22.))
+                            .h(px(22.))
+                            .rounded(px(t.r_xs))
+                            .cursor_pointer()
+                            .hover(|st| st.bg(rgb(t.surface_hover)))
+                            .child(lucide("x", 13., t.fg3))
+                            .on_click(move |_ev, _win, cx| {
+                                app_rm.update(cx, |this, cx| this.settings_remove_root(i, cx));
+                            }),
+                    ),
+            );
+        }
     }
-    // Browse (native multi-folder picker) + typed path Add (fallback / paste).
+
     let browse = {
         let app = app.clone();
         let (hb, hf) = (t.border_strong, t.fg0);
@@ -573,11 +690,11 @@ fn roots_section(s: &SettingsState, t: &Theme, app: &Entity<RepoHarborApp>) -> i
             .px(px(14.))
             .py(px(7.))
             .rounded(px(t.r_sm))
-            .bg(rgb(t.button_bg))
+            .bg(rgb(t.accent_wash))
             .border_1()
-            .border_color(rgb(t.border))
+            .border_color(rgb(t.border_accent))
             .text_size(px(t.text_data_sm))
-            .text_color(rgb(t.fg1))
+            .text_color(rgb(t.fg0))
             .cursor_pointer()
             .hover(move |s| s.border_color(rgb(hb)).text_color(rgb(hf)))
             .child("Add")
@@ -585,7 +702,18 @@ fn roots_section(s: &SettingsState, t: &Theme, app: &Entity<RepoHarborApp>) -> i
                 app.update(cx, |this, cx| this.settings_add_root(window, cx));
             })
     };
-    col = col.child(
+
+    let roots_card = section(
+        t,
+        &format!("Scanned workspace roots ({})", s.draft.roots.len()),
+    )
+    .child(note_line(
+        "Each root can be a single repository or a parent folder containing multiple repos & submodules.".into(),
+        t.fg3,
+        t,
+    ))
+    .child(roots_list)
+    .child(
         div()
             .flex()
             .flex_row()
@@ -596,62 +724,69 @@ fn roots_section(s: &SettingsState, t: &Theme, app: &Entity<RepoHarborApp>) -> i
             .child(add),
     );
 
-    // Pull-only upstream prefixes (editable — not only config.toml).
-    col = col.child(
-        div()
-            .mt(px(14.))
-            .mb(px(4.))
-            .text_size(px(t.text_data_sm))
-            .font_weight(gpui::FontWeight::SEMIBOLD)
-            .text_color(rgb(t.fg1))
-            .child("Pull-only paths (upstream)"),
-    );
-    col = col.child(
-        div()
-            .text_size(px(t.text_data_sm))
-            .text_color(rgb(t.fg3))
-            .child(
-                "Repos under these prefixes: Pull to update; hide Push / Gen & push / Empty commit; demote upstream CI. Removing a path is remembered across restarts (new Odoo core/custom trees still auto-add). Your digits modules stay Pushable when outside this list.",
-            ),
-    );
-    for (i, prefix) in s.draft.pull_only_prefixes.iter().enumerate() {
-        let remove = {
-            let app = app.clone();
-            let (hb, _) = (t.surface_hover, t.fg3);
-            div()
-                .id(SharedString::from(format!("ib-x-pullonly-{i}")))
-                .flex()
-                .items_center()
-                .justify_center()
-                .w(px(24.))
-                .h(px(24.))
-                .rounded(px(t.r_xs))
-                .cursor_pointer()
-                .hover(move |s| s.bg(rgb(hb)))
-                .child(lucide("x", 13., t.fg3))
-                .on_click(move |_ev, _win, cx| {
-                    app.update(cx, |this, cx| this.settings_remove_pull_only(i, cx));
-                })
-        };
-        col = col.child(
-            div()
-                .flex()
-                .flex_row()
-                .items_center()
-                .gap(px(8.))
-                .child(lucide("arrow-down", 13., t.fg3))
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w(px(0.))
-                        .truncate()
-                        .font_family("monospace")
-                        .text_size(px(t.text_data_sm))
-                        .text_color(rgb(t.fg1))
-                        .child(SharedString::from(prefix.clone())),
-                )
-                .child(remove),
-        );
+    // Pull-only upstream card
+    let mut po_list = div()
+        .id("settings-pull-only-list")
+        .flex()
+        .flex_col()
+        .gap(px(5.))
+        .max_h(px(180.))
+        .overflow_y_scroll()
+        .p(px(8.))
+        .rounded(px(t.r_sm))
+        .bg(rgb(t.page))
+        .border_1()
+        .border_color(rgb(t.border));
+    if s.draft.pull_only_prefixes.is_empty() {
+        po_list = po_list.child(note_line(
+            "No pull-only prefixes configured.".into(),
+            t.fg3,
+            t,
+        ));
+    } else {
+        for (i, prefix) in s.draft.pull_only_prefixes.iter().enumerate() {
+            let app_rm = app.clone();
+            po_list = po_list.child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(8.))
+                    .px(px(6.))
+                    .py(px(4.))
+                    .rounded(px(t.r_xs))
+                    .bg(rgb(t.surface))
+                    .border_1()
+                    .border_color(rgb(t.border))
+                    .child(lucide("arrow-down", 12., t.fg3))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .truncate()
+                            .font_family("monospace")
+                            .text_size(px(t.text_data_sm))
+                            .text_color(rgb(t.fg1))
+                            .child(SharedString::from(prefix.clone())),
+                    )
+                    .child(
+                        div()
+                            .id(SharedString::from(format!("ib-x-pullonly-{i}")))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .w(px(22.))
+                            .h(px(22.))
+                            .rounded(px(t.r_xs))
+                            .cursor_pointer()
+                            .hover(|st| st.bg(rgb(t.surface_hover)))
+                            .child(lucide("x", 12., t.fg3))
+                            .on_click(move |_ev, _win, cx| {
+                                app_rm.update(cx, |this, cx| this.settings_remove_pull_only(i, cx));
+                            }),
+                    ),
+            );
+        }
     }
     let add_po = {
         let app = app.clone();
@@ -673,13 +808,26 @@ fn roots_section(s: &SettingsState, t: &Theme, app: &Entity<RepoHarborApp>) -> i
                 app.update(cx, |this, cx| this.settings_add_pull_only(window, cx));
             })
     };
-    col = col.child(
+    let pull_only_card = section(
+        t,
+        &format!(
+            "Pull-only upstream paths ({})",
+            s.draft.pull_only_prefixes.len()
+        ),
+    )
+    .child(note_line(
+        "Upstream/vendor trees: allow Pull only and hide Push, Gen & push, and Empty commit."
+            .into(),
+        t.fg3,
+        t,
+    ))
+    .child(po_list)
+    .child(
         div()
             .flex()
             .flex_row()
             .items_center()
             .gap(px(8.))
-            .mt(px(4.))
             .child(
                 div()
                     .flex_1()
@@ -689,62 +837,67 @@ fn roots_section(s: &SettingsState, t: &Theme, app: &Entity<RepoHarborApp>) -> i
             .child(add_po),
     );
 
-    // Mute-attention prefixes — silence Needs me for selected trees.
-    col = col.child(
-        div()
-            .mt(px(14.))
-            .mb(px(4.))
-            .text_size(px(t.text_data_sm))
-            .font_weight(gpui::FontWeight::SEMIBOLD)
-            .text_color(rgb(t.fg1))
-            .child("Mute attention paths"),
-    );
-    col = col.child(
-        div()
-            .text_size(px(t.text_data_sm))
-            .text_color(rgb(t.fg3))
-            .child(
-                "Repos under these prefixes never raise Needs me, attention chips, or tray alerts. Does not edit files inside the repo — local to RepoHarbor only.",
-            ),
-    );
-    for (i, prefix) in s.draft.mute_attention_prefixes.iter().enumerate() {
-        let remove = {
-            let app = app.clone();
-            let (hb, _) = (t.surface_hover, t.fg3);
-            div()
-                .id(SharedString::from(format!("ib-x-mute-attn-{i}")))
-                .flex()
-                .items_center()
-                .justify_center()
-                .w(px(24.))
-                .h(px(24.))
-                .rounded(px(t.r_xs))
-                .cursor_pointer()
-                .hover(move |s| s.bg(rgb(hb)))
-                .child(lucide("x", 13., t.fg3))
-                .on_click(move |_ev, _win, cx| {
-                    app.update(cx, |this, cx| this.settings_remove_mute_attention(i, cx));
-                })
-        };
-        col = col.child(
-            div()
-                .flex()
-                .flex_row()
-                .items_center()
-                .gap(px(8.))
-                .child(lucide("bell", 13., t.fg3))
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w(px(0.))
-                        .truncate()
-                        .font_family("monospace")
-                        .text_size(px(t.text_data_sm))
-                        .text_color(rgb(t.fg1))
-                        .child(SharedString::from(prefix.clone())),
-                )
-                .child(remove),
-        );
+    // Mute attention card
+    let mut mute_list = div()
+        .id("settings-mute-list")
+        .flex()
+        .flex_col()
+        .gap(px(5.))
+        .max_h(px(180.))
+        .overflow_y_scroll()
+        .p(px(8.))
+        .rounded(px(t.r_sm))
+        .bg(rgb(t.page))
+        .border_1()
+        .border_color(rgb(t.border));
+    if s.draft.mute_attention_prefixes.is_empty() {
+        mute_list = mute_list.child(note_line("No muted paths configured.".into(), t.fg3, t));
+    } else {
+        for (i, prefix) in s.draft.mute_attention_prefixes.iter().enumerate() {
+            let app_rm = app.clone();
+            mute_list = mute_list.child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(8.))
+                    .px(px(6.))
+                    .py(px(4.))
+                    .rounded(px(t.r_xs))
+                    .bg(rgb(t.surface))
+                    .border_1()
+                    .border_color(rgb(t.border))
+                    .child(lucide("bell", 12., t.fg3))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .truncate()
+                            .font_family("monospace")
+                            .text_size(px(t.text_data_sm))
+                            .text_color(rgb(t.fg1))
+                            .child(SharedString::from(prefix.clone())),
+                    )
+                    .child(
+                        div()
+                            .id(SharedString::from(format!("ib-x-mute-attn-{i}")))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .w(px(22.))
+                            .h(px(22.))
+                            .rounded(px(t.r_xs))
+                            .cursor_pointer()
+                            .hover(|st| st.bg(rgb(t.surface_hover)))
+                            .child(lucide("x", 12., t.fg3))
+                            .on_click(move |_ev, _win, cx| {
+                                app_rm.update(cx, |this, cx| {
+                                    this.settings_remove_mute_attention(i, cx)
+                                });
+                            }),
+                    ),
+            );
+        }
     }
     let add_mute = {
         let app = app.clone();
@@ -766,13 +919,25 @@ fn roots_section(s: &SettingsState, t: &Theme, app: &Entity<RepoHarborApp>) -> i
                 app.update(cx, |this, cx| this.settings_add_mute_attention(window, cx));
             })
     };
-    col = col.child(
+    let mute_card = section(
+        t,
+        &format!(
+            "Muted attention paths ({})",
+            s.draft.mute_attention_prefixes.len()
+        ),
+    )
+    .child(note_line(
+        "Repos under these paths never raise Needs me badges, chips, or desktop alerts.".into(),
+        t.fg3,
+        t,
+    ))
+    .child(mute_list)
+    .child(
         div()
             .flex()
             .flex_row()
             .items_center()
             .gap(px(8.))
-            .mt(px(4.))
             .child(
                 div()
                     .flex_1()
@@ -782,9 +947,40 @@ fn roots_section(s: &SettingsState, t: &Theme, app: &Entity<RepoHarborApp>) -> i
             .child(add_mute),
     );
 
-    // Scan depth stepper + ignore field.
-    col = col.child(number_row("Scan depth", &s.scan_depth, t));
-    col.child(labeled("Ignore (comma-separated)", s.ignore.clone(), t))
+    let scanner_card = section(t, "Scanner options").child(
+        div()
+            .flex()
+            .flex_row()
+            .flex_wrap()
+            .items_end()
+            .gap(px(16.))
+            .child(
+                div()
+                    .w(px(220.))
+                    .child(number_row("Scan depth (1–8)", &s.scan_depth, t)),
+            )
+            .child(div().flex_1().min_w(px(260.)).child(labeled(
+                "Ignored folder names (comma-separated)",
+                s.ignore.clone(),
+                t,
+            ))),
+    );
+
+    div()
+        .flex()
+        .flex_col()
+        .gap(px(16.))
+        .child(roots_card)
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .flex_wrap()
+                .gap(px(16.))
+                .child(div().flex_1().min_w(px(340.)).child(pull_only_card))
+                .child(div().flex_1().min_w(px(340.)).child(mute_card)),
+        )
+        .child(scanner_card)
 }
 
 fn launchers_section(
@@ -792,79 +988,119 @@ fn launchers_section(
     t: &Theme,
     app: &Entity<RepoHarborApp>,
 ) -> impl IntoElement {
-    section(t, "Launchers")
-        .child(labeled("IDE command", s.ide.clone(), t))
-        .child(labeled(
-            "Terminal / agent command (opens shell or local agent at {path})",
-            s.agent.clone(),
-            t,
-        ))
-        .child(labeled(
-            "Agent dispatch args ({prompt} = task)",
-            s.agent_dispatch.clone(),
-            t,
-        ))
-        .child(labeled(
-            "External diff command ({path} = repo, {file} = selected path)",
-            s.diff_command.clone(),
-            t,
-        ))
+    let templates_card = section(t, "External IDE, terminal & diff templates")
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .flex_wrap()
+                .gap(px(14.))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w(px(280.))
+                        .child(labeled("IDE command ({path})", s.ide.clone(), t)),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w(px(280.))
+                        .child(labeled("External diff tool ({path} / {file})", s.diff_command.clone(), t)),
+                ),
+        )
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .flex_wrap()
+                .gap(px(14.))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w(px(280.))
+                        .child(labeled("Terminal / agent command ({path})", s.agent.clone(), t)),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w(px(280.))
+                        .child(labeled("Agent dispatch args ({prompt})", s.agent_dispatch.clone(), t)),
+                ),
+        )
         .child(note_line(
             SharedString::from(
-                "Changes → Open external diff launches this tool (default: meld, or code / xdg-open).",
+                "Changes → Open external diff launches the configured diff tool (default: meld, code, or OS opener).",
             ),
             t.fg3,
             t,
-        ))
-        .child(toggle(
-            "Open built-in terminal on repo card / drawer clicks",
-            s.draft.terminal_embedded_default,
-            t,
-            app,
-            |this| {
-                if let Some(st) = &mut this.settings {
-                    st.draft.terminal_embedded_default = !st.draft.terminal_embedded_default;
-                }
-            },
-        ))
-        .child(toggle(
-            "Confirm destructive commands before executing in terminal",
-            s.draft.terminal_confirm_destructive,
-            t,
-            app,
-            |this| {
-                if let Some(st) = &mut this.settings {
-                    st.draft.terminal_confirm_destructive = !st.draft.terminal_confirm_destructive;
-                }
-            },
-        ))
-        .child(toggle(
-            "Dispatch coding agents inside built-in terminal tabs",
-            s.draft.terminal_dispatch_embedded,
-            t,
-            app,
-            |this| {
-                if let Some(st) = &mut this.settings {
-                    st.draft.terminal_dispatch_embedded = !st.draft.terminal_dispatch_embedded;
-                }
-            },
-        ))
-        .child(toggle(
-            "Show live command log in bottom terminal on toolbar actions",
-            s.draft.terminal_auto_show_log,
-            t,
-            app,
-            |this| {
-                if let Some(st) = &mut this.settings {
-                    st.draft.terminal_auto_show_log = !st.draft.terminal_auto_show_log;
-                }
-            },
-        ))
+        ));
+
+    let terminal_card = section(t, "Built-in PTY terminal dock")
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(8.))
+                .child(boxed_toggle(
+                    "Open built-in terminal on repo card / drawer clicks",
+                    s.draft.terminal_embedded_default,
+                    t,
+                    app,
+                    |this| {
+                        if let Some(st) = &mut this.settings {
+                            st.draft.terminal_embedded_default =
+                                !st.draft.terminal_embedded_default;
+                        }
+                    },
+                ))
+                .child(boxed_toggle(
+                    "Confirm destructive commands before executing in terminal",
+                    s.draft.terminal_confirm_destructive,
+                    t,
+                    app,
+                    |this| {
+                        if let Some(st) = &mut this.settings {
+                            st.draft.terminal_confirm_destructive =
+                                !st.draft.terminal_confirm_destructive;
+                        }
+                    },
+                ))
+                .child(boxed_toggle(
+                    "Dispatch coding agents inside built-in terminal tabs",
+                    s.draft.terminal_dispatch_embedded,
+                    t,
+                    app,
+                    |this| {
+                        if let Some(st) = &mut this.settings {
+                            st.draft.terminal_dispatch_embedded =
+                                !st.draft.terminal_dispatch_embedded;
+                        }
+                    },
+                ))
+                .child(boxed_toggle(
+                    "Show live Action Log automatically on fleet toolbar actions",
+                    s.draft.terminal_auto_show_log,
+                    t,
+                    app,
+                    |this| {
+                        if let Some(st) = &mut this.settings {
+                            st.draft.terminal_auto_show_log = !st.draft.terminal_auto_show_log;
+                        }
+                    },
+                )),
+        )
         .child(labeled(
-            "Built-in terminal shell (blank = $SHELL)",
+            "Custom shell override (blank = system default shell)",
             s.terminal_shell.clone(),
             t,
-        ))
+        ));
+
+    div()
+        .flex()
+        .flex_col()
+        .gap(px(16.))
+        .child(templates_card)
+        .child(terminal_card)
 }
 
 /// True when the configured backend string selects the llama.cpp sidecar.
@@ -908,9 +1144,9 @@ fn ai_section(
     let is_groq = backend_is_groq(&s.draft.ai_backend);
     let is_mistral = backend_is_mistral(&s.draft.ai_backend);
     let is_cloud = backend_is_cloud(&s.draft.ai_backend);
-    let mut sec = section(t, "AI & search")
-        .child(toggle(
-            "Enable AI features",
+    let mut primary_card = section(t, "AI engine & primary backend")
+        .child(boxed_toggle(
+            "Enable AI features across summaries, commit drafts & semantic search",
             s.draft.ai_enabled,
             t,
             app,
@@ -921,72 +1157,92 @@ fn ai_section(
             },
         ))
         .child(backend_picker(&s.draft.ai_backend, t, app));
+
+    let base_and_model_row =
+        |base_lbl: &str, base_inp: Entity<InputState>, model_inp: Entity<InputState>| {
+            div()
+                .flex()
+                .flex_row()
+                .flex_wrap()
+                .gap(px(14.))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w(px(260.))
+                        .child(labeled(base_lbl, base_inp, t)),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w(px(260.))
+                        .child(labeled("Chat model", model_inp, t)),
+                )
+        };
+
     if is_groq {
-        sec = sec
-            .child(labeled("Base URL", s.openai_base.clone(), t))
-            .child(labeled("Chat model", s.ai_model.clone(), t))
+        primary_card = primary_card
+            .child(base_and_model_row("Base URL", s.openai_base.clone(), s.ai_model.clone()))
             .child(groq_model_presets(s, t, app))
             .child(cloud_key_row(s, t, app, "groq"))
             .child(note_line(
                 SharedString::from(
-                    "Groq backend: Ultra-fast LPU inference (15-60ms) with generous free tier. Supports openai/gpt-oss-120b, openai/gpt-oss-20b, qwen3.8-27b, and allam-2-7b. Prompts go to Groq; embeddings stay local (Ollama).",
+                    "Groq backend: Ultra-fast LPU inference (15–60ms) with free tier. Prompts go to Groq; embeddings stay local (Ollama).",
                 ),
                 t.clean,
                 t,
             ));
     } else if is_mistral {
-        sec = sec
-            .child(labeled("Base URL", s.openai_base.clone(), t))
-            .child(labeled("Chat model", s.ai_model.clone(), t))
+        primary_card = primary_card
+            .child(base_and_model_row("Base URL", s.openai_base.clone(), s.ai_model.clone()))
             .child(mistral_model_presets(s, t, app))
             .child(cloud_key_row(s, t, app, "mistral"))
             .child(note_line(
                 SharedString::from(
-                    "Mistral AI backend: Codestral optimized for code and Conventional Commits, plus Mistral Large/Small. Prompts go to Mistral; embeddings stay local (Ollama).",
+                    "Mistral AI backend: Codestral optimized for code & Conventional Commits. Prompts go to Mistral; embeddings stay local.",
                 ),
                 t.clean,
                 t,
             ));
     } else if is_openrouter {
-        sec = sec
-            .child(labeled("Base URL", s.openai_base.clone(), t))
-            .child(labeled("Chat model", s.ai_model.clone(), t))
+        primary_card = primary_card
+            .child(base_and_model_row("Base URL", s.openai_base.clone(), s.ai_model.clone()))
             .child(openrouter_model_presets(s, t, app))
             .child(cloud_key_row(s, t, app, "openrouter"))
             .child(note_line(
                 SharedString::from(
-                    "OpenRouter backend: Access 200+ hosted models (DeepSeek V3, Llama 3.3 70B, Claude 3.5, GPT-4o) using your OpenRouter API key. Prompts are routed to OpenRouter; embeddings and semantic search stay local (Ollama).",
+                    "OpenRouter backend: Access 200+ hosted models with your key. Prompts go to OpenRouter; embeddings stay local.",
                 ),
                 t.clean,
                 t,
             ));
     } else if is_cloud {
-        sec = sec
-            .child(labeled("Base URL", s.openai_base.clone(), t))
-            .child(labeled("Chat model", s.ai_model.clone(), t))
+        primary_card = primary_card
+            .child(base_and_model_row("Base URL", s.openai_base.clone(), s.ai_model.clone()))
             .child(cloud_key_row(s, t, app, "cloud"))
-            // Amber, not red: this is a standing caution about where the data
-            // goes, not a failure. Red (`behind`) reads as "something broke".
             .child(note_line(
                 SharedString::from(
-                    "Cloud backend: prompts — including your staged diffs and commit history — are sent to this endpoint. Pick Ollama or llama.cpp to keep everything on-device. Embeddings and semantic search always stay local.",
+                    "Cloud backend: prompts and diffs are sent to this endpoint. Pick Ollama or llama.cpp to keep everything on-device.",
                 ),
                 t.dirty,
                 t,
             ));
     } else if is_llama {
-        sec = sec
+        primary_card = primary_card
             .child(labeled("llama-server path", s.llama_server.clone(), t))
             .child(llama_download_row(s, t, app))
             .child(llama_model_line(s, t));
     } else {
-        sec = sec
-            .child(labeled("Ollama host", s.ollama_host.clone(), t))
-            .child(labeled("Chat model", s.ai_model.clone(), t))
+        primary_card = primary_card
+            .child(base_and_model_row(
+                "Ollama host",
+                s.ollama_host.clone(),
+                s.ai_model.clone(),
+            ))
             .child(labeled("Embedding model", s.embed_model.clone(), t));
     }
-    sec = sec
-        .child(toggle(
+
+    let pool_card = section(t, "Provider failover pool")
+        .child(boxed_toggle(
             "Auto-failover to next model/provider on rate limit or error (429 / 402 / timeout)",
             s.draft.ai_failover_enabled,
             t,
@@ -997,15 +1253,21 @@ fn ai_section(
                 }
             },
         ))
-        .child(model_pool_block(s, t, app))
-        .child(labeled("GitHub OAuth client id", s.client_id.clone(), t))
-        .child(ai_status_block(s, ai, t, app));
-    // Semantic recall index — an aiReady affordance (hidden, not broken, when
-    // AI is off/unreachable or the backend can't embed).
+        .child(model_pool_block(s, t, app));
+
+    let mut health_card =
+        section(t, "Backend health & available models").child(ai_status_block(s, ai, t, app));
     if ai_ready && repoharbor_core::ai::embeddings_supported() {
-        sec = sec.child(semantic_index_block(s, t, app));
+        health_card = health_card.child(semantic_index_block(s, t, app));
     }
-    sec
+
+    div()
+        .flex()
+        .flex_col()
+        .gap(px(16.))
+        .child(primary_card)
+        .child(pool_card)
+        .child(health_card)
 }
 
 /// Semantic-index size line + "Rebuild index" (drop + re-embed the corpus).
@@ -1881,6 +2143,7 @@ fn backend_picker(backend: &str, t: &Theme, app: &Entity<RepoHarborApp>) -> impl
             div()
                 .flex()
                 .flex_row()
+                .flex_wrap()
                 .gap(px(6.))
                 .child(opt("Ollama", "ollama"))
                 .child(opt("llama.cpp", "llamaCpp"))
@@ -2031,21 +2294,40 @@ fn ai_status_block(
                 t,
             ));
         } else {
-            block = block.child(note_line("Click a model to use it.".into(), t.fg3, t));
+            block = block.child(note_line(
+                SharedString::from(format!(
+                    "Available models ({}) — click any model to activate:",
+                    models.len()
+                )),
+                t.fg3,
+                t,
+            ));
+            let mut models_scroll = div()
+                .id("settings-ai-models-scroll")
+                .flex()
+                .flex_col()
+                .gap(px(3.))
+                .max_h(px(210.))
+                .overflow_y_scroll()
+                .p(px(8.))
+                .rounded(px(t.r_sm))
+                .bg(rgb(t.page))
+                .border_1()
+                .border_color(rgb(t.border));
             for (name, size) in models {
                 // Clicking a model selects it: the GGUF path for llama.cpp, or the
                 // chat-model name for Ollama/Cloud (a lightweight picker over the list).
                 let (app, ai_model, pick) = (app.clone(), s.ai_model.clone(), name.clone());
-                block = block.child(
+                models_scroll = models_scroll.child(
                     div()
                         .id(SharedString::from(format!("ai-model-{name}")))
                         .flex()
                         .flex_row()
                         .items_center()
                         .gap(px(8.))
-                        .px(px(6.))
-                        .py(px(3.))
-                        .rounded(px(t.r_sm))
+                        .px(px(8.))
+                        .py(px(4.))
+                        .rounded(px(t.r_xs))
                         .font_family("monospace")
                         .text_size(px(t.text_data_sm))
                         .cursor_pointer()
@@ -2083,6 +2365,7 @@ fn ai_status_block(
                         }),
                 );
             }
+            block = block.child(models_scroll);
         }
         // Ollama can pull the configured chat model from the registry; the
         // llama.cpp backend downloads GGUFs via the field above instead.
@@ -2108,78 +2391,88 @@ fn notifications_section(
 ) -> impl IntoElement {
     let app_auto = app.clone();
     let app_desk = app.clone();
-    section(t, "Notifications & Startup")
-        .child(toggle(
-            "Background notifications",
-            s.draft.notify_enabled,
-            t,
-            app,
-            |a| {
-                if let Some(s) = &mut a.settings {
-                    s.draft.notify_enabled = !s.draft.notify_enabled;
-                }
-            },
-        ))
-        .child(toggle(
-            "Urgent attention items",
-            s.draft.notify_attention,
-            t,
-            app,
-            |a| {
-                if let Some(s) = &mut a.settings {
-                    s.draft.notify_attention = !s.draft.notify_attention;
-                }
-            },
-        ))
-        .child(toggle(
-            "New pull request",
-            s.draft.notify_new_pr,
-            t,
-            app,
-            |a| {
-                if let Some(s) = &mut a.settings {
-                    s.draft.notify_new_pr = !s.draft.notify_new_pr;
-                }
-            },
-        ))
-        .child(toggle(
-            "Review requested",
-            s.draft.notify_review_requested,
-            t,
-            app,
-            |a| {
-                if let Some(s) = &mut a.settings {
-                    s.draft.notify_review_requested = !s.draft.notify_review_requested;
-                }
-            },
-        ))
-        .child(toggle(
-            "CI failure",
-            s.draft.notify_ci_failure,
-            t,
-            app,
-            |a| {
-                if let Some(s) = &mut a.settings {
-                    s.draft.notify_ci_failure = !s.draft.notify_ci_failure;
-                }
-            },
-        ))
-        .child(toggle(
-            "Agent finished",
-            s.draft.notify_agent_finished,
-            t,
-            app,
-            |a| {
-                if let Some(s) = &mut a.settings {
-                    s.draft.notify_agent_finished = !s.draft.notify_agent_finished;
-                }
-            },
-        ))
+
+    let alerts_card = section(t, "Desktop notifications").child(
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(8.))
+            .child(boxed_toggle(
+                "Background desktop notifications (master switch)",
+                s.draft.notify_enabled,
+                t,
+                app,
+                |a| {
+                    if let Some(s) = &mut a.settings {
+                        s.draft.notify_enabled = !s.draft.notify_enabled;
+                    }
+                },
+            ))
+            .child(boxed_toggle(
+                "Urgent attention items (conflicts / CI / ahead-behind)",
+                s.draft.notify_attention,
+                t,
+                app,
+                |a| {
+                    if let Some(s) = &mut a.settings {
+                        s.draft.notify_attention = !s.draft.notify_attention;
+                    }
+                },
+            ))
+            .child(boxed_toggle(
+                "New pull request assigned or opened",
+                s.draft.notify_new_pr,
+                t,
+                app,
+                |a| {
+                    if let Some(s) = &mut a.settings {
+                        s.draft.notify_new_pr = !s.draft.notify_new_pr;
+                    }
+                },
+            ))
+            .child(boxed_toggle(
+                "Pull request review requested",
+                s.draft.notify_review_requested,
+                t,
+                app,
+                |a| {
+                    if let Some(s) = &mut a.settings {
+                        s.draft.notify_review_requested = !s.draft.notify_review_requested;
+                    }
+                },
+            ))
+            .child(boxed_toggle(
+                "Default branch CI workflow failure",
+                s.draft.notify_ci_failure,
+                t,
+                app,
+                |a| {
+                    if let Some(s) = &mut a.settings {
+                        s.draft.notify_ci_failure = !s.draft.notify_ci_failure;
+                    }
+                },
+            ))
+            .child(boxed_toggle(
+                "Dispatched coding agent finished task",
+                s.draft.notify_agent_finished,
+                t,
+                app,
+                |a| {
+                    if let Some(s) = &mut a.settings {
+                        s.draft.notify_agent_finished = !s.draft.notify_agent_finished;
+                    }
+                },
+            )),
+    );
+
+    let startup_card = section(t, "System startup & desktop integration")
         .child({
             use gpui_component::switch::Switch;
             div()
-                .pt(px(8.))
-                .border_t_1()
+                .p(px(10.))
+                .rounded(px(t.r_sm))
+                .bg(rgb(t.page))
+                .border_1()
                 .border_color(rgb(t.border))
                 .flex()
                 .flex_row()
@@ -2188,9 +2481,21 @@ fn notifications_section(
                 .child(
                     div()
                         .flex_1()
-                        .text_size(px(t.text_small))
-                        .text_color(rgb(t.fg1))
-                        .child("Launch automatically on desktop login (~/.config/autostart)"),
+                        .flex()
+                        .flex_col()
+                        .gap(px(2.))
+                        .child(
+                            div()
+                                .text_size(px(t.text_small))
+                                .text_color(rgb(t.fg0))
+                                .child("Launch automatically on desktop login"),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(t.text_data_sm))
+                                .text_color(rgb(t.fg3))
+                                .child("Registers an autostart entry for Linux, macOS LaunchAgents, or Windows Startup."),
+                        ),
                 )
                 .child(
                     Switch::new("tg-autostart-login")
@@ -2203,20 +2508,42 @@ fn notifications_section(
         })
         .child(
             div()
+                .p(px(10.))
+                .rounded(px(t.r_sm))
+                .bg(rgb(t.page))
+                .border_1()
+                .border_color(rgb(t.border))
                 .flex()
-                .flex_row()
-                .flex_wrap()
-                .items_center()
+                .flex_col()
                 .gap(px(8.))
-                .child(button_id(
-                    "btn-repair-desktop",
-                    "Install / repair desktop shortcut & icon",
+                .child(note_line(
+                    "Register or repair RepoHarbor's desktop launcher, taskbar icon, and app bundle on this OS.".into(),
+                    t.fg3,
                     t,
-                    move |cx| {
-                        app_desk.update(cx, |this, cx| this.repair_desktop_shortcut(cx));
-                    },
-                )),
-        )
+                ))
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .child(button_id(
+                            "btn-repair-desktop",
+                            "Install / repair desktop shortcut & icon",
+                            t,
+                            move |cx| {
+                                app_desk.update(cx, |this, cx| this.repair_desktop_shortcut(cx));
+                            },
+                        )),
+                ),
+        );
+
+    div()
+        .flex()
+        .flex_row()
+        .flex_wrap()
+        .gap(px(16.))
+        .child(div().flex_1().min_w(px(340.)).child(alerts_card))
+        .child(div().flex_1().min_w(px(340.)).child(startup_card))
 }
 
 fn about_section(
@@ -3081,6 +3408,24 @@ fn note_line(text: SharedString, color: u32, t: &Theme) -> impl IntoElement {
         .text_size(px(t.text_data_sm))
         .text_color(rgb(color))
         .child(text)
+}
+
+/// A label + gpui-component on/off [`Switch`] framed in a clean bordered row.
+fn boxed_toggle(
+    label: &str,
+    on: bool,
+    t: &Theme,
+    app: &Entity<RepoHarborApp>,
+    flip: impl Fn(&mut RepoHarborApp) + 'static,
+) -> impl IntoElement {
+    div()
+        .px(px(10.))
+        .py(px(8.))
+        .rounded(px(t.r_sm))
+        .bg(rgb(t.page))
+        .border_1()
+        .border_color(rgb(t.border))
+        .child(toggle(label, on, t, app, flip))
 }
 
 /// A label + gpui-component on/off [`Switch`] row. `flip` toggles the bound

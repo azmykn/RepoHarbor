@@ -62,51 +62,57 @@ pub fn render(
         matches_search && in_category
     };
 
-    let mut grid = div().flex().flex_col().gap(px(12.));
+    let wrap_tool = |el: gpui::AnyElement| div().flex_1().min_w(px(420.)).child(el);
+    let mut grid = div()
+        .flex()
+        .flex_row()
+        .flex_wrap()
+        .items_start()
+        .gap(px(14.));
     if show("UUID", "uuid guid id", "generators") {
-        grid = grid.child(uuid_tool(s, t, app));
+        grid = grid.child(wrap_tool(uuid_tool(s, t, app).into_any_element()));
     }
     if show("Base64", "base64 encode decode", "encoding") {
-        grid = grid.child(base64_tool(s, t, cx));
+        grid = grid.child(wrap_tool(base64_tool(s, t, cx).into_any_element()));
     }
     if show("SHA-256", "hash sha sha256 digest", "hashing") {
-        grid = grid.child(hash_tool(s, t, cx));
+        grid = grid.child(wrap_tool(hash_tool(s, t, cx).into_any_element()));
     }
     if show("URL encode", "url percent encode decode", "encoding") {
-        grid = grid.child(url_tool(s, t, cx));
+        grid = grid.child(wrap_tool(url_tool(s, t, cx).into_any_element()));
     }
     if show("JSON", "json format minify pretty", "data") {
-        grid = grid.child(json_tool(s, t, cx));
+        grid = grid.child(wrap_tool(json_tool(s, t, cx).into_any_element()));
     }
     if show("JWT decoder", "jwt token decode auth bearer", "data") {
-        grid = grid.child(jwt_tool(s, t, cx));
+        grid = grid.child(wrap_tool(jwt_tool(s, t, cx).into_any_element()));
     }
     if show(
         "Base converter",
         "base hex octal binary radix number",
         "convert",
     ) {
-        grid = grid.child(base_tool(s, t, cx));
+        grid = grid.child(wrap_tool(base_tool(s, t, cx).into_any_element()));
     }
     if show(
         "Timestamp converter",
         "timestamp epoch unix date time",
         "convert",
     ) {
-        grid = grid.child(timestamp_tool(s, t, cx));
+        grid = grid.child(wrap_tool(timestamp_tool(s, t, cx).into_any_element()));
     }
     if show("Colour converter", "colour color hex rgb hsl", "convert") {
-        grid = grid.child(colour_tool(s, t, cx));
+        grid = grid.child(wrap_tool(colour_tool(s, t, cx).into_any_element()));
     }
     if show(
         "Case converter",
         "case upper lower snake kebab camel title",
         "text",
     ) {
-        grid = grid.child(case_tool(s, t, cx));
+        grid = grid.child(wrap_tool(case_tool(s, t, cx).into_any_element()));
     }
     if show("Regex tester", "regex regexp pattern match test", "text") {
-        grid = grid.child(regex_tool(s, t, cx));
+        grid = grid.child(wrap_tool(regex_tool(s, t, cx).into_any_element()));
     }
 
     div()

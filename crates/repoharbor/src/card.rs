@@ -874,7 +874,7 @@ pub(crate) fn list_item(
         .flex()
         .flex_row()
         .items_center()
-        .gap(px(12.))
+        .gap(px(8.))
         .flex_none()
         .font_family(MONO)
         .text_size(px(t.text_data_sm));
@@ -902,12 +902,19 @@ pub(crate) fn list_item(
                 .flex_row()
                 .items_center()
                 .gap(px(4.))
-                .px(px(4.))
+                .px(px(6.))
                 .py(px(1.))
                 .rounded(px(t.r_xs))
+                .bg(rgb(t.button_bg))
+                .border_1()
+                .border_color(rgb(t.border))
                 .cursor_pointer()
-                .hover(|s| s.bg(rgb(t.surface_hover)).text_color(rgb(t.fg0)))
-                .child(lucide("git-branch", 13., t.fg2))
+                .hover(|s| {
+                    s.bg(rgb(t.surface_hover))
+                        .border_color(rgb(t.border_strong))
+                        .text_color(rgb(t.fg0))
+                })
+                .child(lucide("git-branch", 12., t.fg2))
                 .child(row.branch.clone())
                 .on_click(move |_ev, window, cx| {
                     let id = repo_id.clone();
@@ -927,19 +934,41 @@ pub(crate) fn list_item(
                 .flex_row()
                 .items_center()
                 .gap(px(4.))
+                .px(px(6.))
+                .py(px(1.))
+                .rounded(px(t.r_xs))
+                .bg(rgb(if row.behind > 0 {
+                    t.danger_badge
+                } else {
+                    t.button_bg
+                }))
+                .border_1()
+                .border_color(rgb(t.border))
                 .text_color(rgb(color))
-                .child(lucide("arrow-up", 13., color))
+                .child(lucide("arrow-up", 12., color))
                 .child(SharedString::from(row.ahead.to_string()))
-                .child(lucide("arrow-down", 13., color))
+                .child(lucide("arrow-down", 12., color))
                 .child(SharedString::from(row.behind.to_string())),
         );
     }
     if row.dirty > 0 {
-        status = status.child(seg(
-            "circle-dot",
-            SharedString::from(row.dirty.to_string()),
-            t.dirty,
-        ));
+        status = status.child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .px(px(6.))
+                .py(px(1.))
+                .rounded(px(t.r_xs))
+                .bg(rgb(t.button_bg))
+                .border_1()
+                .border_color(rgb(t.border))
+                .child(seg(
+                    "circle-dot",
+                    SharedString::from(row.dirty.to_string()),
+                    t.dirty,
+                )),
+        );
     }
     if !row.host.is_empty() {
         status = status.child(seg("star", row.stars.clone(), t.star));
