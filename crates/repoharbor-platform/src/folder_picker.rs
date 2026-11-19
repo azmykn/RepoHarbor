@@ -1,21 +1,25 @@
-//! Native folder picker via the XDG **FileChooser** portal (`ashpd`).
+//! Native folder picker across Linux (XDG **FileChooser** portal via `ashpd`),
+//! macOS (`osascript`), and Windows (PowerShell `FolderBrowserDialog`).
 //!
-//! Opens a directory chooser with multi-select enabled when the portal/backend
+//! Opens a directory chooser with multi-select enabled when the platform
 //! supports it (`directory` + `multiple`). Callers should treat a single-path
-//! result as success — some desktops only allow one folder even when asked for
-//! many. Cancel returns an empty `Vec`, not an error.
+//! result as success. Cancel returns an empty `Vec`, not an error.
 
 use std::path::PathBuf;
 
+#[cfg(target_os = "linux")]
 use ashpd::desktop::file_chooser::SelectedFiles;
+#[cfg(target_os = "linux")]
 use ashpd::desktop::ResponseError;
+#[cfg(target_os = "linux")]
 use ashpd::Error as AshpdError;
 
 /// Open a native folder dialog and return the selected absolute paths.
 ///
 /// - **Ok([])** — user cancelled, or accepted with no usable paths.
 /// - **Ok(paths)** — one or more directories (multi-select when the portal allows).
-/// - **Err** — portal unavailable / request failed.
+/// - **Err** — dialog backend unavailable / request failed.
+#[cfg(target_os = "linux")]
 pub fn pick_folders(title: &str, accept_label: &str) -> Result<Vec<PathBuf>, String> {
     let title = title.to_string();
     let accept_label = accept_label.to_string();
@@ -36,6 +40,60 @@ pub fn pick_folders(title: &str, accept_label: &str) -> Result<Vec<PathBuf>, Str
         .map_err(|_| "folder picker thread panicked".to_string())?
 }
 
+#[cfg(target_os = "macos")]
+pub fn pick_folders(title: &str, _accept_label: &str) -> Result<Vec<PathBuf>, String> {
+    let escaped = title.replace('\\', "\\\\").replace('"', "\\\"");
+    let script = format!("POSIX path of (choose folder with prompt \"{escaped}\")");
+    let out = std::process::Command::new("osascript")
+        .args(["-e", &script])
+        .output()
+        .map_err(|e| format!("osascript folder picker failed: {e}"))?;
+    if !out.status.success() {
+        // User cancellation exits non-zero in AppleScript.
+        return Ok(Vec::new());
+    }
+    let path_str = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if path_str.is_empty() {
+        Ok(Vec::new())
+    } else {
+        Ok(vec![PathBuf::from(path_str)])
+    }
+}
+
+#[cfg(target_os = "windows")]
+pub fn pick_folders(title: &str, _accept_label: &str) -> Result<Vec<PathBuf>, String> {
+    let escaped = title.replace('\'', "''");
+    let script = format!(
+        "Add-Type -AssemblyName System.Windows.Forms; \
+         $f = New-Object System.Windows.Forms.FolderBrowserDialog; \
+         $f.Description = '{escaped}'; \
+         $f.ShowNewFolderButton = $true; \
+         if ($f.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {{ \
+             [Console]::OutputEncoding = [System.Text.Encoding]::UTF8; \
+             Write-Output $f.SelectedPath \
+         }}"
+    );
+    let out = std::process::Command::new("powershell")
+        .args(["-NoProfile", "-STA", "-Command", &script])
+        .output()
+        .map_err(|e| format!("PowerShell folder picker failed: {e}"))?;
+    if !out.status.success() {
+        return Ok(Vec::new());
+    }
+    let path_str = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if path_str.is_empty() {
+        Ok(Vec::new())
+    } else {
+        Ok(vec![PathBuf::from(path_str)])
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+pub fn pick_folders(_title: &str, _accept_label: &str) -> Result<Vec<PathBuf>, String> {
+    Ok(Vec::new())
+}
+
+#[cfg(target_os = "linux")]
 async fn pick_folders_async(title: &str, accept_label: &str) -> Result<Vec<PathBuf>, String> {
     let request = SelectedFiles::open_file()
         .title(title)
@@ -63,6 +121,7 @@ async fn pick_folders_async(title: &str, accept_label: &str) -> Result<Vec<PathB
 }
 
 /// Convert a `file://` URI from the portal into a filesystem path.
+#[cfg_attr(not(any(target_os = "linux", test)), allow(dead_code))]
 fn file_uri_to_path(uri: &str) -> Option<PathBuf> {
     let rest = uri.strip_prefix("file://")?;
     let enc = if rest.starts_with('/') {

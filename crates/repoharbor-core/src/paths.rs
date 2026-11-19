@@ -61,17 +61,52 @@ pub fn resolve_data_file(file_name: &str) -> Option<PathBuf> {
     Some(new)
 }
 
-/// XDG autostart entry path: `~/.config/autostart/com.digitscode.repoharbor.desktop`.
+/// Platform autostart entry path:
+/// - Linux: `~/.config/autostart/com.digitscode.repoharbor.desktop`
+/// - macOS: `~/Library/LaunchAgents/com.digitscode.repoharbor.plist`
+/// - Windows: `%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup\RepoHarbor.cmd`
 pub fn autostart_desktop_path() -> Option<PathBuf> {
-    dirs::config_dir().map(|d| {
-        d.join("autostart")
-            .join("com.digitscode.repoharbor.desktop")
-    })
+    #[cfg(target_os = "macos")]
+    {
+        dirs::home_dir().map(|h| {
+            h.join("Library")
+                .join("LaunchAgents")
+                .join("com.digitscode.repoharbor.plist")
+        })
+    }
+    #[cfg(target_os = "windows")]
+    {
+        dirs::data_dir().map(|appdata| {
+            appdata
+                .join("Microsoft")
+                .join("Windows")
+                .join("Start Menu")
+                .join("Programs")
+                .join("Startup")
+                .join("RepoHarbor.cmd")
+        })
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        dirs::config_dir().map(|d| {
+            d.join("autostart")
+                .join("com.digitscode.repoharbor.desktop")
+        })
+    }
 }
 
-/// User-local executable directory (`~/.local/bin`).
+/// User-local executable directory:
+/// - Linux / macOS: `~/.local/bin`
+/// - Windows: `%LOCALAPPDATA%\Programs\RepoHarbor`
 pub fn user_bin_dir() -> Option<PathBuf> {
-    dirs::executable_dir().or_else(|| dirs::home_dir().map(|h| h.join(".local/bin")))
+    #[cfg(target_os = "windows")]
+    {
+        dirs::data_local_dir().map(|d| d.join("Programs").join("RepoHarbor"))
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        dirs::executable_dir().or_else(|| dirs::home_dir().map(|h| h.join(".local/bin")))
+    }
 }
 
 /// Metadata tracking how RepoHarbor was installed (binary, AppImage, source, deb/rpm).

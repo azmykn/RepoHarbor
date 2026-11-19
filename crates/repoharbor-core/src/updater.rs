@@ -75,13 +75,27 @@ impl InstallKind {
     /// Recommended shell command for updating externally (fallback for system packages).
     pub fn external_update_command(&self) -> String {
         match self {
-            Self::SourceCheckout { repo_dir, .. } => format!(
-                "cd {} && git pull --ff-only && bash scripts/install.sh --from-source",
-                shell_quote_path(repo_dir)
-            ),
+            Self::SourceCheckout { repo_dir, .. } => {
+                if cfg!(target_os = "windows") {
+                    format!(
+                        "cd {}; git pull --ff-only; powershell -ExecutionPolicy Bypass -File scripts\\install.ps1 -FromSource",
+                        shell_quote_path(repo_dir)
+                    )
+                } else {
+                    format!(
+                        "cd {} && git pull --ff-only && bash scripts/install.sh --from-source",
+                        shell_quote_path(repo_dir)
+                    )
+                }
+            }
             Self::SystemPackage(_) => {
-                "curl -fsSL https://raw.githubusercontent.com/azmykn/RepoHarbor/main/scripts/install.sh | bash"
-                    .to_string()
+                if cfg!(target_os = "windows") {
+                    "irm https://raw.githubusercontent.com/azmykn/RepoHarbor/main/scripts/install.ps1 | iex"
+                        .to_string()
+                } else {
+                    "curl -fsSL https://raw.githubusercontent.com/azmykn/RepoHarbor/main/scripts/install.sh | bash"
+                        .to_string()
+                }
             }
             Self::UserBinary(_) | Self::AppImage(_) => "repoharbor update".to_string(),
         }
@@ -231,7 +245,11 @@ pub fn detect_install_kind_for(
     }
     if let Some(parent) = exe.parent() {
         let s = parent.to_string_lossy();
-        if s.ends_with("/target/release") || s.ends_with("/target/debug") {
+        if s.ends_with("/target/release")
+            || s.ends_with("/target/debug")
+            || s.ends_with(r"\target\release")
+            || s.ends_with(r"\target\debug")
+        {
             if let Some(repo_dir) = find_git_ancestor(parent) {
                 return InstallKind::SourceCheckout {
                     repo_dir,
@@ -244,6 +262,44 @@ pub fn detect_install_kind_for(
         }
     }
     InstallKind::SystemPackage(exe.to_path_buf())
+}
+
+/// Canonical release archive suffix (`"<os>-<arch>.tar.gz"`) for a target OS and CPU architecture.
+pub fn expected_tarball_suffix_for(os: &str, arch: &str) -> String {
+    let norm_os = match os.to_ascii_lowercase().as_str() {
+        "darwin" | "macos" => "macos",
+        "win32" | "windows" => "windows",
+        _ => "linux",
+    };
+    let norm_arch = match arch.to_ascii_lowercase().as_str() {
+        "arm64" | "aarch64" => "aarch64",
+        _ => "x86_64",
+    };
+    format!("{norm_os}-{norm_arch}.tar.gz")
+}
+
+/// Canonical release archive suffix for the currently compiled platform.
+pub fn expected_tarball_suffix() -> String {
+    expected_tarball_suffix_for(std::env::consts::OS, std::env::consts::ARCH)
+}
+
+fn select_platform_tarball_asset<'a>(
+    assets: &'a [GithubAssetJson],
+    os: &str,
+    arch: &str,
+) -> Option<&'a GithubAssetJson> {
+    let exact_suffix = expected_tarball_suffix_for(os, arch);
+    if let Some(exact) = assets.iter().find(|a| a.name.ends_with(&exact_suffix)) {
+        return Some(exact);
+    }
+    let norm_os = if os.eq_ignore_ascii_case("darwin") {
+        "macos"
+    } else {
+        os
+    };
+    assets
+        .iter()
+        .find(|a| a.name.ends_with(".tar.gz") && a.name.contains(norm_os))
 }
 
 /// Inspect the running process environment to classify how RepoHarbor was installed.
@@ -295,10 +351,8 @@ pub async fn check_latest_release(current_version: &str) -> Result<UpdateCheck, 
         .strip_prefix('v')
         .unwrap_or(gh.tag_name.trim())
         .to_string();
-    let tarball = gh
-        .assets
-        .iter()
-        .find(|a| a.name.ends_with(".tar.gz") && a.name.contains("linux"));
+    let tarball =
+        select_platform_tarball_asset(&gh.assets, std::env::consts::OS, std::env::consts::ARCH);
     let appimage = gh.assets.iter().find(|a| a.name.ends_with(".AppImage"));
     let checksums = gh
         .assets
@@ -363,8 +417,31 @@ pub fn verify_sha256(bytes: &[u8], expected_hex: &str) -> Result<(), String> {
     }
 }
 
+/// Fallback two-step swap used on Windows when `target` is a running `.exe`
+/// that cannot be overwritten directly, or when tested explicitly:
+/// renames `target` → `<target>.old`, then moves `staging` → `target`, and
+/// best-effort removes `<target>.old`.
+pub fn replace_with_backup_rename(staging: &Path, target: &Path) -> Result<(), String> {
+    let backup = target.with_extension("old");
+    let _ = fs::remove_file(&backup);
+    if target.exists() {
+        fs::rename(target, &backup).map_err(|e| {
+            let _ = fs::remove_file(staging);
+            format!("backup rename failed: {e}")
+        })?;
+    }
+    if let Err(e) = fs::rename(staging, target) {
+        // Roll back backup if moving staging into place failed.
+        let _ = fs::rename(&backup, target);
+        let _ = fs::remove_file(staging);
+        return Err(format!("atomic swap after backup failed: {e}"));
+    }
+    let _ = fs::remove_file(&backup);
+    Ok(())
+}
+
 /// Atomically replace `target` executable with `new_binary_bytes` via a sibling
-/// staging file + `0755` chmod + POSIX `rename()`.
+/// staging file + `0755` chmod + POSIX `rename()` (or Windows running-exe backup rename).
 pub fn atomic_replace_executable(target: &Path, new_binary_bytes: &[u8]) -> Result<(), String> {
     if new_binary_bytes.is_empty() {
         return Err("downloaded update binary is empty".to_string());
@@ -373,6 +450,7 @@ pub fn atomic_replace_executable(target: &Path, new_binary_bytes: &[u8]) -> Resu
         .parent()
         .ok_or_else(|| format!("target path has no parent: {}", target.display()))?;
     fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    let _ = fs::remove_file(target.with_extension("old"));
     let file_name = target
         .file_name()
         .and_then(|n| n.to_str())
@@ -382,13 +460,13 @@ pub fn atomic_replace_executable(target: &Path, new_binary_bytes: &[u8]) -> Resu
     #[cfg(unix)]
     fs::set_permissions(&staging, fs::Permissions::from_mode(0o755))
         .map_err(|e| format!("chmod staging failed: {e}"))?;
-    fs::rename(&staging, target).map_err(|e| {
-        let _ = fs::remove_file(&staging);
-        format!("atomic swap failed: {e}")
-    })
+    match fs::rename(&staging, target) {
+        Ok(()) => Ok(()),
+        Err(_) => replace_with_backup_rename(&staging, target),
+    }
 }
 
-/// Extract the `repoharbor` executable bytes from a release `.tar.gz` archive.
+/// Extract the `repoharbor` (or `repoharbor.exe`) executable bytes from a release `.tar.gz` archive.
 pub fn extract_binary_from_tar_gz(archive_bytes: &[u8]) -> Result<Vec<u8>, String> {
     let gz = GzDecoder::new(archive_bytes);
     let mut tar = tar::Archive::new(gz);
@@ -399,7 +477,10 @@ pub fn extract_binary_from_tar_gz(archive_bytes: &[u8]) -> Result<Vec<u8>, Strin
         let mut entry = entry.map_err(|e| format!("tar entry error: {e}"))?;
         let path = entry.path().map_err(|e| e.to_string())?;
         if entry.header().entry_type().is_file()
-            && path.file_name().and_then(|n| n.to_str()) == Some("repoharbor")
+            && matches!(
+                path.file_name().and_then(|n| n.to_str()),
+                Some("repoharbor" | "repoharbor.exe")
+            )
         {
             let mut out = Vec::new();
             entry
@@ -419,6 +500,8 @@ pub async fn download_and_apply_release_update(
     release: &ReleaseInfo,
     kind: &InstallKind,
 ) -> Result<PathBuf, String> {
+    let expected_suffix = expected_tarball_suffix();
+    let default_tarball_name = format!("repoharbor-{expected_suffix}");
     let (target_path, asset_url, asset_name, is_tarball) = match kind {
         InstallKind::AppImage(path) => (
             path.clone(),
@@ -437,19 +520,22 @@ pub async fn download_and_apply_release_update(
             release
                 .tarball_url
                 .clone()
-                .ok_or("release has no Linux tarball asset")?,
+                .ok_or_else(|| format!("release has no {expected_suffix} asset"))?,
             release
                 .tarball_name
                 .clone()
-                .unwrap_or_else(|| "repoharbor-linux-x86_64.tar.gz".to_string()),
+                .unwrap_or_else(|| default_tarball_name.clone()),
             true,
         ),
         InstallKind::SourceCheckout { bin_path, .. } => {
+            let exe_name = format!("repoharbor{}", std::env::consts::EXE_SUFFIX);
             let user_bin = paths::user_bin_dir()
-                .map(|d| d.join("repoharbor"))
+                .map(|d| d.join(&exe_name))
                 .unwrap_or_else(|| bin_path.clone());
+            let bin_str = bin_path.to_string_lossy();
             let target = if bin_path.parent().is_some_and(dir_is_user_writable)
-                && !bin_path.to_string_lossy().contains("/target/")
+                && !bin_str.contains("/target/")
+                && !bin_str.contains(r"\target\")
             {
                 bin_path.clone()
             } else {
@@ -460,17 +546,14 @@ pub async fn download_and_apply_release_update(
                 release
                     .tarball_url
                     .clone()
-                    .ok_or("release has no Linux tarball asset")?,
-                release
-                    .tarball_name
-                    .clone()
-                    .unwrap_or_else(|| "repoharbor-linux-x86_64.tar.gz".to_string()),
+                    .ok_or_else(|| format!("release has no {expected_suffix} asset"))?,
+                release.tarball_name.clone().unwrap_or(default_tarball_name),
                 true,
             )
         }
         InstallKind::SystemPackage(_) => {
             return Err(
-                "system package installs (/usr/bin) require root — update with apt/dnf or install user binary"
+                "system package installs require administrator permissions — use the installer script or package manager"
                     .to_string(),
             );
         }
@@ -627,5 +710,78 @@ mod tests {
                 bin_path: exe,
             }
         );
+    }
+
+    #[test]
+    fn multi_os_asset_selection_and_windows_exe_extraction() {
+        assert_eq!(
+            expected_tarball_suffix_for("linux", "x86_64"),
+            "linux-x86_64.tar.gz"
+        );
+        assert_eq!(
+            expected_tarball_suffix_for("macos", "aarch64"),
+            "macos-aarch64.tar.gz"
+        );
+        assert_eq!(
+            expected_tarball_suffix_for("darwin", "arm64"),
+            "macos-aarch64.tar.gz"
+        );
+        assert_eq!(
+            expected_tarball_suffix_for("windows", "x86_64"),
+            "windows-x86_64.tar.gz"
+        );
+
+        let assets = vec![
+            GithubAssetJson {
+                name: "repoharbor-v2026.11.1-linux-x86_64.tar.gz".into(),
+                browser_download_url: "https://example.com/linux.tar.gz".into(),
+            },
+            GithubAssetJson {
+                name: "repoharbor-v2026.11.1-macos-aarch64.tar.gz".into(),
+                browser_download_url: "https://example.com/macos-arm64.tar.gz".into(),
+            },
+            GithubAssetJson {
+                name: "repoharbor-v2026.11.1-windows-x86_64.tar.gz".into(),
+                browser_download_url: "https://example.com/win.tar.gz".into(),
+            },
+        ];
+        assert_eq!(
+            select_platform_tarball_asset(&assets, "macos", "aarch64")
+                .map(|a| a.browser_download_url.as_str()),
+            Some("https://example.com/macos-arm64.tar.gz")
+        );
+        assert_eq!(
+            select_platform_tarball_asset(&assets, "windows", "x86_64")
+                .map(|a| a.browser_download_url.as_str()),
+            Some("https://example.com/win.tar.gz")
+        );
+
+        // Extract `repoharbor.exe` from a Windows release `.tar.gz`.
+        let mut gz_buf = Vec::new();
+        {
+            let encoder = GzEncoder::new(&mut gz_buf, Compression::default());
+            let mut builder = tar::Builder::new(encoder);
+            let data = b"MZ-windows-pe-binary";
+            let mut header = tar::Header::new_gnu();
+            header.set_size(data.len() as u64);
+            header.set_mode(0o755);
+            header.set_cksum();
+            builder
+                .append_data(&mut header, "repoharbor/repoharbor.exe", &data[..])
+                .unwrap();
+            builder.into_inner().unwrap().finish().unwrap();
+        }
+        let extracted = extract_binary_from_tar_gz(&gz_buf).unwrap();
+        assert_eq!(extracted, b"MZ-windows-pe-binary");
+
+        // Test Windows two-step backup rename (`repoharbor.exe` -> `repoharbor.old`).
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("repoharbor.exe");
+        let staging = dir.path().join(".repoharbor.exe.new");
+        fs::write(&target, b"old-exe").unwrap();
+        fs::write(&staging, b"new-exe").unwrap();
+        replace_with_backup_rename(&staging, &target).unwrap();
+        assert_eq!(fs::read(&target).unwrap(), b"new-exe");
+        assert!(!target.with_extension("old").exists());
     }
 }

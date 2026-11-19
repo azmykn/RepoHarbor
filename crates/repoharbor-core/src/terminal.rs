@@ -85,7 +85,7 @@ pub struct TerminalSession {
     exit_code: Arc<Mutex<Option<i32>>>,
 }
 
-/// Resolve the shell binary (`override_shell`, else `$SHELL`, else `/bin/bash` / `/bin/sh`).
+/// Resolve the shell binary (`override_shell`, else `$SHELL`, else platform default shell).
 pub fn resolve_shell(override_shell: &str) -> String {
     let custom = override_shell.trim();
     if !custom.is_empty() {
@@ -97,10 +97,25 @@ pub fn resolve_shell(override_shell: &str) -> String {
             return trimmed.to_string();
         }
     }
-    if std::path::Path::new("/bin/bash").exists() {
-        "/bin/bash".into()
-    } else {
-        "/bin/sh".into()
+    #[cfg(target_os = "windows")]
+    {
+        if which::which("pwsh").is_ok() {
+            return "pwsh.exe".into();
+        }
+        if which::which("powershell").is_ok() {
+            return "powershell.exe".into();
+        }
+        std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".into())
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        if cfg!(target_os = "macos") && std::path::Path::new("/bin/zsh").exists() {
+            "/bin/zsh".into()
+        } else if std::path::Path::new("/bin/bash").exists() {
+            "/bin/bash".into()
+        } else {
+            "/bin/sh".into()
+        }
     }
 }
 

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
 # install.sh — First-time installer, desktop integrator & periodic updater setup
-# for RepoHarbor on Linux.
+# for RepoHarbor on Linux and macOS.
 #
 # Usage:
 #   curl -fsSL https://raw.githubusercontent.com/azmykn/RepoHarbor/main/scripts/install.sh | bash
@@ -10,20 +10,41 @@
 #
 # Installs:
 #   - Binary:  ~/.local/bin/repoharbor (atomic swap — safe while running)
-#   - Desktop: ~/.local/share/applications/com.digitscode.repoharbor.desktop + hicolor icons
-#   - Meta:    ~/.local/share/repoharbor/install-meta.toml
-#   - Optional: ~/.config/autostart/com.digitscode.repoharbor.desktop (--autostart)
-#   - Optional: systemd user timer repoharbor-update.timer (--with-auto-update)
+#   - Desktop: ~/.local/share/applications/com.digitscode.repoharbor.desktop (Linux)
+#              ~/Applications/RepoHarbor.app (macOS)
+#   - Meta:    install-meta.toml in user data dir
+#   - Optional: autostart entry on login (--autostart)
+#   - Optional: systemd user timer repoharbor-update.timer on Linux (--with-auto-update)
 set -euo pipefail
 
 REPO_SLUG="azmykn/RepoHarbor"
 APP_ID="com.digitscode.repoharbor"
 BIN_DIR="${XDG_BIN_HOME:-$HOME/.local/bin}"
 BIN_DST="$BIN_DIR/repoharbor"
-DATA_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/repoharbor"
-CFG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/repoharbor"
+
+UNAME_S="$(uname -s)"
+UNAME_M="$(uname -m)"
+case "$UNAME_S" in
+  Darwin)
+    TARGET_OS="macos"
+    DATA_DIR="$HOME/Library/Application Support/repoharbor"
+    CFG_DIR="$HOME/Library/Application Support/repoharbor"
+    AUTOSTART_FILE="$HOME/Library/LaunchAgents/${APP_ID}.plist"
+    ;;
+  *)
+    TARGET_OS="linux"
+    DATA_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/repoharbor"
+    CFG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/repoharbor"
+    AUTOSTART_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/autostart/${APP_ID}.desktop"
+    ;;
+esac
+
+case "$UNAME_M" in
+  arm64|aarch64) TARGET_ARCH="aarch64" ;;
+  *)             TARGET_ARCH="x86_64" ;;
+esac
+
 SYSTEMD_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
-AUTOSTART_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/autostart"
 
 MODE="auto"
 AUTOSTART=0
@@ -68,17 +89,21 @@ do_uninstall() {
     systemctl --user disable --now repoharbor-update.timer >/dev/null 2>&1 || true
   fi
   rm -f "$SYSTEMD_DIR/repoharbor-update.timer" "$SYSTEMD_DIR/repoharbor-update.service"
-  rm -f "$AUTOSTART_DIR/${APP_ID}.desktop"
+  rm -f "$AUTOSTART_FILE"
   rm -f "$BIN_DST"
-  APP_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/applications"
-  ICON_BASE="${XDG_DATA_HOME:-$HOME/.local/share}/icons/hicolor"
-  rm -f "$APP_DIR/${APP_ID}.desktop" "$APP_DIR/repoharbor.desktop"
-  for size in 32x32 64x64 128x128 256x256 512x512 scalable; do
-    rm -f "$ICON_BASE/${size}/apps/repoharbor.png" \
-          "$ICON_BASE/${size}/apps/repoharbor.svg" \
-          "$ICON_BASE/${size}/apps/${APP_ID}.png" \
-          "$ICON_BASE/${size}/apps/${APP_ID}.svg"
-  done
+  if [[ "$TARGET_OS" == "macos" ]]; then
+    rm -rf "$HOME/Applications/RepoHarbor.app"
+  else
+    APP_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/applications"
+    ICON_BASE="${XDG_DATA_HOME:-$HOME/.local/share}/icons/hicolor"
+    rm -f "$APP_DIR/${APP_ID}.desktop" "$APP_DIR/repoharbor.desktop"
+    for size in 32x32 64x64 128x128 256x256 512x512 scalable; do
+      rm -f "$ICON_BASE/${size}/apps/repoharbor.png" \
+            "$ICON_BASE/${size}/apps/repoharbor.svg" \
+            "$ICON_BASE/${size}/apps/${APP_ID}.png" \
+            "$ICON_BASE/${size}/apps/${APP_ID}.svg"
+    done
+  fi
   rm -f "$DATA_DIR/install-meta.toml"
   if [[ "$PURGE" == "1" ]]; then
     rm -rf "$DATA_DIR" "$CFG_DIR"
@@ -109,7 +134,7 @@ write_meta() {
 }
 
 install_from_release() {
-  say "Checking latest GitHub Release ($REPO_SLUG)…"
+  say "Checking latest GitHub Release ($REPO_SLUG for ${TARGET_OS}-${TARGET_ARCH})…"
   local api_json
   api_json="$(curl -fsSL -H 'Accept: application/vnd.github+json' \
     "https://api.github.com/repos/${REPO_SLUG}/releases/latest" 2>/dev/null || true)"
@@ -117,7 +142,10 @@ install_from_release() {
     return 1
   fi
   local tar_url sums_url tag
-  tar_url="$(printf '%s' "$api_json" | grep -Eo '"browser_download_url":[[:space:]]*"[^"]+linux[^"]+\.tar\.gz"' | head -n1 | cut -d'"' -f4 || true)"
+  tar_url="$(printf '%s' "$api_json" | grep -Eo "\"browser_download_url\":[[:space:]]*\"[^\"]+${TARGET_OS}-${TARGET_ARCH}\.tar\.gz\"" | head -n1 | cut -d'"' -f4 || true)"
+  if [[ -z "$tar_url" ]]; then
+    tar_url="$(printf '%s' "$api_json" | grep -Eo "\"browser_download_url\":[[:space:]]*\"[^\"]+${TARGET_OS}[^\"]+\.tar\.gz\"" | head -n1 | cut -d'"' -f4 || true)"
+  fi
   sums_url="$(printf '%s' "$api_json" | grep -Eo '"browser_download_url":[[:space:]]*"[^"]+SHA256SUMS\.txt"' | head -n1 | cut -d'"' -f4 || true)"
   tag="$(printf '%s' "$api_json" | grep -Eo '"tag_name":[[:space:]]*"[^"]+"' | head -n1 | cut -d'"' -f4 || true)"
 
@@ -131,11 +159,16 @@ install_from_release() {
   say "Downloading $tar_name (${tag:-latest})…"
   curl -fL --progress-bar -o "$tmp/$tar_name" "$tar_url"
 
-  if [[ -n "$sums_url" ]] && have sha256sum; then
+  if [[ -n "$sums_url" ]]; then
     curl -fsSL -o "$tmp/SHA256SUMS.txt" "$sums_url" || true
     if grep -q "$tar_name" "$tmp/SHA256SUMS.txt" 2>/dev/null; then
-      (cd "$tmp" && grep "$tar_name" SHA256SUMS.txt | sha256sum -c -)
-      ok "SHA-256 checksum verified"
+      if have sha256sum; then
+        (cd "$tmp" && grep "$tar_name" SHA256SUMS.txt | sha256sum -c -)
+        ok "SHA-256 checksum verified"
+      elif have shasum; then
+        (cd "$tmp" && grep "$tar_name" SHA256SUMS.txt | sed 's/ \*/  /' | shasum -a 256 -c -)
+        ok "SHA-256 checksum verified"
+      fi
     fi
   fi
 
@@ -144,8 +177,13 @@ install_from_release() {
   unpacked_bin="$(find "$tmp" -type f -name repoharbor | head -n1)"
   [[ -n "$unpacked_bin" ]] || { echo "archive missing repoharbor binary" >&2; return 1; }
 
-  install -Dm755 "$unpacked_bin" "$BIN_DST.tmp"
+  mkdir -p "$BIN_DIR"
+  cp -f "$unpacked_bin" "$BIN_DST.tmp"
+  chmod 755 "$BIN_DST.tmp"
   mv -f "$BIN_DST.tmp" "$BIN_DST"
+  if [[ "$TARGET_OS" == "macos" ]] && have xattr; then
+    xattr -dr com.apple.quarantine "$BIN_DST" >/dev/null 2>&1 || true
+  fi
   ok "installed $BIN_DST"
 
   local ver="${tag#v}"
@@ -161,7 +199,6 @@ install_from_release() {
 
 install_from_source() {
   local work_repo="$REPO_ROOT"
-  local cleanup_tmp=""
   if [[ -z "$work_repo" ]]; then
     have git || { echo "git is required for --from-source" >&2; exit 1; }
     work_repo="$DATA_DIR/src"
@@ -175,7 +212,7 @@ install_from_source() {
   fi
 
   cd "$work_repo"
-  if ! have cargo || [[ ! -f "$HOME/.cargo/env" && ! -x "$(command -v cargo || true)" ]]; then
+  if [[ "$TARGET_OS" == "linux" ]] && { ! have cargo || [[ ! -f "$HOME/.cargo/env" && ! -x "$(command -v cargo || true)" ]]; }; then
     local setup_flags=()
     [[ "$ASSUME_YES" == "1" ]] && setup_flags+=(-y)
     bash scripts/setup.sh "${setup_flags[@]}"
@@ -185,7 +222,9 @@ install_from_source() {
   say "Building release binary (cargo build --release -p repoharbor)…"
   cargo build --release -p repoharbor
 
-  install -Dm755 "$work_repo/target/release/repoharbor" "$BIN_DST.tmp"
+  mkdir -p "$BIN_DIR"
+  cp -f "$work_repo/target/release/repoharbor" "$BIN_DST.tmp"
+  chmod 755 "$BIN_DST.tmp"
   mv -f "$BIN_DST.tmp" "$BIN_DST"
   ok "installed $BIN_DST cleanly (atomic swap)"
 
@@ -194,9 +233,9 @@ install_from_source() {
   write_meta "source" "$work_repo" "$ver"
 
   if [[ "$AUTOSTART" == "1" ]]; then
-    REPOHARBOR_BIN="$BIN_DST" bash "$work_repo/scripts/install-desktop.sh" --autostart
+    "$BIN_DST" install-desktop --autostart
   else
-    REPOHARBOR_BIN="$BIN_DST" bash "$work_repo/scripts/install-desktop.sh"
+    "$BIN_DST" install-desktop
   fi
 }
 

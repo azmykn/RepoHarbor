@@ -14,8 +14,8 @@ permissions:
   contents: write
 
 jobs:
-  release:
-    name: Build & release (Linux x86_64)
+  build-linux:
+    name: Build Linux (x86_64)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -78,7 +78,7 @@ jobs:
       - name: Build AppImage
         run: bash packaging/appimage.sh
 
-      - name: Collect artifacts
+      - name: Collect Linux artifacts
         run: |
           mkdir -p dist stage/repoharbor
           cp target/debian/*.deb dist/
@@ -92,8 +92,142 @@ jobs:
           TAG="${GITHUB_REF_NAME#v}"
           tar -czf "dist/repoharbor-v${TAG}-linux-x86_64.tar.gz" -C stage repoharbor
           rm -rf stage
-          (cd dist && sha256sum * > SHA256SUMS.txt)
           ls -la dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-linux-x86_64
+          path: dist/*
+          if-no-files-found: error
+
+  build-macos:
+    name: Build macOS (${{ matrix.arch }})
+    runs-on: macos-14
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: aarch64
+            target: aarch64-apple-darwin
+          - arch: x86_64
+            target: x86_64-apple-darwin
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@1.95.0
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: macos-${{ matrix.arch }}
+
+      - name: Build release binary (${{ matrix.target }})
+        run: cargo build --release -p repoharbor --target ${{ matrix.target }}
+
+      - name: Package macOS archive & .app bundle
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME#v}"
+          BIN="target/${{ matrix.target }}/release/repoharbor"
+          mkdir -p dist stage/repoharbor
+          cp "$BIN" stage/repoharbor/repoharbor
+          chmod 755 stage/repoharbor/repoharbor
+          cp -r packaging/icons stage/repoharbor/icons
+
+          # Create self-contained RepoHarbor.app bundle inside the archive too.
+          APP="stage/repoharbor/RepoHarbor.app/Contents"
+          mkdir -p "$APP/MacOS" "$APP/Resources"
+          cp "$BIN" "$APP/MacOS/repoharbor"
+          chmod 755 "$APP/MacOS/repoharbor"
+          cp packaging/icons/icon.png "$APP/Resources/icon.png"
+          cat > "$APP/Info.plist" <<EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>CFBundleName</key>
+            <string>RepoHarbor</string>
+            <key>CFBundleDisplayName</key>
+            <string>RepoHarbor</string>
+            <key>CFBundleIdentifier</key>
+            <string>com.digitscode.repoharbor</string>
+            <key>CFBundleVersion</key>
+            <string>${TAG}</string>
+            <key>CFBundleShortVersionString</key>
+            <string>${TAG}</string>
+            <key>CFBundlePackageType</key>
+            <string>APPL</string>
+            <key>CFBundleExecutable</key>
+            <string>repoharbor</string>
+            <key>CFBundleIconFile</key>
+            <string>icon.png</string>
+            <key>NSHighResolutionCapable</key>
+            <true/>
+          </dict>
+          </plist>
+          EOF
+
+          tar -czf "dist/repoharbor-v${TAG}-macos-${{ matrix.arch }}.tar.gz" -C stage repoharbor
+          rm -rf stage
+          ls -la dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-macos-${{ matrix.arch }}
+          path: dist/*
+          if-no-files-found: error
+
+  build-windows:
+    name: Build Windows (x86_64)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@1.95.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: windows-x86_64
+
+      - name: Build release binary
+        run: cargo build --release -p repoharbor
+
+      - name: Package Windows archives (.tar.gz & .zip)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $Tag = "${env:GITHUB_REF_NAME}" -replace '^v', ''
+          New-Item -ItemType Directory -Force -Path "dist", "stage\repoharbor" | Out-Null
+          Copy-Item "target\release\repoharbor.exe" "stage\repoharbor\repoharbor.exe"
+          Copy-Item "LICENSE", "NOTICE", "COPYRIGHT.md" "stage\repoharbor\"
+          Copy-Item "packaging\icons" "stage\repoharbor\icons" -Recurse
+          tar -czf "dist\repoharbor-v${Tag}-windows-x86_64.tar.gz" -C stage repoharbor
+          Compress-Archive -Path "stage\repoharbor\*" -DestinationPath "dist\repoharbor-v${Tag}-windows-x86_64.zip" -Force
+          Remove-Item -Recurse -Force stage
+          Get-ChildItem dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-windows-x86_64
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    name: Publish unified release (Linux, macOS, Windows)
+    needs: [build-linux, build-macos, build-windows]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all platform artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Generate unified SHA256SUMS.txt
+        run: |
+          cd dist
+          sha256sum * > SHA256SUMS.txt
+          cat SHA256SUMS.txt
 
       - name: Publish release
         uses: softprops/action-gh-release@v2
@@ -102,14 +236,18 @@ jobs:
           draft: ${{ github.event_name == 'workflow_dispatch' && inputs.draft == true }}
           generate_release_notes: true
           body: |
-            Linux builds of RepoHarbor (native GPUI). See the
-            [documentation](https://azmykn.github.io/RepoHarbor/) for setup.
+            Native GPUI builds of **RepoHarbor** for **Linux**, **macOS**, and **Windows** from the same unified codebase.
+            See the [documentation](https://azmykn.github.io/RepoHarbor/) for setup and usage.
 
-            - **Quick install / update (zero sudo):**
+            ### Quick Install / Update (Zero Sudo)
+
+            - **Linux & macOS:**
               ```sh
               curl -fsSL https://raw.githubusercontent.com/azmykn/RepoHarbor/main/scripts/install.sh | bash
               ```
-            - `.deb` — Debian/Ubuntu
-            - `.rpm` — Fedora/openSUSE
-            - `.AppImage` — portable (any distro, bundled `llama.cpp`)
-            - `.tar.gz` — standalone user binary + `SHA256SUMS.txt`
+            - **Windows (PowerShell):**
+              ```powershell
+              irm https://raw.githubusercontent.com/azmykn/RepoHarbor/main/scripts/install.ps1 | iex
+              ```
+            - **In-App & CLI Auto-Update (All Platforms):**
+              Click **`Update`** in the top header bar inside RepoHarbor, or run `repoharbor update` in your terminal.

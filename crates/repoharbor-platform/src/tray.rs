@@ -11,23 +11,32 @@
 //! recent-repos quick-open list and show/rescan/quit actions. While anything
 //! urgent is pending the item reports `NeedsAttention` and badges its glyph.
 
+#[cfg(target_os = "linux")]
 use std::sync::Arc;
+#[cfg(target_os = "linux")]
 use std::sync::OnceLock;
 
+#[cfg(target_os = "linux")]
 use ksni::blocking::{Handle, TrayMethods};
+#[cfg(target_os = "linux")]
 use ksni::menu::StandardItem;
+#[cfg(target_os = "linux")]
 use ksni::{Icon, MenuItem, ToolTip};
 
+#[cfg(target_os = "linux")]
 use repoharbor_core::{cache, config, launch};
 
 /// Cap on recent repos shown, to keep the menu compact.
+#[cfg(target_os = "linux")]
 const MAX_RECENT: usize = 5;
 
 // Monochrome symbolic glyphs (transparent background) so the icon reads like the
 // other symbolic icons in the panel. We can't hand the SNI host a themed name,
 // so we ship both tints and pick by the panel colour-scheme: a light glyph for
 // dark panels, a dark glyph for light ones.
+#[cfg(target_os = "linux")]
 const TRAY_LIGHT: &[u8] = include_bytes!("../assets/tray-light.png");
+#[cfg(target_os = "linux")]
 const TRAY_DARK: &[u8] = include_bytes!("../assets/tray-dark.png");
 
 /// A tray menu activation, handed to the app to act on.
@@ -59,11 +68,13 @@ pub struct TrayAttention {
 /// Lets the app update the live tray. `ksni` runs the tray on its own thread; an
 /// update is a short, synchronous round-trip to it. Clonable so the app entity
 /// and the live-signal task can each hold one.
+#[cfg(target_os = "linux")]
 #[derive(Clone)]
 pub struct TrayHandle {
     handle: Handle<Model>,
 }
 
+#[cfg(target_os = "linux")]
 impl TrayHandle {
     /// Replace the attention summary (menu top items, tooltip count, urgent
     /// icon state).
@@ -77,14 +88,27 @@ impl TrayHandle {
     }
 }
 
+/// Stub tray handle on non-Linux targets (macOS/Windows use native Dock/Taskbar).
+#[cfg(not(target_os = "linux"))]
+#[derive(Clone)]
+pub struct TrayHandle;
+
+#[cfg(not(target_os = "linux"))]
+impl TrayHandle {
+    pub fn set_attention(&self, _attention: TrayAttention) {}
+    pub fn set_panel_dark(&self, _dark: bool) {}
+}
+
 /// The SNI item model. `ksni` calls these methods to paint the icon + menu and
 /// to dispatch clicks (which we forward through `on_action`).
+#[cfg(target_os = "linux")]
 struct Model {
     attention: TrayAttention,
     panel_dark: bool,
     on_action: Arc<dyn Fn(TrayAction) + Send + Sync>,
 }
 
+#[cfg(target_os = "linux")]
 impl Model {
     fn fire(&self, action: TrayAction) {
         (self.on_action)(action);
@@ -94,6 +118,7 @@ impl Model {
 /// Decode a PNG glyph to an SNI pixmap (ARGB32, network byte order), cached on
 /// first use; the `urgent` variant gets a corner dot overlaid. Returns empty on
 /// any decode failure (the host then shows nothing rather than crashing).
+#[cfg(target_os = "linux")]
 fn glyph(panel_dark: bool, urgent: bool) -> Vec<Icon> {
     static LIGHT: OnceLock<Option<Icon>> = OnceLock::new();
     static DARK: OnceLock<Option<Icon>> = OnceLock::new();
@@ -117,6 +142,7 @@ fn glyph(panel_dark: bool, urgent: bool) -> Vec<Icon> {
 /// Overlay a filled dot in the glyph's bottom-right corner — the urgent badge.
 /// The tint is `--orr-behind` (#ff6b6b), the design system's danger role, so the
 /// tray matches the in-app urgent badges.
+#[cfg(target_os = "linux")]
 fn with_urgent_dot(mut icon: Icon) -> Icon {
     const DOT: (f32, f32, f32) = (255., 107., 107.);
     let (w, h) = (icon.width as f32, icon.height as f32);
@@ -145,6 +171,7 @@ fn with_urgent_dot(mut icon: Icon) -> Icon {
     icon
 }
 
+#[cfg(target_os = "linux")]
 fn decode_argb(png_bytes: &[u8]) -> Option<Icon> {
     let decoder = png::Decoder::new(std::io::Cursor::new(png_bytes));
     let mut reader = decoder.read_info().ok()?;
@@ -172,6 +199,7 @@ fn decode_argb(png_bytes: &[u8]) -> Option<Icon> {
 
 /// The most-recently-active repos (by last commit) as `(id, display_name)`, for
 /// the quick-open list. The id is the repo path — what the IDE launcher expects.
+#[cfg(target_os = "linux")]
 fn recent_repos() -> Vec<(String, String)> {
     let mut repos = cache::load_repos();
     repos.sort_by_key(|r| std::cmp::Reverse(r.last_commit_unix));
@@ -183,6 +211,7 @@ fn recent_repos() -> Vec<(String, String)> {
 }
 
 /// "needs" / "need" — the attention header + tooltip verb.
+#[cfg_attr(not(any(target_os = "linux", test)), allow(dead_code))]
 fn need(n: usize) -> &'static str {
     if n == 1 {
         "needs"
@@ -192,6 +221,7 @@ fn need(n: usize) -> &'static str {
 }
 
 /// One-line readout of the attention counts, or `None` when all clear.
+#[cfg_attr(not(any(target_os = "linux", test)), allow(dead_code))]
 fn attention_line(a: &TrayAttention) -> Option<String> {
     match (a.total, a.urgent) {
         (0, _) => None,
@@ -201,6 +231,7 @@ fn attention_line(a: &TrayAttention) -> Option<String> {
 }
 
 /// A non-interactive label row (header / attention line).
+#[cfg(target_os = "linux")]
 fn label(text: impl Into<String>) -> MenuItem<Model> {
     StandardItem {
         label: text.into(),
@@ -211,6 +242,7 @@ fn label(text: impl Into<String>) -> MenuItem<Model> {
 }
 
 /// An actionable row that fires `action` when clicked.
+#[cfg(target_os = "linux")]
 fn action_item(text: impl Into<String>, action: fn(&mut Model)) -> MenuItem<Model> {
     StandardItem {
         label: text.into(),
@@ -220,6 +252,7 @@ fn action_item(text: impl Into<String>, action: fn(&mut Model)) -> MenuItem<Mode
     .into()
 }
 
+#[cfg(target_os = "linux")]
 impl ksni::Tray for Model {
     fn id(&self) -> String {
         // Keep stable and short; some hosts also look up IconName via the
@@ -332,6 +365,7 @@ impl ksni::Tray for Model {
 /// invoked for every menu activation; `Open` is handled here so the caller only
 /// deals with app-level actions. Returns a [`TrayHandle`] for live updates, or
 /// `None` if the tray couldn't start (no SNI host, etc.).
+#[cfg(target_os = "linux")]
 pub fn spawn(on_action: impl Fn(TrayAction) + Send + Sync + 'static) -> Option<TrayHandle> {
     // Opening a repo needs no foreground hop — it just spawns a process — so
     // handle it here and forward the rest to the app.
@@ -351,6 +385,11 @@ pub fn spawn(on_action: impl Fn(TrayAction) + Send + Sync + 'static) -> Option<T
     // Degrade silently (like the rest of platform) if there's no SNI host.
     let handle = model.spawn().ok()?;
     Some(TrayHandle { handle })
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn spawn(_on_action: impl Fn(TrayAction) + Send + Sync + 'static) -> Option<TrayHandle> {
+    None
 }
 
 #[cfg(test)]
@@ -375,6 +414,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn urgent_dot_badges_the_corner_only() {
         // A fully transparent 16×16 glyph: after badging, the bottom-right

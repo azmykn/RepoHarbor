@@ -291,15 +291,18 @@ pub struct WorkspaceGroup {
 }
 
 /// True when `path` equals or is nested under any of `prefixes`
-/// (trailing `/` ignored; empty prefixes never match).
+/// (trailing `/` or `\` ignored; empty prefixes never match).
 pub fn path_under_prefixes(path: &str, prefixes: &[String]) -> bool {
     if prefixes.is_empty() {
         return false;
     }
-    let path = path.trim_end_matches('/');
+    let path = path.trim_end_matches(['/', '\\']);
     prefixes.iter().any(|p| {
-        let p = p.trim_end_matches('/');
-        !p.is_empty() && (path == p || path.starts_with(&format!("{p}/")))
+        let p = p.trim_end_matches(['/', '\\']);
+        !p.is_empty()
+            && (path == p
+                || path.starts_with(&format!("{p}/"))
+                || path.starts_with(&format!("{p}\\")))
     })
 }
 
@@ -385,6 +388,16 @@ pub struct AiEndpointConfig {
     pub api_key: String,
 }
 
+pub fn default_file_opener_command() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "open {path}"
+    } else if cfg!(target_os = "windows") {
+        "explorer {path}"
+    } else {
+        "xdg-open {path}"
+    }
+}
+
 pub fn default_diff_command() -> String {
     // Prefer a real folder diff tool, then an installed editor, then the file manager.
     if which::which("meld").is_ok() {
@@ -394,7 +407,7 @@ pub fn default_diff_command() -> String {
     } else if which::which("code").is_ok() {
         "code {path}".into()
     } else {
-        "xdg-open {path}".into()
+        default_file_opener_command().into()
     }
 }
 

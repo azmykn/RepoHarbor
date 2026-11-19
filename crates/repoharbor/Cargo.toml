@@ -25,9 +25,6 @@ repoharbor-platform = { path = "../repoharbor-platform" }
 # GPU-native UI toolkit. Pinned to the exact Zed rev that gpui-component tracks,
 # so both resolve to one gpui (git deps unify by url + rev). Not on crates.io.
 gpui = { git = "https://github.com/zed-industries/zed", rev = "1d217ee39d381ac101b7cf49d3d22451ac1093fe" }
-# Platform/window factory; features match gpui-component's so its components and
-# our window construction agree. A compositor feature is REQUIRED on Linux.
-gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "1d217ee39d381ac101b7cf49d3d22451ac1093fe", features = ["font-kit", "x11", "wayland", "runtime_shaders"] }
 # Component library: multiline input, markdown, switches/dropdowns/lists, etc.
 gpui-component = { git = "https://github.com/longbridge/gpui-component" }
 # SVG pack for gpui-component IconName (TitleBar window controls, Button icons).
@@ -61,6 +58,15 @@ urlencoding = "2"
 # Month-label date math for the contribution heatmap (core supplies the data).
 chrono = "0.4"
 image = { version = "0.25.10", default-features = false, features = ["png"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# Platform/window factory; features match gpui-component's so its components and
+# our window construction agree. A compositor feature is REQUIRED on Linux.
+gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "1d217ee39d381ac101b7cf49d3d22451ac1093fe", features = ["font-kit", "x11", "wayland", "runtime_shaders"] }
+
+[target.'cfg(not(target_os = "linux"))'.dependencies]
+# macOS (Metal/Cocoa) and Windows (DirectX/Win32) need no X11/Wayland compositor features.
+gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "1d217ee39d381ac101b7cf49d3d22451ac1093fe", features = ["font-kit", "runtime_shaders"] }
 
 [lints.rust]
 unsafe_code = "warn"

@@ -4,7 +4,11 @@ Install RepoHarbor in one command, grab a release package, or build from source.
 
 ## Quick install (recommended)
 
-Install into `~/.local/bin/repoharbor`, register the desktop icon & launcher, and enable background update checks with zero `sudo`:
+RepoHarbor runs natively on **Linux**, **macOS**, and **Windows** from the same unified Rust + GPUI codebase, and all three platforms receive updates together.
+
+### Linux & macOS
+
+Install into `~/.local/bin/repoharbor` and register the desktop launcher (`.desktop` on Linux, `~/Applications/RepoHarbor.app` on macOS) with zero `sudo`:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/azmykn/RepoHarbor/main/scripts/install.sh | bash
@@ -12,11 +16,21 @@ curl -fsSL https://raw.githubusercontent.com/azmykn/RepoHarbor/main/scripts/inst
 
 Optional flags:
 
-- `--from-source` — build the release binary from source (runs `scripts/setup.sh` first)
+- `--from-source` — build the release binary from source (runs `scripts/setup.sh` first on Linux)
 - `--autostart` — launch RepoHarbor automatically when you log in
-- `--with-auto-update` — enable a daily `systemd --user` update timer (`repoharbor-update.timer`)
+- `--with-auto-update` — enable a daily `systemd --user` update timer on Linux (`repoharbor-update.timer`)
 
-On first launch, RepoHarbor automatically scans common workspace folders (`~/odoo`, `~/Tools`, `~/dev`, `~/projects`, `~/work`) and surfaces a compact **First-run setup** bar to connect GitHub or pin the app to your Dash/taskbar.
+### Windows (PowerShell)
+
+Install into `%LOCALAPPDATA%\Programs\RepoHarbor\repoharbor.exe`, add it to your user `PATH`, and create a Start Menu shortcut:
+
+```powershell
+irm https://raw.githubusercontent.com/azmykn/RepoHarbor/main/scripts/install.ps1 | iex
+```
+
+Optional parameters (`scripts\install.ps1`): `-FromSource`, `-Autostart`, `-Uninstall`, `-Purge`.
+
+On first launch, RepoHarbor automatically scans common workspace folders (`~/odoo`, `~/Tools`, `~/dev`, `~/projects`, `~/work`) and surfaces a compact **First-run setup** bar to connect GitHub or pin the app to your desktop launcher.
 
 ## Periodic updates
 

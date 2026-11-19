@@ -250,14 +250,21 @@ crates/
 
 ## Building & Installation
 
-### Quick Install (Recommended)
+### Quick Install — Linux, macOS & Windows (Recommended)
+
+All three operating systems share the exact same Rust/GPUI codebase and receive periodic updates together from GitHub Releases:
 
 ```bash
-# Install prebuilt binary + desktop shortcut (zero sudo)
+# Linux & macOS (installs ~/.local/bin/repoharbor + desktop launcher / RepoHarbor.app)
 curl -fsSL https://raw.githubusercontent.com/azmykn/RepoHarbor/main/scripts/install.sh | bash
 
 # Or install locally from source with autostart + daily periodic update timer
 bash scripts/install.sh --from-source --autostart --with-auto-update
+```
+
+```powershell
+# Windows (PowerShell — installs to %LOCALAPPDATA%\Programs\RepoHarbor + Start Menu shortcut)
+irm https://raw.githubusercontent.com/azmykn/RepoHarbor/main/scripts/install.ps1 | iex
 ```
 
 ### Prerequisites (Building from Source)

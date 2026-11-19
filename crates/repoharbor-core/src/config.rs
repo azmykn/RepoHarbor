@@ -30,7 +30,7 @@ fn detect(candidates: &[&str], template: &str) -> Option<String> {
 fn detect_ide_command() -> String {
     detect(&["cursor", "code", "codium", "zed", "subl"], "{cmd} {path}")
         .or_else(|| detect(&["nvim", "vim"], "{cmd} {path}"))
-        .unwrap_or_else(|| "xdg-open {path}".to_string())
+        .unwrap_or_else(|| crate::model::default_file_opener_command().to_string())
 }
 
 /// Drop scan roots whose directory is gone (for example a renamed checkout).
@@ -48,7 +48,7 @@ pub fn heal_diff_command(cfg: &mut AppConfig) -> bool {
         .diff_command
         .split_whitespace()
         .next()
-        .is_some_and(|prog| prog == "xdg-open");
+        .is_some_and(|prog| matches!(prog, "xdg-open" | "open" | "explorer"));
     if !template_program_missing(&cfg.diff_command) && !weak {
         return false;
     }
@@ -100,11 +100,23 @@ const TERMINALS: &[&str] = &[
     "gnome-terminal",
     "xfce4-terminal",
     "xterm",
+    "wt",
 ];
 
 /// First terminal on PATH, if any.
 fn detect_terminal() -> Option<&'static str> {
     TERMINALS.iter().copied().find(|t| which::which(t).is_ok())
+}
+
+/// Default fallback terminal launcher when none of `TERMINALS` is on PATH.
+fn platform_fallback_terminal_command() -> String {
+    if cfg!(target_os = "macos") {
+        "open -a Terminal {path}".to_string()
+    } else if cfg!(target_os = "windows") {
+        "cmd /K cd /d {path}".to_string()
+    } else {
+        "xdg-terminal-exec".to_string()
+    }
 }
 
 /// Open `term` at `{path}` with a normal interactive shell (no agent argv).
@@ -116,10 +128,12 @@ fn terminal_shell_command(term: Option<&str>) -> String {
         // Ptyxis (GNOME's current terminal): `-d` sets cwd; no `--` command → shell.
         Some("ptyxis") => "ptyxis --new-window -d {path}".to_string(),
         Some("xfce4-terminal") => "xfce4-terminal --working-directory={path}".to_string(),
+        // Windows Terminal (`wt.exe`): `-d` sets the starting directory.
+        Some("wt") => "wt -d {path}".to_string(),
         // `spawn` sets `current_dir`, so bare xterm lands in the repo.
         Some("xterm") => "xterm".to_string(),
         Some(t) => format!("{t} --working-directory {{path}}"),
-        None => "xdg-terminal-exec".to_string(),
+        None => platform_fallback_terminal_command(),
     }
 }
 
@@ -136,8 +150,13 @@ pub fn detect_agent_command() -> String {
 pub fn agent_command_is_shell_only(cmd: &str) -> bool {
     let tokens: Vec<&str> = cmd
         .split_whitespace()
-        .filter(|tok| !tok.starts_with('-') && !tok.contains('{'))
-        .map(|tok| tok.rsplit('/').next().unwrap_or(tok))
+        .filter(|tok| !tok.starts_with('-') && !tok.starts_with('/') && !tok.contains('{'))
+        .map(|tok| tok.rsplit(['/', '\\']).next().unwrap_or(tok))
+        .map(|tok| {
+            tok.strip_suffix(".exe")
+                .or_else(|| tok.strip_suffix(".EXE"))
+                .unwrap_or(tok)
+        })
         .collect();
     if tokens.is_empty() {
         return true;
@@ -159,6 +178,13 @@ pub fn agent_command_is_shell_only(cmd: &str) -> bool {
         "ghostty",
         "ptyxis",
         "xdg-terminal-exec",
+        "open",
+        "Terminal",
+        "wt",
+        "cmd",
+        "cd",
+        "powershell",
+        "pwsh",
         "start",
     ];
     !tokens.iter().any(|b| !SKIP.contains(b))
@@ -339,7 +365,7 @@ pub fn detect_candidate_roots() -> Vec<String> {
 
 /// Trailing-slash–insensitive path equality for pull-only lists.
 fn same_pull_only_path(a: &str, b: &str) -> bool {
-    a.trim_end_matches('/') == b.trim_end_matches('/')
+    a.trim_end_matches(['/', '\\']) == b.trim_end_matches(['/', '\\'])
 }
 
 /// True when `path` is listed in `pull_only_opt_out` (user removed it).
@@ -351,7 +377,7 @@ fn pull_only_path_opted_out(cfg: &AppConfig, path: &str) -> bool {
 
 /// Record an explicit Settings removal so heal/seed will not re-append `path`.
 pub fn note_pull_only_opt_out(cfg: &mut AppConfig, path: &str) {
-    let path = path.trim_end_matches('/');
+    let path = path.trim_end_matches(['/', '\\']);
     if path.is_empty() || pull_only_path_opted_out(cfg, path) {
         return;
     }
@@ -536,7 +562,10 @@ pub fn is_autostart_enabled() -> bool {
     is_autostart_enabled_at(paths::autostart_desktop_path().as_deref())
 }
 
-/// Enable or disable XDG desktop autostart at `path` pointing `Exec=` to `exec_cmd`.
+/// Enable or disable desktop autostart at `path` pointing to `exec_cmd`.
+/// Writes a macOS LaunchAgent `.plist` when `path` ends with `.plist`,
+/// a Windows Startup `.cmd` script when `path` ends with `.cmd` / `.bat`,
+/// or a Linux XDG `.desktop` entry otherwise.
 pub fn set_autostart_enabled_at(
     path: Option<&std::path::Path>,
     enabled: bool,
@@ -552,19 +581,49 @@ pub fn set_autostart_enabled_at(
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
-    let escaped_exec = exec_cmd.replace(' ', "\\ ");
-    let entry = format!(
-        "[Desktop Entry]\n\
-         Type=Application\n\
-         Name=RepoHarbor\n\
-         Comment=every repo at harbor — git fleet command center\n\
-         Exec={escaped_exec}\n\
-         Icon=repoharbor\n\
-         Terminal=false\n\
-         Categories=Development;RevisionControl;\n\
-         StartupWMClass=com.digitscode.repoharbor\n\
-         X-GNOME-Autostart-enabled=true\n"
-    );
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let entry = if ext == "plist" {
+        let escaped = exec_cmd
+            .replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;");
+        format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+             <!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n\
+             <plist version=\"1.0\">\n\
+             <dict>\n\
+               <key>Label</key>\n\
+               <string>com.digitscode.repoharbor</string>\n\
+               <key>ProgramArguments</key>\n\
+               <array>\n\
+                 <string>{escaped}</string>\n\
+               </array>\n\
+               <key>RunAtLoad</key>\n\
+               <true/>\n\
+             </dict>\n\
+             </plist>\n"
+        )
+    } else if ext == "cmd" || ext == "bat" {
+        format!("@echo off\r\nstart \"\" \"{exec_cmd}\"\r\n")
+    } else {
+        let escaped_exec = exec_cmd.replace(' ', "\\ ");
+        format!(
+            "[Desktop Entry]\n\
+             Type=Application\n\
+             Name=RepoHarbor\n\
+             Comment=every repo at harbor — git fleet command center\n\
+             Exec={escaped_exec}\n\
+             Icon=repoharbor\n\
+             Terminal=false\n\
+             Categories=Development;RevisionControl;\n\
+             StartupWMClass=com.digitscode.repoharbor\n\
+             X-GNOME-Autostart-enabled=true\n"
+        )
+    };
     fs::write(path, entry).map_err(|e| e.to_string())
 }
 
@@ -765,11 +824,11 @@ mod tests {
     #[test]
     fn heal_replaces_xdg_open_diff_when_editor_exists() {
         let mut cfg = AppConfig {
-            diff_command: "xdg-open {path}".into(),
+            diff_command: crate::model::default_file_opener_command().into(),
             ..AppConfig::default()
         };
         let better = crate::model::default_diff_command();
-        if better == "xdg-open {path}" {
+        if better == crate::model::default_file_opener_command() {
             assert!(!heal_diff_command(&mut cfg));
         } else {
             assert!(heal_diff_command(&mut cfg));
@@ -792,7 +851,7 @@ mod tests {
         );
         assert!(cfg.ide_command.contains("{path}"));
         if template_program_missing(&cfg.ide_command) {
-            assert_eq!(cfg.ide_command, "xdg-open {path}");
+            assert_eq!(cfg.ide_command, crate::model::default_file_opener_command());
         }
         assert!(!heal_ide_command(&mut cfg));
     }
@@ -815,10 +874,10 @@ mod tests {
         // `xdg-terminal-exec`. The fallback string is still a successful heal;
         // requiring it on PATH made CI fail while desktops stayed green.
         if template_program_missing(&cfg.agent_command) {
+            let fallback = platform_fallback_terminal_command();
             assert!(
-                cfg.agent_command == "xdg-terminal-exec"
-                    || cfg.agent_command.starts_with("xdg-terminal-exec "),
-                "PATH-less fallback should be xdg-terminal-exec, got {}",
+                cfg.agent_command == fallback || cfg.agent_command.starts_with(&fallback),
+                "PATH-less fallback should be {fallback}, got {}",
                 cfg.agent_command
             );
         }
@@ -906,5 +965,25 @@ mod tests {
 
         set_autostart_enabled_at(Some(&entry), false, "/home/test/.local/bin/repoharbor").unwrap();
         assert!(!is_autostart_enabled_at(Some(&entry)));
+
+        // macOS LaunchAgent plist format
+        let plist = dir
+            .path()
+            .join("LaunchAgents/com.digitscode.repoharbor.plist");
+        set_autostart_enabled_at(Some(&plist), true, "/Users/test/.local/bin/repoharbor").unwrap();
+        let plist_text = fs::read_to_string(&plist).unwrap();
+        assert!(plist_text.contains("<string>com.digitscode.repoharbor</string>"));
+        assert!(plist_text.contains("<string>/Users/test/.local/bin/repoharbor</string>"));
+
+        // Windows Startup cmd format
+        let cmd_entry = dir.path().join("Startup/RepoHarbor.cmd");
+        set_autostart_enabled_at(
+            Some(&cmd_entry),
+            true,
+            r"C:\Users\test\AppData\Local\Programs\RepoHarbor\repoharbor.exe",
+        )
+        .unwrap();
+        let cmd_text = fs::read_to_string(&cmd_entry).unwrap();
+        assert!(cmd_text.contains("repoharbor.exe"));
     }
 }

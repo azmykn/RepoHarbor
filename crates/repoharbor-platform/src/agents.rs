@@ -17,12 +17,16 @@ pub struct RunningAgent {
     pub started_unix: i64,
 }
 
-/// Last path segment of `s` (the program basename).
+/// Last path segment of `s` (the program basename), stripping `.exe` on Windows.
 fn basename(s: &str) -> &str {
-    s.rsplit('/').next().unwrap_or(s)
+    let seg = s.rsplit(['/', '\\']).next().unwrap_or(s);
+    seg.strip_suffix(".exe")
+        .or_else(|| seg.strip_suffix(".EXE"))
+        .unwrap_or(seg)
 }
 
 /// Boot time in unix seconds, from `/proc/stat`'s `btime` line.
+#[cfg(target_os = "linux")]
 fn boot_time() -> i64 {
     std::fs::read_to_string("/proc/stat")
         .ok()
@@ -34,6 +38,7 @@ fn boot_time() -> i64 {
 }
 
 /// Process start time in unix seconds, from `/proc/<pid>/stat` field 22.
+#[cfg(target_os = "linux")]
 fn start_time(pid: u32, btime: i64) -> i64 {
     // Clock ticks per second; 100 on effectively all Linux configs.
     const HZ: i64 = 100;
@@ -51,6 +56,7 @@ fn start_time(pid: u32, btime: i64) -> i64 {
 /// line is malformed. `comm` (field 2, parenthesized) can itself contain spaces
 /// and parens, so we anchor on the *last* ')' and count from there: starttime is
 /// the 20th whitespace-separated field after it (index 19).
+#[cfg_attr(not(any(target_os = "linux", test)), allow(dead_code))]
 fn starttime_ticks(stat: &str) -> Option<i64> {
     let rparen = stat.rfind(')')?;
     stat[rparen + 1..]
@@ -61,6 +67,7 @@ fn starttime_ticks(stat: &str) -> Option<i64> {
 
 /// Scan running processes for agent sessions inside `repos`. `programs` is the
 /// set of agent CLI basenames to match (e.g. `claude`, `aider`).
+#[cfg(target_os = "linux")]
 pub fn detect(repos: &[String], programs: &[String]) -> Vec<RunningAgent> {
     let mut out = Vec::new();
     let Ok(dir) = std::fs::read_dir("/proc") else {
@@ -115,10 +122,82 @@ pub fn detect(repos: &[String], programs: &[String]) -> Vec<RunningAgent> {
     out
 }
 
-/// Send SIGTERM to a process. Best-effort via the `kill` binary (no extra deps).
+#[cfg(target_os = "macos")]
+pub fn detect(repos: &[String], programs: &[String]) -> Vec<RunningAgent> {
+    let mut out = Vec::new();
+    let Ok(ps_out) = std::process::Command::new("ps")
+        .args(["-eo", "pid=,command="])
+        .output()
+    else {
+        return out;
+    };
+    let text = String::from_utf8_lossy(&ps_out.stdout);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+
+    for line in text.lines() {
+        let trimmed = line.trim();
+        let Some((pid_str, cmd_str)) = trimmed.split_once(char::is_whitespace) else {
+            continue;
+        };
+        let Ok(pid) = pid_str.trim().parse::<u32>() else {
+            continue;
+        };
+        let cmd_str = cmd_str.trim();
+        let argv0 = cmd_str.split_whitespace().next().unwrap_or("");
+        if !programs.iter().any(|p| basename(argv0) == p.as_str()) {
+            continue;
+        }
+        let Ok(lsof_out) = std::process::Command::new("lsof")
+            .args(["-a", "-p", &pid.to_string(), "-d", "cwd", "-Fn"])
+            .output()
+        else {
+            continue;
+        };
+        let lsof_text = String::from_utf8_lossy(&lsof_out.stdout);
+        let Some(cwd_str) = lsof_text.lines().find_map(|l| l.strip_prefix('n')) else {
+            continue;
+        };
+        let cwd = Path::new(cwd_str);
+        let Some(repo) = repos.iter().find(|r| {
+            let r = Path::new(r);
+            cwd == r || cwd.starts_with(r)
+        }) else {
+            continue;
+        };
+        out.push(RunningAgent {
+            pid,
+            repo: repo.clone(),
+            command: cmd_str.to_string(),
+            started_unix: now,
+        });
+    }
+    out
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub fn detect(_repos: &[String], _programs: &[String]) -> Vec<RunningAgent> {
+    let _ = Path::new("");
+    let _ = basename("");
+    Vec::new()
+}
+
+/// Send SIGTERM to a process (or `taskkill` on Windows).
+#[cfg(not(target_os = "windows"))]
 pub fn terminate(pid: u32) -> bool {
     std::process::Command::new("kill")
         .arg(pid.to_string())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+#[cfg(target_os = "windows")]
+pub fn terminate(pid: u32) -> bool {
+    std::process::Command::new("taskkill")
+        .args(["/PID", &pid.to_string(), "/T", "/F"])
         .status()
         .map(|s| s.success())
         .unwrap_or(false)

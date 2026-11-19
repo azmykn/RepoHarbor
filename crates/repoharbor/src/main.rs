@@ -147,12 +147,28 @@ fn cli_update(args: &[String]) -> i32 {
             eprintln!("git pull --ff-only failed in {}", repo_dir.display());
             return 1;
         }
-        let installer = repo_dir.join("scripts/install.sh");
-        let build_ok = std::process::Command::new("bash")
-            .args([installer.to_string_lossy().as_ref(), "--from-source"])
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
+        let build_ok = if cfg!(target_os = "windows") {
+            let installer = repo_dir.join("scripts").join("install.ps1");
+            std::process::Command::new("powershell")
+                .args([
+                    "-NoProfile",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-File",
+                    installer.to_string_lossy().as_ref(),
+                    "-FromSource",
+                ])
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false)
+        } else {
+            let installer = repo_dir.join("scripts/install.sh");
+            std::process::Command::new("bash")
+                .args([installer.to_string_lossy().as_ref(), "--from-source"])
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false)
+        };
         if build_ok {
             println!("RepoHarbor updated from source.");
             return 0;
@@ -206,15 +222,13 @@ fn cli_update(args: &[String]) -> i32 {
             match rt.block_on(download_and_apply_release_update(&release, &kind)) {
                 Ok(dest) => {
                     println!("Updated {} to {}.", dest.display(), release.tag_name);
-                    let _ = std::process::Command::new("notify-send")
-                        .args([
-                            "RepoHarbor Updated",
-                            &format!(
-                                "Updated to {} — relaunch to use the new build.",
-                                release.tag_name
-                            ),
-                        ])
-                        .output();
+                    let _ = rt.block_on(repoharbor_platform::notify::send(
+                        "RepoHarbor Updated",
+                        &format!(
+                            "Updated to {} — relaunch to use the new build.",
+                            release.tag_name
+                        ),
+                    ));
                     0
                 }
                 Err(e) => {

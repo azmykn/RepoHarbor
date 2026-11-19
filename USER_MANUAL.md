@@ -21,11 +21,18 @@
 
 ## 1. Installation & First Launch
 
-### Recommended One-Command Install (Zero `sudo`)
+### Recommended One-Command Install (Linux, macOS & Windows)
+
+All three platforms run from the same unified Rust/GPUI codebase and receive synchronized updates via GitHub Releases:
 
 ```bash
-# Install latest GitHub Release into ~/.local/bin/repoharbor + desktop icon
+# Linux & macOS — installs ~/.local/bin/repoharbor + .desktop icon / ~/Applications/RepoHarbor.app
 curl -fsSL https://raw.githubusercontent.com/azmykn/RepoHarbor/main/scripts/install.sh | bash
+```
+
+```powershell
+# Windows (PowerShell) — installs %LOCALAPPDATA%\Programs\RepoHarbor\repoharbor.exe + Start Menu shortcut
+irm https://raw.githubusercontent.com/azmykn/RepoHarbor/main/scripts/install.ps1 | iex
 ```
 
 Optional installer flags:

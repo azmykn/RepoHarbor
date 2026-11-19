@@ -10,11 +10,16 @@
 //! means fewer fields are populated. This module has no UI and no Tauri — the
 //! Tauri app wraps it in a command + event; the GPUI app reads it directly.
 
-use futures_util::StreamExt;
 use serde::Serialize;
+
+#[cfg(target_os = "linux")]
+use futures_util::StreamExt;
+#[cfg(target_os = "linux")]
 use zbus::zvariant::Value;
+#[cfg(target_os = "linux")]
 use zbus::Connection;
 
+#[cfg(target_os = "linux")]
 const APPEARANCE_NS: &str = "org.freedesktop.appearance";
 
 /// An 8-bit sRGB colour.
@@ -43,6 +48,7 @@ pub struct Appearance {
 
 // The freedesktop Settings portal. `ReadOne` returns the setting value as a
 // variant; `SettingChanged` fires whenever any namespaced setting changes.
+#[cfg(target_os = "linux")]
 #[zbus::proxy(
     interface = "org.freedesktop.portal.Settings",
     default_service = "org.freedesktop.portal.Desktop",
@@ -61,6 +67,7 @@ trait Settings {
 }
 
 /// Parse the portal `accent-color` struct of three doubles in `[0, 1]`.
+#[cfg(target_os = "linux")]
 fn portal_accent(value: &zbus::zvariant::OwnedValue) -> Option<Rgb> {
     if let Value::Structure(s) = &**value {
         let fields = s.fields();
@@ -107,6 +114,7 @@ fn parse_rgb_triplet(s: &str) -> Option<Rgb> {
 }
 
 /// Read window/view/text/accent colours from `~/.config/kdeglobals`.
+#[cfg(target_os = "linux")]
 fn read_kdeglobals() -> KdeColors {
     let base = std::env::var_os("XDG_CONFIG_HOME")
         .map(std::path::PathBuf::from)
@@ -122,6 +130,7 @@ fn read_kdeglobals() -> KdeColors {
 
 /// Parse the relevant colour keys out of a kdeglobals INI body. Pure (no I/O),
 /// so it's unit-testable; `read_kdeglobals` supplies the file contents.
+#[cfg_attr(not(any(target_os = "linux", test)), allow(dead_code))]
 fn parse_kdeglobals(content: &str) -> KdeColors {
     let mut out = KdeColors::default();
     let mut section = String::new();
@@ -146,6 +155,7 @@ fn parse_kdeglobals(content: &str) -> KdeColors {
     out
 }
 
+#[cfg(target_os = "linux")]
 async fn read_appearance(proxy: &SettingsProxy<'_>) -> Appearance {
     let color_scheme = match proxy.read_one(APPEARANCE_NS, "color-scheme").await {
         Ok(v) => match &*v {
@@ -178,6 +188,7 @@ async fn read_appearance(proxy: &SettingsProxy<'_>) -> Appearance {
 /// The portal-less degrade path: colours from `kdeglobals` alone. Without the
 /// portal there's no colour-scheme preference to read, but accent/window/view
 /// colours can still be recovered.
+#[cfg(target_os = "linux")]
 fn kdeglobals_appearance() -> Appearance {
     let kde = read_kdeglobals();
     Appearance {
@@ -190,6 +201,7 @@ fn kdeglobals_appearance() -> Appearance {
 }
 
 /// One-shot async read of the current desktop appearance.
+#[cfg(target_os = "linux")]
 pub async fn read() -> Appearance {
     // No session bus or no Settings portal on it — still try kdeglobals so
     // colours work without the portal. (Individual portal reads failing is
@@ -203,8 +215,15 @@ pub async fn read() -> Appearance {
     read_appearance(&proxy).await
 }
 
+/// One-shot async read of the current desktop appearance (macOS / Windows).
+#[cfg(not(target_os = "linux"))]
+pub async fn read() -> Appearance {
+    read_blocking()
+}
+
 /// Blocking convenience for synchronous callers (e.g. app startup): drives
 /// [`read`] to completion on a throwaway current-thread runtime.
+#[cfg(target_os = "linux")]
 pub fn read_blocking() -> Appearance {
     match tokio::runtime::Builder::new_current_thread().build() {
         Ok(rt) => rt.block_on(read()),
@@ -213,10 +232,65 @@ pub fn read_blocking() -> Appearance {
     }
 }
 
+/// Read appearance synchronously on macOS via `defaults read -g AppleInterfaceStyle`.
+#[cfg(target_os = "macos")]
+pub fn read_blocking() -> Appearance {
+    let is_dark = std::process::Command::new("defaults")
+        .args(["read", "-g", "AppleInterfaceStyle"])
+        .output()
+        .ok()
+        .is_some_and(|o| {
+            o.status.success()
+                && String::from_utf8_lossy(&o.stdout)
+                    .trim()
+                    .eq_ignore_ascii_case("dark")
+        });
+    Appearance {
+        color_scheme: Some(if is_dark { "dark" } else { "light" }.to_string()),
+        ..Appearance::default()
+    }
+}
+
+/// Read appearance synchronously on Windows via the Personalize registry key.
+#[cfg(target_os = "windows")]
+pub fn read_blocking() -> Appearance {
+    let color_scheme = std::process::Command::new("reg")
+        .args([
+            "query",
+            r"HKCU\SOFTWARE\Microsoft\Windows\CurrentVersion\Themes\Personalize",
+            "/v",
+            "AppsUseLightTheme",
+        ])
+        .output()
+        .ok()
+        .and_then(|o| {
+            if !o.status.success() {
+                return None;
+            }
+            let text = String::from_utf8_lossy(&o.stdout);
+            if text.contains("0x0") {
+                Some("dark".to_string())
+            } else if text.contains("0x1") {
+                Some("light".to_string())
+            } else {
+                None
+            }
+        });
+    Appearance {
+        color_scheme,
+        ..Appearance::default()
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+pub fn read_blocking() -> Appearance {
+    Appearance::default()
+}
+
 /// Spawn a background thread that calls `on_change` with the current appearance
 /// immediately and again on every desktop theme/accent change. No-ops (and the
-/// thread exits) if the portal is unavailable. UI-agnostic: the Tauri app emits
-/// an event from the callback; the native app updates its theme.
+/// thread exits) if the portal is unavailable.
+#[cfg(target_os = "linux")]
 pub fn watch(on_change: impl Fn(Appearance) + Send + 'static) {
     std::thread::spawn(move || {
         let Ok(rt) = tokio::runtime::Builder::new_current_thread().build() else {
@@ -243,6 +317,13 @@ pub fn watch(on_change: impl Fn(Appearance) + Send + 'static) {
                 on_change(read_appearance(&proxy).await);
             }
         });
+    });
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn watch(on_change: impl Fn(Appearance) + Send + 'static) {
+    std::thread::spawn(move || {
+        on_change(read_blocking());
     });
 }
 

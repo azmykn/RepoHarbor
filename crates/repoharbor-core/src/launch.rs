@@ -61,11 +61,36 @@ pub fn launch(template: &str, path: &str) -> Result<(), String> {
     spawn(template, path).map(|_| ())
 }
 
-/// Open a folder path or URL in the system default handler (xdg-open), detached.
+/// Open a folder path or URL in the system default handler (`xdg-open` on Linux,
+/// `open` on macOS, `cmd /C start` / `explorer` on Windows), detached.
 pub fn open(target: &str) -> Result<(), String> {
-    Command::new("xdg-open")
-        .arg(target)
-        .stdin(Stdio::null())
+    #[cfg(target_os = "macos")]
+    let mut cmd = {
+        let mut c = Command::new("open");
+        c.arg(target);
+        c
+    };
+    #[cfg(target_os = "windows")]
+    let mut cmd = {
+        let is_url = target.starts_with("http://") || target.starts_with("https://");
+        if is_url {
+            let mut c = Command::new("cmd");
+            c.args(["/C", "start", "", target]);
+            c
+        } else {
+            let mut c = Command::new("explorer");
+            c.arg(target);
+            c
+        }
+    };
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    let mut cmd = {
+        let mut c = Command::new("xdg-open");
+        c.arg(target);
+        c
+    };
+
+    cmd.stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
@@ -74,8 +99,8 @@ pub fn open(target: &str) -> Result<(), String> {
 }
 
 /// Open the folder containing `path` in the system file manager.
-/// If `path` is an existing file, first attempts to highlight/select it via D-Bus
-/// `org.freedesktop.FileManager1.ShowItems`. Falls back to `open` on the parent directory.
+/// If `path` is an existing file, reveals/selects it in Finder (`open -R`),
+/// Explorer (`explorer /select,`), or D-Bus `org.freedesktop.FileManager1.ShowItems`.
 pub fn open_location(path: &str) -> Result<(), String> {
     let p = std::path::Path::new(path);
     if p.is_dir() {
@@ -92,24 +117,56 @@ pub fn open_location(path: &str) -> Result<(), String> {
         } else {
             p.to_path_buf()
         };
-        let uri = format!("file://{}", abs.to_string_lossy());
-        let res = Command::new("dbus-send")
-            .args([
-                "--session",
-                "--dest=org.freedesktop.FileManager1",
-                "--type=method_call",
-                "/org/freedesktop/FileManager1",
-                "org.freedesktop.FileManager1.ShowItems",
-                &format!("array:string:{uri}"),
-                "string:",
-            ])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
-        if let Ok(status) = res {
-            if status.success() {
+
+        #[cfg(target_os = "macos")]
+        {
+            if Command::new("open")
+                .args(["-R", &abs.to_string_lossy()])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .is_ok()
+            {
                 return Ok(());
+            }
+        }
+
+        #[cfg(target_os = "windows")]
+        {
+            if Command::new("explorer")
+                .arg(format!("/select,{}", abs.to_string_lossy()))
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .is_ok()
+            {
+                return Ok(());
+            }
+        }
+
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+        {
+            let uri = format!("file://{}", abs.to_string_lossy());
+            let res = Command::new("dbus-send")
+                .args([
+                    "--session",
+                    "--dest=org.freedesktop.FileManager1",
+                    "--type=method_call",
+                    "/org/freedesktop/FileManager1",
+                    "org.freedesktop.FileManager1.ShowItems",
+                    &format!("array:string:{uri}"),
+                    "string:",
+                ])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+            if let Ok(status) = res {
+                if status.success() {
+                    return Ok(());
+                }
             }
         }
     }

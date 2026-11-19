@@ -9,16 +9,23 @@
 //! same D-Bus surface, but driven on its own thread + runtime (mirroring
 //! `appearance::watch` / `notifier::watch`) instead of Tauri's async runtime.
 
+#[cfg(target_os = "linux")]
 use std::collections::HashMap;
 
+#[cfg(target_os = "linux")]
 use repoharbor_core::{cache, config, launch};
+#[cfg(target_os = "linux")]
 use zbus::zvariant::OwnedValue;
 
+#[cfg(target_os = "linux")]
 const BUS_NAME: &str = "com.digitscode.repoharbor.krunner";
+#[cfg(target_os = "linux")]
 const OBJECT_PATH: &str = "/krunner";
 
+#[cfg(target_os = "linux")]
 struct Runner;
 
+#[cfg(target_os = "linux")]
 #[zbus::interface(name = "org.kde.krunner1")]
 impl Runner {
     /// Returns matches as `(id, text, iconName, type, relevance, properties)`.
@@ -80,6 +87,7 @@ impl Runner {
 
 /// Write the KRunner dbusplugin descriptor so the launcher discovers our service.
 /// Best-effort and idempotent (skips if already present).
+#[cfg(target_os = "linux")]
 fn ensure_plugin_file() {
     let Some(dir) = dirs::data_dir().map(|d| d.join("krunner").join("dbusplugins")) else {
         return;
@@ -99,6 +107,7 @@ fn ensure_plugin_file() {
     );
 }
 
+#[cfg(target_os = "linux")]
 async fn serve() -> zbus::Result<()> {
     // Holding the connection in scope keeps the bus name owned and the service
     // registered; zbus drives method dispatch on its own internal executor.
@@ -115,6 +124,7 @@ async fn serve() -> zbus::Result<()> {
 /// (the thread exits) when there's no session bus or the service can't be
 /// registered — KRunner search is then simply unavailable, like every other
 /// platform integration.
+#[cfg(target_os = "linux")]
 pub fn spawn() {
     ensure_plugin_file();
     std::thread::spawn(|| {
@@ -126,3 +136,7 @@ pub fn spawn() {
         }
     });
 }
+
+/// No-op on non-Linux desktops (KRunner is KDE Plasma / D-Bus specific).
+#[cfg(not(target_os = "linux"))]
+pub fn spawn() {}
