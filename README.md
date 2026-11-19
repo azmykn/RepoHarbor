@@ -8,7 +8,7 @@
 
 A high-performance desktop dashboard built with **GPUI** (GPU-accelerated, zero webview, zero Tauri) for developers managing dozens or hundreds of repositories, nested submodule hierarchies, and multi-version workspace trees.
 
-[![Version](https://img.shields.io/badge/version-2026.10.14-blue.svg)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-2026.11.1-blue.svg)](CHANGELOG.md)
 [![Rust](https://img.shields.io/badge/rust-2024%20edition-orange.svg)](https://www.rust-lang.org)
 [![Platform](https://img.shields.io/badge/platform-Linux%20(Wayland%20%2F%20X11)-teal.svg)](#stack)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
@@ -418,7 +418,7 @@ Released under the **[MIT License](LICENSE)** for public use — you are free to
 | Field | Detail |
 |---|---|
 | **Product** | **RepoHarbor** |
-| **Version** | `2026.10.14` (Calendar versioning `YYYY.M.P`) |
+| **Version** | `2026.11.1` (Calendar versioning `YYYY.M.P`) |
 | **Publisher** | **Digital Integrated Transformation Solutions (DigitsCode)** |
 | **Author** | **Azmy Karam** |
 | **Repository** | [https://github.com/azmykn/RepoHarbor](https://github.com/azmykn/RepoHarbor) |

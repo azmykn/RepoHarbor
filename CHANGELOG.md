@@ -5,6 +5,26 @@ All notable changes to [RepoHarbor](https://github.com/azmykn/RepoHarbor) by Dig
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project (upstream) uses calendar versioning (`YYYY.M.P`).
 
+## [2026.11.1] - 2026-11-19
+
+### Added
+
+- **First-Time Installer, Onboarding & Periodic Auto-Updater**:
+  - Added [`scripts/install.sh`](scripts/install.sh) for zero-`sudo` installation into `~/.local/bin/repoharbor` (with `--from-source`, `--autostart`, `--with-auto-update` systemd timer, and `--uninstall`), self-contained `repoharbor install-desktop` registration, and `repoharbor update [--check] [--quiet]` CLI commands.
+  - Added GitHub Releases update checker with SHA-256 verification and atomic binary replacement, surfaced via a prominent **`Update <tag>`** button in the main header bar, a TitleBar `↑ vYYYY.M.P` pill, and **Settings → About → Updates & installation**.
+  - Added smart first-run workspace root discovery (`~/odoo`, `~/Tools`, `~/dev`, `~/projects`, …), a dismissable **First-run setup** onboarding banner, and login autostart (`~/.config/autostart`) controls.
+- **Embedded Terminal Mouse Selection & Copy**:
+  - Added mouse drag selection, double-click word selection, triple-click line selection, and clipboard copy (`Ctrl+C` when text is selected, `Ctrl+Shift+C`, `Copy sel`, or right-click).
+- **Interactive Submodule Focus & Search Clear**:
+  - Replaced the redundant sidebar `TREE` list with clickable **`N sub`** pills in List and Grid views plus a **`Showing submodules of <Repo>`** banner, and added an inline **`✕`** clear button to the Mission Control search bar.
+- **Documentation & Hygiene**:
+  - Added [`USER_MANUAL.md`](USER_MANUAL.md) and [`docs/guide/terminal.md`](docs/guide/terminal.md), updated [`README.md`](README.md) and VitePress guides, and enabled non-draft `.tar.gz` + `SHA256SUMS.txt` artifacts in `.github/workflows/release.yml`.
+
+### Fixed
+
+- Classified remote branch-protection rejections (`GH013`) separately from non-fast-forward errors with ready-to-run feature-branch recovery commands.
+- Fixed List-view repository name truncation, `Action Log` 100-column early wrapping, pinned `Action Log` close button visibility, and repeated 5-minute background `GitHub CI 403` log spam.
+
 ## [2026.10.14] - 2026-11-18
 
 ### Added
