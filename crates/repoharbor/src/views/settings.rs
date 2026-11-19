@@ -2230,7 +2230,7 @@ fn about_section(
         .flex()
         .flex_col()
         .gap(px(16.))
-        .child(about_product(t))
+        .child(about_product(install_kind, update_state, t))
         .child(about_updates(
             install_kind,
             update_state,
@@ -2238,9 +2238,75 @@ fn about_section(
             t,
             app,
         ))
-        .child(about_contact(t))
-        .child(about_license(t))
-        .child(about_attribution(t))
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .flex_wrap()
+                .gap(px(16.))
+                .child(div().flex_1().min_w(px(320.)).child(about_contact(t)))
+                .child(div().flex_1().min_w(px(320.)).child(about_license(t))),
+        )
+}
+
+fn about_pill_badge(
+    icon_name: Option<&'static str>,
+    label: impl Into<SharedString>,
+    fg: u32,
+    bg: u32,
+    border: u32,
+    t: &Theme,
+) -> gpui::Div {
+    let mut el = div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(5.))
+        .px(px(8.))
+        .py(px(3.))
+        .rounded(px(t.r_xs))
+        .bg(rgb(bg))
+        .border_1()
+        .border_color(rgb(border))
+        .text_size(px(t.text_data_sm))
+        .text_color(rgb(fg));
+    if let Some(ic) = icon_name {
+        el = el.child(lucide(ic, 12., fg));
+    }
+    el.child(label.into())
+}
+
+fn about_metric_tile(
+    label: &'static str,
+    value: impl Into<SharedString>,
+    value_color: u32,
+    t: &Theme,
+) -> gpui::Div {
+    div()
+        .flex_1()
+        .min_w(px(150.))
+        .p(px(10.))
+        .rounded(px(t.r_sm))
+        .bg(rgb(t.page))
+        .border_1()
+        .border_color(rgb(t.border))
+        .flex()
+        .flex_col()
+        .gap(px(4.))
+        .child(
+            div()
+                .text_size(px(t.text_data_sm))
+                .text_color(rgb(t.fg3))
+                .child(label),
+        )
+        .child(
+            div()
+                .font_family("monospace")
+                .text_size(px(t.text_data_sm))
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(rgb(value_color))
+                .child(value.into()),
+        )
 }
 
 fn about_updates(
@@ -2253,8 +2319,114 @@ fn about_updates(
     use crate::shell::AppUpdateState;
     use gpui_component::switch::Switch;
 
+    let (status_icon, status_text, status_color, latest_label) = match update_state {
+        AppUpdateState::Idle => (
+            "clock",
+            SharedString::from("Update status has not been checked yet in this session."),
+            t.fg2,
+            SharedString::from("Not checked"),
+        ),
+        AppUpdateState::Checking => (
+            "refresh-cw",
+            SharedString::from("Querying GitHub Releases for newer builds…"),
+            t.primary,
+            SharedString::from("Checking…"),
+        ),
+        AppUpdateState::UpToDate(tag) => {
+            let latest = tag
+                .clone()
+                .unwrap_or_else(|| format!("v{}", crate::identity::APP_VERSION));
+            (
+                "circle-check",
+                SharedString::from(format!(
+                    "RepoHarbor v{} is running the latest published release ({latest}).",
+                    crate::identity::APP_VERSION
+                )),
+                t.clean,
+                SharedString::from(latest),
+            )
+        }
+        AppUpdateState::Available(rel) => (
+            "cloud-download",
+            SharedString::from(format!(
+                "New release {} is ready to install (currently running v{}).",
+                rel.tag_name,
+                crate::identity::APP_VERSION
+            )),
+            t.clean,
+            SharedString::from(rel.tag_name.clone()),
+        ),
+        AppUpdateState::Installing => (
+            "refresh-cw",
+            SharedString::from(
+                "Downloading release archive, verifying SHA-256 checksum, and restarting…",
+            ),
+            t.primary,
+            SharedString::from("Installing…"),
+        ),
+        AppUpdateState::Error(err) => (
+            "circle-alert",
+            SharedString::from(format!("Update check failed: {err}")),
+            t.behind,
+            SharedString::from("Check failed"),
+        ),
+    };
+
+    let platform_label = format!("{} · {}", std::env::consts::OS, std::env::consts::ARCH);
+
+    let metrics_grid = div()
+        .flex()
+        .flex_row()
+        .flex_wrap()
+        .gap(px(8.))
+        .child(about_metric_tile(
+            "INSTALLED VERSION",
+            format!("v{}", crate::identity::APP_VERSION),
+            t.primary,
+            t,
+        ))
+        .child(about_metric_tile(
+            "LATEST RELEASE",
+            latest_label,
+            status_color,
+            t,
+        ))
+        .child(about_metric_tile(
+            "INSTALL MODE",
+            install_kind.label(),
+            t.fg0,
+            t,
+        ))
+        .child(about_metric_tile(
+            "PLATFORM TARGET",
+            platform_label,
+            t.fg1,
+            t,
+        ));
+
+    let status_banner = div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(8.))
+        .px(px(12.))
+        .py(px(9.))
+        .rounded(px(t.r_sm))
+        .bg(rgb(t.page))
+        .border_1()
+        .border_color(rgb(t.border))
+        .child(lucide(status_icon, 14., status_color))
+        .child(
+            div()
+                .flex_1()
+                .text_size(px(t.text_small))
+                .text_color(rgb(status_color))
+                .child(status_text),
+        );
+
     let mut box_el = section(t, "Updates & installation")
-        .child(about_value_row("Install mode", &install_kind.label(), t))
+        .child(metrics_grid)
+        .child(status_banner)
         .child({
             let app_sw = app.clone();
             div()
@@ -2262,12 +2434,30 @@ fn about_updates(
                 .flex_row()
                 .items_center()
                 .gap(px(10.))
+                .px(px(12.))
+                .py(px(8.))
+                .rounded(px(t.r_sm))
+                .bg(rgb(t.page))
+                .border_1()
+                .border_color(rgb(t.border))
                 .child(
                     div()
                         .flex_1()
-                        .text_size(px(t.text_small))
-                        .text_color(rgb(t.fg1))
-                        .child("Check for periodic updates automatically"),
+                        .flex()
+                        .flex_col()
+                        .gap(px(2.))
+                        .child(
+                            div()
+                                .text_size(px(t.text_small))
+                                .text_color(rgb(t.fg0))
+                                .child("Check for periodic updates automatically"),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(t.text_data_sm))
+                                .text_color(rgb(t.fg3))
+                                .child("Checks GitHub Releases on launch and every 12 hours in the background."),
+                        ),
                 )
                 .child(
                     Switch::new("tg-auto-check-updates")
@@ -2278,44 +2468,6 @@ fn about_updates(
                         }),
                 )
         });
-
-    let (status_text, status_color) = match update_state {
-        AppUpdateState::Idle => (
-            SharedString::from("Not checked yet in this session."),
-            t.fg3,
-        ),
-        AppUpdateState::Checking => (SharedString::from("Checking GitHub Releases…"), t.primary),
-        AppUpdateState::UpToDate(tag) => {
-            let suffix = tag
-                .as_deref()
-                .map(|t| format!(" (latest release: {t})"))
-                .unwrap_or_default();
-            (
-                SharedString::from(format!(
-                    "RepoHarbor v{} is up to date{suffix}.",
-                    crate::identity::APP_VERSION
-                )),
-                t.clean,
-            )
-        }
-        AppUpdateState::Available(rel) => (
-            SharedString::from(format!(
-                "Update available: {} (current: v{}).",
-                rel.tag_name,
-                crate::identity::APP_VERSION
-            )),
-            t.clean,
-        ),
-        AppUpdateState::Installing => (
-            SharedString::from("Downloading, verifying SHA-256, and installing update…"),
-            t.primary,
-        ),
-        AppUpdateState::Error(err) => (
-            SharedString::from(format!("Update check failed: {err}")),
-            t.behind,
-        ),
-    };
-    box_el = box_el.child(note_line(status_text, status_color, t));
 
     if let AppUpdateState::Available(rel) = update_state
         && !rel.notes.is_empty()
@@ -2338,11 +2490,41 @@ fn about_updates(
 
     let app_chk = app.clone();
     let app_apply = app.clone();
-    let mut actions_row = div()
-        .flex()
-        .flex_row()
-        .flex_wrap()
-        .gap(px(8.))
+    let mut actions_row = div().flex().flex_row().flex_wrap().gap(px(8.));
+
+    if let AppUpdateState::Available(rel) = update_state {
+        let label = match install_kind {
+            repoharbor_core::updater::InstallKind::SystemPackage(_) => {
+                "Run user installer in terminal".to_string()
+            }
+            _ => format!("Update & Restart ({})", rel.tag_name),
+        };
+        actions_row = actions_row.child(
+            div()
+                .id("btn-apply-update")
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(6.))
+                .px(px(12.))
+                .py(px(6.))
+                .rounded(px(t.r_sm))
+                .bg(rgb(t.accent_wash))
+                .border_1()
+                .border_color(rgb(t.primary))
+                .text_size(px(t.text_small))
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(rgb(t.fg0))
+                .cursor_pointer()
+                .child(lucide("rocket", 13., t.primary))
+                .child(SharedString::from(label))
+                .on_click(move |_ev, win, cx| {
+                    app_apply.update(cx, |this, cx| this.apply_app_update(win, cx));
+                }),
+        );
+    }
+
+    actions_row = actions_row
         .child(button_id(
             "btn-check-updates",
             "Check for updates",
@@ -2361,19 +2543,6 @@ fn about_updates(
             },
         ));
 
-    if let AppUpdateState::Available(_) = update_state {
-        let label = match install_kind {
-            repoharbor_core::updater::InstallKind::SystemPackage(_) => {
-                "Run user installer in terminal"
-            }
-            _ => "Update & Restart",
-        };
-        actions_row =
-            actions_row.child(button_win("btn-apply-update", label, t, move |win, cx| {
-                app_apply.update(cx, |this, cx| this.apply_app_update(win, cx));
-            }));
-    }
-
     let ext_cmd = install_kind.external_update_command();
     let ext_cmd_copy = ext_cmd.clone();
     box_el.child(actions_row).child(
@@ -2382,12 +2551,22 @@ fn about_updates(
             .flex_row()
             .flex_wrap()
             .items_center()
+            .justify_between()
             .gap(px(8.))
-            .child(note_line(
-                SharedString::from(format!("CLI update: `{ext_cmd}`")),
-                t.fg3,
-                t,
-            ))
+            .p(px(10.))
+            .rounded(px(t.r_sm))
+            .bg(rgb(t.page))
+            .border_1()
+            .border_color(rgb(t.border))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(200.))
+                    .font_family("monospace")
+                    .text_size(px(t.text_data_sm))
+                    .text_color(rgb(t.fg2))
+                    .child(SharedString::from(format!("$ {ext_cmd}"))),
+            )
             .child(button_id(
                 "btn-copy-update-cmd",
                 "Copy CLI command",
@@ -2399,48 +2578,184 @@ fn about_updates(
     )
 }
 
-fn about_product(t: &Theme) -> impl IntoElement {
+fn about_product(
+    install_kind: &repoharbor_core::updater::InstallKind,
+    update_state: &crate::shell::AppUpdateState,
+    t: &Theme,
+) -> impl IntoElement {
     use crate::identity as id;
-    section(t, "Product")
+    use crate::shell::AppUpdateState;
+
+    let (status_badge_icon, status_badge_text, status_fg, status_bg, status_border) =
+        match update_state {
+            AppUpdateState::Available(rel) => (
+                Some("cloud-download"),
+                format!("Update ready: {}", rel.tag_name),
+                t.clean,
+                t.accent_wash,
+                t.clean,
+            ),
+            AppUpdateState::UpToDate(_) => (
+                Some("circle-check"),
+                "Up to date".to_string(),
+                t.clean,
+                t.page,
+                t.border,
+            ),
+            AppUpdateState::Checking => (
+                Some("refresh-cw"),
+                "Checking updates…".to_string(),
+                t.primary,
+                t.page,
+                t.border,
+            ),
+            AppUpdateState::Installing => (
+                Some("rocket"),
+                "Updating…".to_string(),
+                t.primary,
+                t.accent_wash,
+                t.primary,
+            ),
+            _ => (
+                Some("tag"),
+                "Release channel".to_string(),
+                t.fg2,
+                t.page,
+                t.border,
+            ),
+        };
+
+    let sys_info = format!(
+        "RepoHarbor v{} ({} / {}, {})",
+        id::APP_VERSION,
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+        install_kind.label()
+    );
+
+    section(t, "Product overview")
         .child(
             div()
                 .flex()
                 .flex_row()
                 .items_center()
-                .gap(px(10.))
+                .gap(px(14.))
                 .child(
                     div()
-                        .text_color(rgb(t.fg0))
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .text_size(px(t.text_h3))
-                        .child(id::APP_NAME),
+                        .w(px(46.))
+                        .h(px(46.))
+                        .rounded(px(t.r_md))
+                        .bg(rgb(t.accent_wash))
+                        .border_1()
+                        .border_color(rgb(t.primary))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(lucide("harbor", 24., t.primary)),
                 )
                 .child(
                     div()
-                        .px(px(8.))
-                        .py(px(2.))
-                        .rounded(px(t.r_xs))
-                        .bg(rgb(t.button_bg))
-                        .border_1()
-                        .border_color(rgb(t.border))
-                        .font_family("monospace")
-                        .text_size(px(t.text_data_sm))
-                        .text_color(rgb(t.primary))
-                        .child(SharedString::from(format!("v{}", id::APP_VERSION))),
+                        .flex_1()
+                        .flex()
+                        .flex_col()
+                        .gap(px(4.))
+                        .child(
+                            div()
+                                .flex()
+                                .flex_row()
+                                .flex_wrap()
+                                .items_center()
+                                .gap(px(8.))
+                                .child(
+                                    div()
+                                        .text_color(rgb(t.fg0))
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .text_size(px(t.text_h3))
+                                        .child(id::APP_NAME),
+                                )
+                                .child(about_pill_badge(
+                                    None,
+                                    format!("v{}", id::APP_VERSION),
+                                    t.primary,
+                                    t.button_bg,
+                                    t.border,
+                                    t,
+                                ))
+                                .child(about_pill_badge(
+                                    status_badge_icon,
+                                    status_badge_text,
+                                    status_fg,
+                                    status_bg,
+                                    status_border,
+                                    t,
+                                ))
+                                .child(about_pill_badge(
+                                    Some("box"),
+                                    format!(
+                                        "{} · {}",
+                                        std::env::consts::OS,
+                                        std::env::consts::ARCH
+                                    ),
+                                    t.fg2,
+                                    t.page,
+                                    t.border,
+                                    t,
+                                )),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(t.text_small))
+                                .text_color(rgb(t.fg1))
+                                .child(format!("Published by {}", id::PUBLISHER)),
+                        ),
                 ),
         )
         .child(note_line(
             SharedString::from(
-                "every repo at harbor — a Linux-native command center for your git fleet",
+                "Every repo at harbor — a native GPU-rendered command center for managing multi-repository git fleets, nested submodules, GitHub/GitLab reviews & CI, multi-provider AI failover, and interactive PTY terminals across Linux, macOS, and Windows.",
             ),
             t.fg2,
             t,
         ))
-        .child(note_line(
-            SharedString::from(format!("Publisher: {}", id::PUBLISHER)),
-            t.fg1,
-            t,
-        ))
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .flex_wrap()
+                .gap(px(6.))
+                .child(about_pill_badge(
+                    Some("git-branch"),
+                    "Fleet Git & Submodules",
+                    t.fg1,
+                    t.page,
+                    t.border,
+                    t,
+                ))
+                .child(about_pill_badge(
+                    Some("git-pull-request"),
+                    "GitHub & GitLab PR/CI",
+                    t.fg1,
+                    t.page,
+                    t.border,
+                    t,
+                ))
+                .child(about_pill_badge(
+                    Some("sparkles"),
+                    "Local & Cloud AI Pool",
+                    t.fg1,
+                    t.page,
+                    t.border,
+                    t,
+                ))
+                .child(about_pill_badge(
+                    Some("square-terminal"),
+                    "Embedded VT100 PTY Dock",
+                    t.fg1,
+                    t.page,
+                    t.border,
+                    t,
+                )),
+        )
         .child(
             div()
                 .flex()
@@ -2465,59 +2780,193 @@ fn about_product(t: &Theme) -> impl IntoElement {
                     |_cx| {
                         let _ = repoharbor_core::launch::open(id::CHANGELOG_URL);
                     },
+                ))
+                .child(button_id(
+                    "btn-about-copy-sysinfo",
+                    "Copy system info",
+                    t,
+                    move |cx| {
+                        cx.write_to_clipboard(ClipboardItem::new_string(sys_info.clone()));
+                    },
                 )),
         )
 }
 
 fn about_contact(t: &Theme) -> impl IntoElement {
     use crate::identity as id;
-    section(t, "Contact")
-        .child(about_value_row("Website", id::WEBSITE, t))
-        .child(about_value_row("Email", id::CONTACT_EMAIL, t))
+    let issues_url = format!("{}/issues", id::REPOSITORY.trim_end_matches('/'));
+    let issues_url_open = issues_url.clone();
+
+    section(t, "Publisher & support")
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(8.))
+                .p(px(12.))
+                .rounded(px(t.r_sm))
+                .bg(rgb(t.page))
+                .border_1()
+                .border_color(rgb(t.border))
+                .child(about_value_row("Organization", id::PUBLISHER, t))
+                .child(about_value_row("Website", id::WEBSITE, t))
+                .child(about_value_row("Support Email", id::CONTACT_EMAIL, t))
+                .child(about_value_row("Issue Tracker", &issues_url, t)),
+        )
+        .child(note_line(
+            SharedString::from(
+                "For enterprise support, feature requests, or bug reports, reach out via the DigitsCode website, support email, or GitHub issue tracker.",
+            ),
+            t.fg3,
+            t,
+        ))
         .child(
             div()
                 .flex()
                 .flex_row()
                 .flex_wrap()
                 .gap(px(8.))
-                .child(button_id("btn-about-website", "Open website", t, |_cx| {
+                .child(button_id("btn-about-website", "Visit website", t, |_cx| {
                     let _ = repoharbor_core::launch::open(id::WEBSITE);
                 }))
-                .child(button_id("btn-about-email", "Email", t, |_cx| {
+                .child(button_id("btn-about-email", "Email support", t, |_cx| {
                     let _ = repoharbor_core::launch::open(&format!("mailto:{}", id::CONTACT_EMAIL));
                 }))
                 .child(button_id("btn-about-copy-email", "Copy email", t, |cx| {
                     cx.write_to_clipboard(ClipboardItem::new_string(id::CONTACT_EMAIL.to_string()));
+                }))
+                .child(button_id("btn-about-issues", "Report an issue", t, move |_cx| {
+                    let _ = repoharbor_core::launch::open(&issues_url_open);
                 })),
         )
 }
 
 fn about_license(t: &Theme) -> impl IntoElement {
     use crate::identity as id;
-    section(t, "License & public use")
-        .child(note_line(
-            SharedString::from(format!(
-                "© {} {} — {}.",
-                id::COPYRIGHT_YEAR,
-                id::PUBLISHER,
-                id::LICENSE_SPDX
-            )),
-            t.fg1,
-            t,
-        ))
-        .child(note_line(SharedString::from(id::PUBLIC_USE), t.fg2, t))
-        .child(note_line(
-            SharedString::from(
-                "Full terms: LICENSE, NOTICE, and COPYRIGHT.md in the repository root.",
-            ),
-            t.fg3,
-            t,
-        ))
-}
+    let license_url = format!("{}/blob/main/LICENSE", id::REPOSITORY.trim_end_matches('/'));
+    let copyright_url = format!(
+        "{}/blob/main/COPYRIGHT.md",
+        id::REPOSITORY.trim_end_matches('/')
+    );
 
-fn about_attribution(t: &Theme) -> impl IntoElement {
-    use crate::identity as id;
-    section(t, "Attribution").child(note_line(SharedString::from(id::UPSTREAM_CREDIT), t.fg2, t))
+    section(t, "License, rights & attribution")
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .flex_wrap()
+                .items_center()
+                .gap(px(8.))
+                .child(about_pill_badge(
+                    Some("circle-check"),
+                    format!("{} License", id::LICENSE_SPDX),
+                    t.clean,
+                    t.page,
+                    t.border,
+                    t,
+                ))
+                .child(about_pill_badge(
+                    Some("globe"),
+                    "Open Source · Public Use",
+                    t.primary,
+                    t.accent_wash,
+                    t.primary,
+                    t,
+                )),
+        )
+        .child(
+            div()
+                .text_size(px(t.text_small))
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(rgb(t.fg0))
+                .child(SharedString::from(format!(
+                    "© {} {}",
+                    id::COPYRIGHT_YEAR,
+                    id::PUBLISHER
+                ))),
+        )
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .flex_wrap()
+                .gap(px(6.))
+                .child(about_pill_badge(
+                    Some("check"),
+                    "Commercial use",
+                    t.fg1,
+                    t.page,
+                    t.border,
+                    t,
+                ))
+                .child(about_pill_badge(
+                    Some("check"),
+                    "Modification",
+                    t.fg1,
+                    t.page,
+                    t.border,
+                    t,
+                ))
+                .child(about_pill_badge(
+                    Some("check"),
+                    "Distribution",
+                    t.fg1,
+                    t.page,
+                    t.border,
+                    t,
+                ))
+                .child(about_pill_badge(
+                    Some("check"),
+                    "Private use",
+                    t.fg1,
+                    t.page,
+                    t.border,
+                    t,
+                )),
+        )
+        .child(note_line(SharedString::from(id::PUBLIC_USE), t.fg2, t))
+        .child(
+            div()
+                .p(px(10.))
+                .rounded(px(t.r_sm))
+                .bg(rgb(t.page))
+                .border_1()
+                .border_color(rgb(t.border))
+                .flex()
+                .flex_col()
+                .gap(px(4.))
+                .child(
+                    div()
+                        .text_size(px(t.text_data_sm))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(rgb(t.fg2))
+                        .child("UPSTREAM ATTRIBUTION"),
+                )
+                .child(note_line(SharedString::from(id::UPSTREAM_CREDIT), t.fg3, t)),
+        )
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .flex_wrap()
+                .gap(px(8.))
+                .child(button_id(
+                    "btn-about-license-file",
+                    "View LICENSE",
+                    t,
+                    move |_cx| {
+                        let _ = repoharbor_core::launch::open(&license_url);
+                    },
+                ))
+                .child(button_id(
+                    "btn-about-copyright-file",
+                    "View COPYRIGHT.md",
+                    t,
+                    move |_cx| {
+                        let _ = repoharbor_core::launch::open(&copyright_url);
+                    },
+                )),
+        )
 }
 
 fn about_value_row(label: &str, value: &str, t: &Theme) -> impl IntoElement {
@@ -2525,7 +2974,8 @@ fn about_value_row(label: &str, value: &str, t: &Theme) -> impl IntoElement {
         .flex()
         .flex_row()
         .items_baseline()
-        .gap(px(8.))
+        .justify_between()
+        .gap(px(12.))
         .child(field_label(label, t))
         .child(
             div()
@@ -2713,27 +3163,4 @@ fn button_id(
         .hover(move |s| s.border_color(rgb(hb)).text_color(rgb(hf)))
         .child(SharedString::from(label.to_string()))
         .on_click(move |_ev, _win, cx| on(cx))
-}
-
-fn button_win(
-    id: impl Into<SharedString>,
-    label: &str,
-    t: &Theme,
-    on: impl Fn(&mut Window, &mut gpui::App) + 'static,
-) -> impl IntoElement {
-    let (hb, hf) = (t.border_strong, t.fg0);
-    div()
-        .id(id.into())
-        .px(px(14.))
-        .py(px(7.))
-        .rounded(px(t.r_sm))
-        .bg(rgb(t.accent_wash))
-        .border_1()
-        .border_color(rgb(t.border_accent))
-        .text_size(px(t.text_data_sm))
-        .text_color(rgb(t.accent_bright))
-        .cursor_pointer()
-        .hover(move |s| s.border_color(rgb(hb)).text_color(rgb(hf)))
-        .child(SharedString::from(label.to_string()))
-        .on_click(move |_ev, win, cx| on(win, cx))
 }
