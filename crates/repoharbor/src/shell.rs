@@ -5277,12 +5277,6 @@ impl RepoHarborApp {
         cx.notify();
     }
 
-    /// Select an explicit Settings category tab without toggling off on re-click.
-    pub fn set_settings_tab(&mut self, key: SharedString, cx: &mut Context<Self>) {
-        self.view_filter = Some(key);
-        cx.notify();
-    }
-
     /// Select the scanned root to filter by (sidebar ROOTS); `None` = all.
     pub fn set_root(&mut self, root: Option<SharedString>, cx: &mut Context<Self>) {
         if self.grid.root == root {

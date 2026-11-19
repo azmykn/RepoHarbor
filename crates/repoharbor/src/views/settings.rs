@@ -190,14 +190,14 @@ impl SettingsState {
     }
 }
 
-const SETTINGS_TABS: [(&str, &str, &str); 7] = [
-    ("roots", "folder", "Workspace & Roots"),
-    ("account", "user", "GitHub Account"),
-    ("launchers", "rocket", "Launchers & Terminal"),
-    ("ai", "sparkles", "AI & Providers"),
-    ("notifications", "bell", "Notifications & System"),
-    ("about", "harbor", "About & License"),
-    ("all", "settings", "All"),
+const SETTINGS_TITLES: [(&str, &str); 7] = [
+    ("roots", "Workspace & Roots"),
+    ("account", "GitHub Account"),
+    ("launchers", "Launchers & Terminal"),
+    ("ai", "AI & Providers"),
+    ("notifications", "Notifications & System"),
+    ("about", "About & License"),
+    ("all", "All Sections"),
 ];
 
 #[allow(clippy::too_many_arguments)]
@@ -244,106 +244,41 @@ pub fn render(
         );
     }
 
-    let header_title = SETTINGS_TABS
+    let section_title = SETTINGS_TITLES
         .iter()
-        .find(|(id, _, _)| *id == active_tab)
-        .map(|(_, _, label)| *label)
+        .find(|(id, _)| *id == active_tab)
+        .map(|(_, label)| *label)
         .unwrap_or("Settings");
-
-    let mut tab_bar = div()
-        .id("settings-inpage-tabs")
-        .flex()
-        .flex_row()
-        .items_center()
-        .gap(px(6.))
-        .overflow_x_scroll()
-        .pb(px(2.));
-    for (id, icon_name, label) in SETTINGS_TABS {
-        let on = active_tab == id;
-        let app_tab = app.clone();
-        let fg = if on { t.accent_bright } else { t.fg2 };
-        let bg = if on { t.accent_wash } else { t.button_bg };
-        let border = if on { t.border_accent } else { t.border };
-        tab_bar = tab_bar.child(
-            div()
-                .id(SharedString::from(format!("settings-tab-{id}")))
-                .flex()
-                .flex_row()
-                .flex_shrink_0()
-                .items_center()
-                .gap(px(6.))
-                .px(px(10.))
-                .py(px(5.))
-                .rounded(px(t.r_sm))
-                .bg(rgb(bg))
-                .border_1()
-                .border_color(rgb(border))
-                .text_size(px(t.text_data_sm))
-                .font_weight(if on {
-                    FontWeight::MEDIUM
-                } else {
-                    FontWeight::NORMAL
-                })
-                .text_color(rgb(fg))
-                .cursor_pointer()
-                .hover(|st| {
-                    st.border_color(rgb(t.border_strong))
-                        .bg(rgb(t.surface_hover))
-                })
-                .child(lucide(icon_name, 13., fg))
-                .child(SharedString::from(label))
-                .on_click(move |_ev, _win, cx| {
-                    app_tab.update(cx, |this, cx| {
-                        this.set_settings_tab(id.into(), cx);
-                    });
-                }),
-        );
-    }
 
     let mut page = div()
         .flex()
         .flex_col()
         .size_full()
         .bg(rgb(t.page))
-        // Clean two-row Settings header: title + horizontal category switcher
+        // Clean single-row Settings header (navigation stays in the left sidebar SECTIONS list)
         .child(
             div()
                 .flex()
-                .flex_col()
+                .flex_row()
+                .items_baseline()
                 .gap(px(10.))
+                .h(px(52.))
                 .px(px(24.))
-                .py(px(12.))
                 .border_b_1()
                 .border_color(rgb(t.border))
                 .child(
                     div()
-                        .flex()
-                        .flex_row()
-                        .items_center()
-                        .justify_between()
-                        .gap(px(12.))
-                        .child(
-                            div()
-                                .flex()
-                                .flex_row()
-                                .items_baseline()
-                                .gap(px(10.))
-                                .child(
-                                    div()
-                                        .font_weight(FontWeight::SEMIBOLD)
-                                        .text_size(px(t.text_h3))
-                                        .text_color(rgb(t.fg0))
-                                        .child("Settings"),
-                                )
-                                .child(
-                                    div()
-                                        .text_size(px(t.text_data_sm))
-                                        .text_color(rgb(t.fg2))
-                                        .child(SharedString::from(header_title)),
-                                ),
-                        ),
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_size(px(t.text_h3))
+                        .text_color(rgb(t.fg0))
+                        .child("Settings"),
                 )
-                .child(tab_bar),
+                .child(
+                    div()
+                        .text_size(px(t.text_data_sm))
+                        .text_color(rgb(t.fg2))
+                        .child(SharedString::from(format!("· {section_title}"))),
+                ),
         )
         // Scrolling sections inside a comfortable max-width container
         .child(
