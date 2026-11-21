@@ -4,7 +4,7 @@
 # knows nothing about the UI.
 [package]
 name = "repoharbor-core"
-version = "2026.11.1"
+version = "2026.11.2"
 edition = "2021"
 authors = ["Digital Integrated Transformation Solutions (DigitsCode) <info@digitscode.com>"]
 license = "MIT"

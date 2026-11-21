@@ -991,17 +991,23 @@ impl RepoHarborApp {
                         // returns, closing the channel and ending the drain.
                     };
                     match op {
-                        FleetOp::Fetch => {
-                            fleet::run(&repos, workers, &cancel, progress, fleet::fetch_op())
-                        }
+                        FleetOp::Fetch => fleet::run(
+                            &repos,
+                            workers,
+                            &cancel,
+                            progress,
+                            fleet::fetch_op_with_cancel(&cancel, workers),
+                        ),
                         FleetOp::Pull => fleet::run(
                             &repos,
                             workers,
                             &cancel,
                             progress,
-                            fleet::pull_op_collecting(
+                            fleet::pull_op_collecting_with_cancel(
                                 Some(pull_files_for_op),
                                 pull_only_prefixes.clone(),
+                                &cancel,
+                                workers,
                             ),
                         ),
                         FleetOp::StageAll => {
@@ -1015,7 +1021,7 @@ impl RepoHarborApp {
                             workers,
                             &cancel,
                             progress,
-                            fleet::submodule_update_op(),
+                            fleet::submodule_update_op_with_cancel(&cancel, workers),
                         ),
                         FleetOp::CommitAll => {
                             let msg = commit_message.unwrap_or_default();
@@ -1059,9 +1065,13 @@ impl RepoHarborApp {
                         FleetOp::Prune => {
                             fleet::run(&repos, workers, &cancel, progress, fleet::prune_op())
                         }
-                        FleetOp::ResetHard => {
-                            fleet::run(&repos, workers, &cancel, progress, fleet::reset_hard_op())
-                        }
+                        FleetOp::ResetHard => fleet::run(
+                            &repos,
+                            workers,
+                            &cancel,
+                            progress,
+                            fleet::reset_hard_op_with_cancel(&cancel, workers),
+                        ),
                         FleetOp::DiscardChanges => fleet::run(
                             &repos,
                             workers,
@@ -1107,6 +1117,9 @@ impl RepoHarborApp {
                     false,
                     cx,
                 );
+                if fail_n > 0 {
+                    push_failure_summary_log_lines(this, &report, cx);
+                }
                 let ctx = fleet_log_context(this, &report);
                 this.upsert_toast_ctx(key, kind, title, detail, ctx, cx);
                 if matches!(op, FleetOp::SubmoduleUpdate) {
@@ -2255,17 +2268,39 @@ fn bar_btn_explain(
         .into_any_element()
 }
 
+const MAX_ACTION_LOG_FAILURE_GROUPS: usize = 6;
+const MAX_ACTION_LOG_FAILURE_NAMES: usize = 4;
+const MAX_FAILURE_GROUP_REASON_CHARS: usize = 110;
+
 /// Full per-repo outcomes for the notice panel (toast detail stays clipped).
 fn fleet_log_context(app: &RepoHarborApp, report: &FleetReport) -> crate::activity_log::LogContext {
     use crate::activity_log::LogContext;
-    const MAX_FACTS: usize = 80;
-    let mut ctx = if report.results.len() == 1 {
+    let ctx = if report.results.len() == 1 {
         app.log_context_for_id(&report.results[0].repo)
     } else {
         LogContext::default()
     };
+    append_fleet_report_facts(ctx, report)
+}
+
+/// Populate `ctx` with totals, grouped failure causes, and failure-first
+/// per-repo outcomes so large fleet runs never crowd errors out of the modal.
+fn append_fleet_report_facts(
+    mut ctx: crate::activity_log::LogContext,
+    report: &FleetReport,
+) -> crate::activity_log::LogContext {
+    const MAX_FACTS: usize = 80;
     ctx = ctx.with_fact("Repos", fleet_totals_line(report));
-    for r in report.results.iter().take(MAX_FACTS) {
+    let (groups, omitted_groups) = summarize_fleet_failures(report, 4, 3);
+    if !groups.is_empty() {
+        let mut summary = groups.join(" · ");
+        if omitted_groups > 0 {
+            summary.push_str(&format!(" · +{omitted_groups} more reason(s)"));
+        }
+        ctx = ctx.with_fact("Failure reasons", summary);
+    }
+    let ordered = results_ordered_by_severity(&report.results);
+    for r in ordered.iter().take(MAX_FACTS) {
         let name = r.repo.rsplit('/').next().unwrap_or(&r.repo);
         let val = match &r.outcome {
             Outcome::Ok(m) => m.clone(),
@@ -2274,10 +2309,124 @@ fn fleet_log_context(app: &RepoHarborApp, report: &FleetReport) -> crate::activi
         };
         ctx = ctx.with_fact(name.to_string(), crate::data::oneline(val));
     }
-    if report.results.len() > MAX_FACTS {
-        ctx = ctx.with_fact("…", format!("+{} more", report.results.len() - MAX_FACTS));
+    if ordered.len() > MAX_FACTS {
+        ctx = ctx.with_fact("…", format!("+{} more", ordered.len() - MAX_FACTS));
     }
     ctx
+}
+
+/// Order fleet outcomes with failures first, then skips, then successes while
+/// keeping input order within each tier.
+fn results_ordered_by_severity(
+    results: &[repoharbor_core::fleet::RepoResult],
+) -> Vec<&repoharbor_core::fleet::RepoResult> {
+    let mut ordered: Vec<_> = results.iter().collect();
+    ordered.sort_by_key(|r| match &r.outcome {
+        Outcome::Failed(_) => 0u8,
+        Outcome::Skipped(_) => 1u8,
+        Outcome::Ok(_) => 2u8,
+    });
+    ordered
+}
+
+/// Group identical failure causes (most frequent first) into concise lines:
+/// `<count>× <reason> (<repo1>, <repo2>, +N more)`.
+fn summarize_fleet_failures(
+    report: &FleetReport,
+    max_groups: usize,
+    max_names: usize,
+) -> (Vec<String>, usize) {
+    struct Group {
+        reason: String,
+        count: usize,
+        names: Vec<String>,
+        first_ix: usize,
+    }
+    let mut by_reason: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut groups: Vec<Group> = Vec::new();
+    for (ix, r) in report.results.iter().enumerate() {
+        let Outcome::Failed(why) = &r.outcome else {
+            continue;
+        };
+        let reason = clean_failure_reason(why);
+        let name = r.repo.rsplit('/').next().unwrap_or(&r.repo).to_string();
+        if let Some(&slot) = by_reason.get(&reason) {
+            let g = &mut groups[slot];
+            g.count += 1;
+            if g.names.len() < max_names {
+                g.names.push(name);
+            }
+        } else {
+            let slot = groups.len();
+            by_reason.insert(reason.clone(), slot);
+            let mut names = Vec::new();
+            if max_names > 0 {
+                names.push(name);
+            }
+            groups.push(Group {
+                reason,
+                count: 1,
+                names,
+                first_ix: ix,
+            });
+        }
+    }
+    groups.sort_by(|a, b| {
+        b.count
+            .cmp(&a.count)
+            .then_with(|| a.first_ix.cmp(&b.first_ix))
+    });
+    let total_groups = groups.len();
+    let omitted = total_groups.saturating_sub(max_groups);
+    let lines = groups
+        .into_iter()
+        .take(max_groups)
+        .map(|g| {
+            let reason = clip(&g.reason, MAX_FAILURE_GROUP_REASON_CHARS);
+            let rest = g.count.saturating_sub(g.names.len());
+            if g.names.is_empty() {
+                format!("{}× {reason}", g.count)
+            } else if rest > 0 {
+                format!(
+                    "{}× {reason} ({}, +{rest} more)",
+                    g.count,
+                    g.names.join(", ")
+                )
+            } else {
+                format!("{}× {reason} ({})", g.count, g.names.join(", "))
+            }
+        })
+        .collect();
+    (lines, omitted)
+}
+
+/// Emit a compact failure breakdown at the tail of the Action Log so errors in
+/// large fleets remain visible even when trailing successes scroll past.
+fn push_failure_summary_log_lines(
+    app: &mut RepoHarborApp,
+    report: &FleetReport,
+    cx: &mut Context<RepoHarborApp>,
+) {
+    let (lines, omitted) = summarize_fleet_failures(
+        report,
+        MAX_ACTION_LOG_FAILURE_GROUPS,
+        MAX_ACTION_LOG_FAILURE_NAMES,
+    );
+    for line in &lines {
+        app.log_action_result("✗", "31", "Failure cause", Some(line), false, cx);
+    }
+    if omitted > 0 {
+        app.log_action_result(
+            "✗",
+            "31",
+            "Failure causes",
+            Some(&format!(
+                "+{omitted} more distinct error(s) — click toast or open Log for details"
+            )),
+            false,
+            cx,
+        );
+    }
 }
 
 /// Repos fact for the notice panel — call out commit-landed / push-failed
@@ -2302,15 +2451,24 @@ fn fleet_totals_line(report: &FleetReport) -> String {
     }
 }
 
-/// Per-repo Failed value for Log / notice facts.
-fn format_failed_log_value(why: &str) -> String {
-    if let Some((commit, push_err)) = split_commit_push_fail(why) {
+fn clean_failure_reason(why: &str) -> String {
+    let raw = if let Some((commit, push_err)) = split_commit_push_fail(why) {
         format!(
             "{commit}; push failed: {}",
             humanize_push_fail_reason(push_err)
         )
     } else {
-        format!("failed: {why}")
+        why.to_string()
+    };
+    crate::data::oneline(raw)
+}
+
+/// Per-repo Failed value for Log / notice facts.
+fn format_failed_log_value(why: &str) -> String {
+    if is_commit_push_fail(why) {
+        clean_failure_reason(why)
+    } else {
+        format!("failed: {}", clean_failure_reason(why))
     }
 }
 
@@ -3254,5 +3412,72 @@ mod tests {
         assert!(fleet_queue_status_label(0).is_none());
         assert_eq!(fleet_queue_status_label(1).as_deref(), Some("1 queued"));
         assert_eq!(fleet_queue_status_label(2).as_deref(), Some("2 queued"));
+    }
+
+    #[test]
+    fn summarize_fleet_failures_groups_sorts_and_caps_names() {
+        let mut results = vec![
+            ("/x/ok1", Outcome::Ok("fetched".into())),
+            (
+                "/x/digits",
+                Outcome::Failed("unexpected http status code: 404".into()),
+            ),
+        ];
+        for i in 0..5 {
+            results.push((
+                ["/x/r0", "/x/r1", "/x/r2", "/x/r3", "/x/r4"][i],
+                Outcome::Failed("Network is unreachable\n(dhcp)".into()),
+            ));
+        }
+        let r = report(results, false);
+        let (lines, omitted) = summarize_fleet_failures(&r, 6, 3);
+        assert_eq!(omitted, 0);
+        assert_eq!(lines.len(), 2);
+        assert_eq!(
+            lines[0],
+            "5× Network is unreachable (dhcp) (r0, r1, r2, +2 more)"
+        );
+        assert_eq!(lines[1], "1× unexpected http status code: 404 (digits)");
+
+        let (capped, omitted_more) = summarize_fleet_failures(&r, 1, 2);
+        assert_eq!(omitted_more, 1);
+        assert_eq!(
+            capped,
+            vec!["5× Network is unreachable (dhcp) (r0, r1, +3 more)"]
+        );
+    }
+
+    #[test]
+    fn append_fleet_report_facts_prioritizes_failures_past_cap() {
+        let mut results: Vec<RepoResult> = (0..100)
+            .map(|i| RepoResult {
+                repo: format!("/x/ok-{i}"),
+                outcome: Outcome::Ok("fetched".into()),
+            })
+            .collect();
+        results.push(RepoResult {
+            repo: "/x/late-fail".into(),
+            outcome: Outcome::Failed("unexpected http status code: 404".into()),
+        });
+        let report = FleetReport {
+            results,
+            started: 101,
+            completed: 101,
+            cancelled: false,
+        };
+        let ctx = append_fleet_report_facts(crate::activity_log::LogContext::default(), &report);
+        let keys: Vec<&str> = ctx.facts.iter().map(|(k, _)| k.as_ref()).collect();
+        assert!(
+            keys.contains(&"Failure reasons"),
+            "expected summary fact: {keys:?}"
+        );
+        assert!(
+            keys.contains(&"late-fail"),
+            "expected late failure first: {keys:?}"
+        );
+        let fail_pos = keys.iter().position(|k| *k == "late-fail").unwrap();
+        let ok_pos = keys.iter().position(|k| *k == "ok-0").unwrap();
+        assert!(fail_pos < ok_pos, "failures must appear before ok rows");
+        assert!(keys.contains(&"…"));
     }
 }

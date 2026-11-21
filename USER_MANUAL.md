@@ -1,4 +1,4 @@
-# RepoHarbor — User Manual (`v2026.11.1`)
+# RepoHarbor — User Manual (`v2026.11.2`)
 
 **Every repo at harbor.** A native Linux GPU-rendered desktop command center (`GPUI` + Vulkan, Wayland/X11) for managing dozens or hundreds of git repositories, submodules, forge reviews, AI workflows, and interactive terminals from one unified workspace.
 

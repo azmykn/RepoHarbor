@@ -5,6 +5,19 @@ All notable changes to [RepoHarbor](https://github.com/azmykn/RepoHarbor) by Dig
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project (upstream) uses calendar versioning (`YYYY.M.P`).
 
+## [2026.11.2] - 2026-11-21
+
+### Fixed
+
+- **Fleet Fetch/Pull Transient Network Resilience & Circuit Breaker**:
+  - Added cancel-aware exponential backoff retries (`1s`, `2s`, `3s`, `4s`) for transient DNS, socket, and HTTP `429`/`5xx` transport failures across fleet fetch, pull, reset-hard, and submodule updates (`NetworkRetryGate`), allowing multi-hundred-repo fleet runs to survive brief Wi-Fi roams and DHCP drops instead of failing the remaining queue.
+  - Added a per-run consecutive-failure circuit breaker (`trip_threshold = workers`) that heals automatically on any successful remote operation, so truly offline fleet runs still abort quickly instead of hanging for minutes.
+  - Permanent remote/auth rejections (`404`, `401`, `403`, `Repository not found`, auth/host-key failures) bypass retries and fail immediately.
+- **Fleet Action Log & Notice Failure Visibility**:
+  - Added grouped **Failure cause** summary lines at the tail of the Action Log when a fleet run finishes with errors so failure causes stay visible even when trailing successes scroll past.
+  - Updated Notice overlay / Activity Log context (`fleet_log_context`) to include a grouped **Failure reasons** summary and order per-repo outcomes by severity (failures and skips before successes) instead of letting early successes crowd late failures past the 80-entry cap.
+  - Normalized multi-line `libgit2`/SSH error strings onto a single clean Action Log line.
+
 ## [2026.11.1] - 2026-11-19
 
 ### Added

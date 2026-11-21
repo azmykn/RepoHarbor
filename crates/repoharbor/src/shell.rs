@@ -8383,8 +8383,15 @@ impl RepoHarborApp {
         cx: &mut Context<Self>,
     ) {
         let now = chrono::Local::now().format("%H:%M:%S").to_string();
-        let line =
-            repoharbor_core::terminal::format_log_entry(&now, tag, sgr_color, subject, detail);
+        let subject = crate::data::oneline(subject.to_string());
+        let detail = detail.map(|d| crate::data::oneline(d.to_string()));
+        let line = repoharbor_core::terminal::format_log_entry(
+            &now,
+            tag,
+            sgr_color,
+            &subject,
+            detail.as_deref(),
+        );
         self.append_action_ansi(reveal, &line, cx);
     }
 
