@@ -2,6 +2,12 @@
 //! listing/switching/pruning, worktrees, recent log, and the working diff.
 //! All synchronous; callers run them off the UI thread.
 
+use std::collections::HashMap;
+use std::io::Write;
+use std::process::{Command, Stdio};
+use std::sync::{LazyLock, Mutex, Once};
+use std::time::{Duration, Instant};
+
 use git2::{
     BranchType, Cred, CredentialType, DiffOptions, FetchOptions, RemoteCallbacks, Repository,
     RepositoryState,
@@ -9,6 +15,162 @@ use git2::{
 use serde::{Deserialize, Serialize};
 
 use crate::model::GitStatus;
+
+/// Bounded libgit2 mmap window size (16 MiB instead of the 1 GiB 64-bit default).
+const MWINDOW_SIZE_BYTES: usize = 16 * 1024 * 1024;
+/// Bounded total libgit2 mapped packfile memory (128 MiB instead of the 8 GiB default).
+const MWINDOW_MAPPED_LIMIT_BYTES: usize = 128 * 1024 * 1024;
+/// Bounded libgit2 global object cache (32 MiB instead of the 256 MiB default).
+const CACHE_MAX_SIZE_BYTES: isize = 32 * 1024 * 1024;
+
+/// Configure process-wide libgit2 memory caps and glibc arena limits.
+///
+/// Must be called once at process startup before worker threads open git
+/// repositories. Deliberately avoids `set_mwindow_file_limit`, which has a
+/// known concurrent close data race in libgit2 (`mwindow.c`).
+pub fn init_runtime_limits() {
+    static INIT: Once = Once::new();
+    INIT.call_once(|| {
+        // SAFETY: Called once at startup before any background threads run git2.
+        unsafe {
+            let _ = git2::opts::set_mwindow_size(MWINDOW_SIZE_BYTES);
+            let _ = git2::opts::set_mwindow_mapped_limit(MWINDOW_MAPPED_LIMIT_BYTES);
+            let _ = libgit2_sys::git_libgit2_opts(
+                libgit2_sys::GIT_OPT_SET_CACHE_MAX_SIZE as std::os::raw::c_int,
+                CACHE_MAX_SIZE_BYTES,
+            );
+        }
+        #[cfg(all(target_os = "linux", target_env = "gnu"))]
+        {
+            extern "C" {
+                fn mallopt(param: libc::c_int, value: libc::c_int) -> libc::c_int;
+            }
+            // Limit glibc malloc arenas so transient worker allocations do not
+            // fragment across dozens of arenas on high-core-count CPUs.
+            const M_ARENA_MAX: libc::c_int = -8;
+            // SAFETY: glibc mallopt is safe to call during process initialization.
+            unsafe {
+                let _ = mallopt(M_ARENA_MAX, 4);
+            }
+        }
+    });
+}
+
+/// Ask the platform allocator to return freed heap pages to the OS after heavy
+/// batch operations (workspace scan, fleet runs). No-op outside Linux/glibc.
+pub fn trim_process_heap() {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    {
+        extern "C" {
+            fn malloc_trim(pad: libc::size_t) -> libc::c_int;
+        }
+        // SAFETY: malloc_trim(0) is thread-safe in glibc and releases unused top-of-heap pages.
+        unsafe {
+            let _ = malloc_trim(0);
+        }
+    }
+}
+
+/// In-memory TTL for cached HTTPS git credentials per `(scheme, host)`.
+const HTTPS_CRED_TTL: Duration = Duration::from_secs(300);
+
+struct CachedHttpsCred {
+    fetched_at: Instant,
+    username: String,
+    password: String,
+}
+
+static HTTPS_CRED_CACHE: LazyLock<Mutex<HashMap<(String, String), CachedHttpsCred>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Parse `https://<host[:port]>/...` into `("https", "<lowercase host[:port]>")`.
+/// Rejects non-HTTPS schemes and control characters so credentials are strictly
+/// scoped by scheme + host.
+fn parse_https_host(url: &str) -> Option<(String, String)> {
+    let rest = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("HTTPS://"))?;
+    let authority = rest.split(['/', '?', '#']).next()?;
+    let host = authority.rsplit('@').next()?.trim();
+    if host.is_empty()
+        || host
+            .bytes()
+            .any(|b| b <= 0x20 || b == b'\r' || b == b'\n' || b == b'\\')
+    {
+        return None;
+    }
+    Some(("https".to_string(), host.to_ascii_lowercase()))
+}
+
+fn fill_git_credential(protocol: &str, host: &str) -> Option<(String, String)> {
+    let mut child = Command::new("git")
+        .args(["credential", "fill"])
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    if let Some(mut stdin) = child.stdin.take() {
+        let _ = write!(stdin, "protocol={protocol}\nhost={host}\n\n");
+    }
+    let out = child.wait_with_output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut user = None;
+    let mut pass = None;
+    for line in text.lines() {
+        if let Some(v) = line.strip_prefix("username=") {
+            if !v.is_empty() {
+                user = Some(v.to_string());
+            }
+        } else if let Some(v) = line.strip_prefix("password=") {
+            if !v.is_empty() {
+                pass = Some(v.to_string());
+            }
+        }
+    }
+    match (user, pass) {
+        (Some(u), Some(p)) => Some((u, p)),
+        _ => None,
+    }
+}
+
+fn cached_https_cred_with<F>(
+    key: &(String, String),
+    now: Instant,
+    fetch: F,
+) -> Option<(String, String)>
+where
+    F: FnOnce(&str, &str) -> Option<(String, String)>,
+{
+    {
+        let cache = HTTPS_CRED_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(entry) = cache.get(key) {
+            if now.saturating_duration_since(entry.fetched_at) < HTTPS_CRED_TTL {
+                return Some((entry.username.clone(), entry.password.clone()));
+            }
+        }
+    }
+    let (username, password) = fetch(&key.0, &key.1)?;
+    let mut cache = HTTPS_CRED_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    cache.insert(
+        key.clone(),
+        CachedHttpsCred {
+            fetched_at: now,
+            username: username.clone(),
+            password: password.clone(),
+        },
+    );
+    Some((username, password))
+}
+
+fn evict_https_cred(key: &(String, String)) {
+    let mut cache = HTTPS_CRED_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    cache.remove(key);
+}
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -94,6 +256,22 @@ fn remote_callbacks() -> RemoteCallbacks<'static> {
         }
         if allowed.contains(CredentialType::USER_PASS_PLAINTEXT) {
             if let Ok(config) = git2::Config::open_default() {
+                let use_http_path = config.get_bool("credential.useHttpPath").unwrap_or(false);
+                if let Some(key) = (!use_http_path).then(|| parse_https_host(url)).flatten() {
+                    if attempts == 1 {
+                        if let Some((user, pass)) =
+                            cached_https_cred_with(&key, Instant::now(), fill_git_credential)
+                        {
+                            if let Ok(cred) = Cred::userpass_plaintext(&user, &pass) {
+                                return Ok(cred);
+                            }
+                        }
+                    } else {
+                        // Auth was rejected on the cached credential — evict immediately
+                        // and fall back to the uncached git credential helper.
+                        evict_https_cred(&key);
+                    }
+                }
                 if let Ok(cred) = Cred::credential_helper(&config, url, username) {
                     return Ok(cred);
                 }
@@ -180,24 +358,218 @@ pub(crate) fn status_of(repo: &Repository) -> GitStatus {
     }
 }
 
+/// Sentinel error returned when an interruptible network retry is aborted
+/// because the caller flipped the fleet cancellation flag.
+pub const ERR_CANCELLED: &str = "cancelled";
+
+/// Shared circuit-breaker and cancellation handle for bulk fleet network ops.
+///
+/// When a brief network drop (e.g. a 5–10s Wi-Fi roam or DHCP lease renewal)
+/// hits an in-flight fleet run, workers back off and retry instead of burning
+/// through hundreds of queued repositories. Once `trip_threshold` consecutive
+/// transient failures exhaust their retries without any intervening success,
+/// the gate trips so truly-offline runs still fail fast.
+pub struct NetworkRetryGate<'a> {
+    pub cancel: &'a std::sync::atomic::AtomicBool,
+    pub consecutive_failures: &'a std::sync::atomic::AtomicUsize,
+    pub trip_threshold: usize,
+}
+
+const SINGLE_RETRY_BACKOFFS: &[std::time::Duration] = &[
+    std::time::Duration::from_millis(500),
+    std::time::Duration::from_millis(1500),
+];
+const FLEET_RETRY_BACKOFFS: &[std::time::Duration] = &[
+    std::time::Duration::from_secs(1),
+    std::time::Duration::from_secs(2),
+    std::time::Duration::from_secs(3),
+    std::time::Duration::from_secs(4),
+];
+const CANCEL_POLL_STEP: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// Collapse embedded CR/LF/tabs into single spaces so git2/SSH multi-line
+/// messages render cleanly on one Action Log / toast line.
+fn normalize_error_message(msg: &str) -> String {
+    msg.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// True when a `libgit2` transport error looks like a transient network, DNS,
+/// or connection-drop blip worth retrying after a short backoff. Permanent
+/// repository/auth rejections (404, auth failure, repository not found) never
+/// match so they fail immediately.
+pub(crate) fn is_transient_transport_error(msg: &str) -> bool {
+    let lower = msg.to_ascii_lowercase();
+    if lower.contains("repository not found")
+        || lower.contains("unexpected http status code: 401")
+        || lower.contains("unexpected http status code: 403")
+        || lower.contains("unexpected http status code: 404")
+        || lower.contains("authentication")
+        || lower.contains("permission denied")
+        || lower.contains("credentials")
+        || lower.contains("host key")
+    {
+        return false;
+    }
+    lower.contains("temporary failure in name resolution")
+        || lower.contains("name or service not known")
+        || lower.contains("could not resolve host")
+        || lower.contains("nodename nor servname provided")
+        || lower.contains("no address associated with hostname")
+        || lower.contains("failed to resolve address")
+        || lower.contains("dns error")
+        || lower.contains("network is unreachable")
+        || lower.contains("network unreachable")
+        || lower.contains("network is down")
+        || lower.contains("network down")
+        || lower.contains("no route to host")
+        || lower.contains("connection refused")
+        || lower.contains("connection reset")
+        || lower.contains("connection aborted")
+        || lower.contains("connection closed")
+        || lower.contains("closed connection")
+        || lower.contains("remote closed")
+        || lower.contains("software caused connection abort")
+        || lower.contains("broken pipe")
+        || lower.contains("timed out")
+        || lower.contains("timeout")
+        || lower.contains("could not connect")
+        || lower.contains("failed to connect")
+        || lower.contains("unable to connect")
+        || lower.contains("socket disconnected")
+        || lower.contains("unexpected eof")
+        || lower.contains("early eof")
+        || lower.contains("failed to send")
+        || lower.contains("failed to receive")
+        || lower.contains("failed to start ssh session")
+        || lower.contains("unexpected http status code: 429")
+        || lower.contains("unexpected http status code: 500")
+        || lower.contains("unexpected http status code: 502")
+        || lower.contains("unexpected http status code: 503")
+        || lower.contains("unexpected http status code: 504")
+}
+
+/// Sleep up to `total` in `step` increments; returns `true` if `cancel` fired.
+fn sleep_interruptible(
+    total: std::time::Duration,
+    step: std::time::Duration,
+    cancel: &std::sync::atomic::AtomicBool,
+) -> bool {
+    use std::sync::atomic::Ordering;
+
+    let step = step.max(std::time::Duration::from_millis(1));
+    let mut remaining = total;
+    while !remaining.is_zero() {
+        if cancel.load(Ordering::SeqCst) {
+            return true;
+        }
+        let chunk = remaining.min(step);
+        std::thread::sleep(chunk);
+        remaining = remaining.saturating_sub(chunk);
+    }
+    cancel.load(Ordering::SeqCst)
+}
+
+fn retry_network_op<T>(
+    gate: Option<&NetworkRetryGate<'_>>,
+    backoffs: &[std::time::Duration],
+    poll_step: std::time::Duration,
+    mut op: impl FnMut() -> Result<T, String>,
+) -> Result<T, String> {
+    use std::sync::atomic::Ordering;
+
+    let mut attempt = 0usize;
+    loop {
+        if gate.is_some_and(|g| g.cancel.load(Ordering::SeqCst)) {
+            return Err(ERR_CANCELLED.into());
+        }
+        match op() {
+            Ok(val) => {
+                if let Some(g) = gate {
+                    g.consecutive_failures.store(0, Ordering::Relaxed);
+                }
+                return Ok(val);
+            }
+            Err(raw) => {
+                let msg = normalize_error_message(&raw);
+                if !is_transient_transport_error(&msg) {
+                    return Err(msg);
+                }
+                let breaker_tripped = gate.is_some_and(|g| {
+                    g.consecutive_failures.load(Ordering::Relaxed) >= g.trip_threshold.max(1)
+                });
+                if breaker_tripped {
+                    return Err(msg);
+                }
+                let Some(&delay) = backoffs.get(attempt) else {
+                    if let Some(g) = gate {
+                        g.consecutive_failures.fetch_add(1, Ordering::Relaxed);
+                    }
+                    return Err(msg);
+                };
+                attempt += 1;
+                if let Some(g) = gate {
+                    if sleep_interruptible(delay, poll_step, g.cancel) {
+                        return Err(ERR_CANCELLED.into());
+                    }
+                } else {
+                    std::thread::sleep(delay);
+                }
+            }
+        }
+    }
+}
+
+fn fetch_remote_with_retry(
+    remote: &mut git2::Remote<'_>,
+    refspecs: &[&str],
+    gate: Option<&NetworkRetryGate<'_>>,
+) -> Result<(), String> {
+    let backoffs = if gate.is_some() {
+        FLEET_RETRY_BACKOFFS
+    } else {
+        SINGLE_RETRY_BACKOFFS
+    };
+    retry_network_op(gate, backoffs, CANCEL_POLL_STEP, || {
+        let mut opts = FetchOptions::new();
+        opts.remote_callbacks(remote_callbacks());
+        remote
+            .fetch(refspecs, Some(&mut opts), None)
+            .map_err(|e| e.to_string())
+    })
+}
+
+fn fetch_origin_with_gate(
+    repo: &Repository,
+    gate: Option<&NetworkRetryGate<'_>>,
+) -> Result<(), String> {
+    if let Ok(mut remote) = repo.find_remote("origin") {
+        let refspecs: Vec<String> = remote
+            .fetch_refspecs()
+            .map(|r| r.iter().flatten().map(String::from).collect())
+            .unwrap_or_default();
+        let refs: Vec<&str> = refspecs.iter().map(String::as_str).collect();
+        fetch_remote_with_retry(&mut remote, &refs, gate)?;
+    }
+    Ok(())
+}
+
 /// Fetch the `origin` remote, then return refreshed git status.
 pub fn fetch(path: &str) -> Result<GitStatus, String> {
+    fetch_with_gate(path, None)
+}
+
+/// Like [`fetch`], using `gate` to ride out brief fleet network drops and
+/// respect cancellation during backoff.
+pub fn fetch_with_gate(
+    path: &str,
+    gate: Option<&NetworkRetryGate<'_>>,
+) -> Result<GitStatus, String> {
     let path = crate::scan::expand(path);
     let path = path
         .to_str()
         .ok_or_else(|| "invalid repository path".to_string())?;
     let repo = Repository::open(path).map_err(|e| e.to_string())?;
-    if let Ok(mut remote) = repo.find_remote("origin") {
-        let mut opts = FetchOptions::new();
-        opts.remote_callbacks(remote_callbacks());
-        let refspecs: Vec<String> = remote
-            .fetch_refspecs()
-            .map(|r| r.iter().flatten().map(String::from).collect())
-            .unwrap_or_default();
-        remote
-            .fetch(&refspecs, Some(&mut opts), None)
-            .map_err(|e| e.to_string())?;
-    }
+    fetch_origin_with_gate(&repo, gate)?;
     Ok(status_of(&repo))
 }
 
@@ -313,22 +685,22 @@ pub fn pull_with_files(
     path: &str,
     rebase_if_diverged: bool,
 ) -> Result<(OpOutcome, Vec<String>), String> {
+    pull_with_files_and_gate(path, rebase_if_diverged, None)
+}
+
+/// Like [`pull_with_files`], using `gate` for transient fetch retries and
+/// fleet cancellation.
+pub fn pull_with_files_and_gate(
+    path: &str,
+    rebase_if_diverged: bool,
+    gate: Option<&NetworkRetryGate<'_>>,
+) -> Result<(OpOutcome, Vec<String>), String> {
     let path = crate::scan::expand(path);
     let path = path
         .to_str()
         .ok_or_else(|| "invalid repository path".to_string())?;
     let repo = Repository::open(path).map_err(|e| e.to_string())?;
-    if let Ok(mut remote) = repo.find_remote("origin") {
-        let mut opts = FetchOptions::new();
-        opts.remote_callbacks(remote_callbacks());
-        let refspecs: Vec<String> = remote
-            .fetch_refspecs()
-            .map(|r| r.iter().flatten().map(String::from).collect())
-            .unwrap_or_default();
-        remote
-            .fetch(&refspecs, Some(&mut opts), None)
-            .map_err(|e| e.to_string())?;
-    }
+    fetch_origin_with_gate(&repo, gate)?;
 
     let (branch, local_oid) = {
         let head = repo.head().map_err(|e| e.to_string())?;
@@ -480,18 +852,17 @@ fn tree_diff_paths(repo: &Repository, from: git2::Oid, to: git2::Oid) -> Vec<Str
 /// tracked remote tip (typically `origin/<branch>`), discarding local commits
 /// and uncommitted changes. Skips detached HEAD / missing upstream.
 pub fn reset_hard_upstream(path: &str) -> Result<OpOutcome, String> {
+    reset_hard_upstream_with_gate(path, None)
+}
+
+/// Like [`reset_hard_upstream`], using `gate` for transient fetch retries and
+/// fleet cancellation.
+pub fn reset_hard_upstream_with_gate(
+    path: &str,
+    gate: Option<&NetworkRetryGate<'_>>,
+) -> Result<OpOutcome, String> {
     let repo = Repository::open(path).map_err(|e| e.to_string())?;
-    if let Ok(mut remote) = repo.find_remote("origin") {
-        let mut opts = FetchOptions::new();
-        opts.remote_callbacks(remote_callbacks());
-        let refspecs: Vec<String> = remote
-            .fetch_refspecs()
-            .map(|r| r.iter().flatten().map(String::from).collect())
-            .unwrap_or_default();
-        remote
-            .fetch(&refspecs, Some(&mut opts), None)
-            .map_err(|e| e.to_string())?;
-    }
+    fetch_origin_with_gate(&repo, gate)?;
 
     let head = repo.head().map_err(|e| e.to_string())?;
     if !head.is_branch() {
@@ -883,9 +1254,26 @@ fn short_oid(oid: git2::Oid) -> String {
     full[..7.min(full.len())].to_string()
 }
 
+/// Fast-path read of `.git/refs/remotes/origin/HEAD` without opening libgit2.
+fn default_branch_fast_path(path: &str) -> Option<String> {
+    let ref_file = std::path::Path::new(path)
+        .join(".git")
+        .join("refs")
+        .join("remotes")
+        .join("origin")
+        .join("HEAD");
+    let raw = std::fs::read_to_string(ref_file).ok()?;
+    let target = raw.trim().strip_prefix("ref:")?.trim();
+    let name = target.rsplit('/').next()?.trim();
+    (!name.is_empty()).then(|| name.to_string())
+}
+
 /// The repo's default branch name (`origin/HEAD`, else a local main/master) —
 /// the base branch for "Open PR" and the merged checks.
 pub fn default_branch(path: &str) -> Option<String> {
+    if let Some(name) = default_branch_fast_path(path) {
+        return Some(name);
+    }
     Repository::open(path)
         .ok()
         .and_then(|r| default_branch_name(&r))
@@ -1979,6 +2367,15 @@ pub fn commit_all(path: &str, message: &str) -> Result<String, String> {
 /// nothing is declared (callers map that to Skip). Any hard failure in a child
 /// fails the whole op with the combined summary.
 pub fn submodule_update(path: &str) -> Result<String, String> {
+    submodule_update_with_gate(path, None)
+}
+
+/// Like [`submodule_update`], using `gate` for transient fetch retries and
+/// fleet cancellation.
+pub fn submodule_update_with_gate(
+    path: &str,
+    gate: Option<&NetworkRetryGate<'_>>,
+) -> Result<String, String> {
     // Fleet / UI ids are absolute, but abbreviated `~/…` paths (or pasted
     // roots) must expand before libgit2 / `Path::join` — otherwise open fails
     // with `failed to open directory '~/…'` or `.gitmodules` is missed.
@@ -1998,8 +2395,9 @@ pub fn submodule_update(path: &str) -> Result<String, String> {
     let mut parts: Vec<String> = Vec::with_capacity(entries.len());
     let mut hard_fail = false;
     for entry in &entries {
-        match pull_one_submodule(path, &entry.path, entry.branch.as_deref()) {
+        match pull_one_submodule(path, &entry.path, entry.branch.as_deref(), gate) {
             Ok(msg) => parts.push(msg),
+            Err(e) if e == ERR_CANCELLED => return Err(e),
             Err(e) => {
                 hard_fail = true;
                 parts.push(format!("{}: {e}", entry.path));
@@ -2019,6 +2417,7 @@ fn pull_one_submodule(
     parent: &str,
     rel: &str,
     configured_branch: Option<&str>,
+    gate: Option<&NetworkRetryGate<'_>>,
 ) -> Result<String, String> {
     let abs = std::path::Path::new(parent).join(rel);
     let freshly_inited = ensure_submodule_checkout(parent, rel, &abs)?;
@@ -2028,7 +2427,7 @@ fn pull_one_submodule(
 
     // Fetch first so a configured branch can be created from origin/<branch>
     // when the checkout is still detached at the parent's recorded SHA.
-    let _ = fetch(abs_str)?;
+    let _ = fetch_with_gate(abs_str, gate)?;
 
     let target = match submodule_target_branch(abs_str, configured_branch)? {
         Some(b) => b,
@@ -2042,7 +2441,7 @@ fn pull_one_submodule(
         }
     };
 
-    match ensure_submodule_on_branch(abs_str, &target)? {
+    match ensure_submodule_on_branch(abs_str, &target, gate)? {
         OpOutcome::Skipped(r) => {
             let note = if freshly_inited {
                 format!("{rel}: initialized; skipped ({r})")
@@ -2054,7 +2453,7 @@ fn pull_one_submodule(
         OpOutcome::Done(_) => {}
     }
 
-    match pull(abs_str)? {
+    match pull_with_files_and_gate(abs_str, false, gate)?.0 {
         OpOutcome::Done(s) => Ok(format!("{rel}: {s}")),
         OpOutcome::Skipped(r) => {
             if freshly_inited {
@@ -2127,23 +2526,26 @@ fn submodule_target_branch(
 /// Needed when the submodule remote uses a narrow refspec (e.g. only
 /// `+refs/heads/master:refs/remotes/origin/master`) so a configured
 /// `.gitmodules` `branch = 15.0` never appears after a default fetch.
-fn fetch_origin_branch(sub_path: &str, branch: &str) -> Result<(), String> {
+fn fetch_origin_branch(
+    sub_path: &str,
+    branch: &str,
+    gate: Option<&NetworkRetryGate<'_>>,
+) -> Result<(), String> {
     let repo = Repository::open(sub_path).map_err(|e| e.to_string())?;
     let mut remote = repo
         .find_remote("origin")
         .map_err(|_| "no 'origin' remote".to_string())?;
-    let mut opts = FetchOptions::new();
-    opts.remote_callbacks(remote_callbacks());
     let refspec = format!("+refs/heads/{branch}:refs/remotes/origin/{branch}");
-    remote
-        .fetch(&[refspec.as_str()], Some(&mut opts), None)
-        .map_err(|e| e.to_string())?;
-    Ok(())
+    fetch_remote_with_retry(&mut remote, &[refspec.as_str()], gate)
 }
 
 /// Check out `branch` in the submodule without discarding dirty work.
 /// Creates a local tracking branch from `origin/<branch>` when needed.
-fn ensure_submodule_on_branch(sub_path: &str, branch: &str) -> Result<OpOutcome, String> {
+fn ensure_submodule_on_branch(
+    sub_path: &str,
+    branch: &str,
+    gate: Option<&NetworkRetryGate<'_>>,
+) -> Result<OpOutcome, String> {
     let repo = Repository::open(sub_path).map_err(|e| e.to_string())?;
     if let Ok(head) = repo.head() {
         if head.is_branch() && head.shorthand() == Some(branch) {
@@ -2162,7 +2564,7 @@ fn ensure_submodule_on_branch(sub_path: &str, branch: &str) -> Result<OpOutcome,
     let remote_ref = format!("refs/remotes/origin/{branch}");
     if repo.find_reference(&remote_ref).is_err() {
         // Narrow fetch refspecs omit non-default branches; pull the tip we need.
-        fetch_origin_branch(sub_path, branch)?;
+        fetch_origin_branch(sub_path, branch, gate)?;
     }
     let repo = Repository::open(sub_path).map_err(|e| e.to_string())?;
     let remote = repo
@@ -3663,5 +4065,248 @@ mod tests {
         assert!(!contains_potential_secret(
             "fix(ui): placeholder for gsk_ in text"
         ));
+    }
+
+    #[test]
+    fn normalize_error_message_collapses_newlines_and_tabs() {
+        assert_eq!(
+            normalize_error_message(
+                "ERROR: Repository not found.\n; class=Ssh (23); code=Eof (-20)"
+            ),
+            "ERROR: Repository not found. ; class=Ssh (23); code=Eof (-20)"
+        );
+        assert_eq!(
+            normalize_error_message("  line1\r\n\tline2  "),
+            "line1 line2"
+        );
+    }
+
+    #[test]
+    fn is_transient_transport_error_distinguishes_blips_from_permanent_failures() {
+        assert!(is_transient_transport_error(
+            "failed to resolve address for github.com: Temporary failure in name resolution"
+        ));
+        assert!(is_transient_transport_error(
+            "failed to connect to github.com: Network is unreachable"
+        ));
+        assert!(is_transient_transport_error(
+            "unexpected http status code: 503; class=Http (34)"
+        ));
+        assert!(is_transient_transport_error(
+            "failed to start SSH session: Socket disconnected"
+        ));
+
+        // Permanent repository/auth errors must fail immediately without retry.
+        assert!(!is_transient_transport_error(
+            "unexpected http status code: 404; class=Http (34)"
+        ));
+        assert!(!is_transient_transport_error(
+            "ERROR: Repository not found. ; class=Ssh (23); code=Eof (-20)"
+        ));
+        assert!(!is_transient_transport_error("authentication failed"));
+        assert!(!is_transient_transport_error(
+            "remote: Permission to org/repo.git denied to user."
+        ));
+        assert!(!is_transient_transport_error("invalid host key"));
+    }
+
+    #[test]
+    fn retry_network_op_recovers_after_transient_blips_and_resets_breaker() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::time::Duration;
+
+        let cancel = AtomicBool::new(false);
+        let failures = AtomicUsize::new(2);
+        let gate = NetworkRetryGate {
+            cancel: &cancel,
+            consecutive_failures: &failures,
+            trip_threshold: 4,
+        };
+        let backoffs = [Duration::from_millis(1), Duration::from_millis(1)];
+        let mut calls = 0usize;
+        let res = retry_network_op(Some(&gate), &backoffs, Duration::from_millis(1), || {
+            calls += 1;
+            if calls < 3 {
+                Err("failed to resolve address for github.com: Temporary failure in name resolution".into())
+            } else {
+                Ok("fetched")
+            }
+        });
+        assert_eq!(res.unwrap(), "fetched");
+        assert_eq!(calls, 3);
+        assert_eq!(failures.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn retry_network_op_trips_breaker_and_fails_fast_when_persistently_offline() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::time::Duration;
+
+        let cancel = AtomicBool::new(false);
+        let failures = AtomicUsize::new(0);
+        let gate = NetworkRetryGate {
+            cancel: &cancel,
+            consecutive_failures: &failures,
+            trip_threshold: 2,
+        };
+        let backoffs = [Duration::from_millis(1), Duration::from_millis(1)];
+
+        // First two repos exhaust retries and trip the threshold (= 2).
+        for _ in 0..2 {
+            let mut calls = 0usize;
+            let err =
+                retry_network_op::<()>(Some(&gate), &backoffs, Duration::from_millis(1), || {
+                    calls += 1;
+                    Err("Network is unreachable".into())
+                })
+                .unwrap_err();
+            assert_eq!(err, "Network is unreachable");
+            assert_eq!(calls, 3);
+        }
+        assert_eq!(failures.load(Ordering::Relaxed), 2);
+
+        // Once tripped, subsequent repos attempt once with zero retry sleeps.
+        let mut fast_calls = 0usize;
+        let err = retry_network_op::<()>(Some(&gate), &backoffs, Duration::from_millis(1), || {
+            fast_calls += 1;
+            Err("Network is unreachable".into())
+        })
+        .unwrap_err();
+        assert_eq!(err, "Network is unreachable");
+        assert_eq!(fast_calls, 1);
+
+        // If connectivity returns later, a single success heals the breaker.
+        let ok =
+            retry_network_op(Some(&gate), &backoffs, Duration::from_millis(1), || Ok(42)).unwrap();
+        assert_eq!(ok, 42);
+        assert_eq!(failures.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn retry_network_op_aborts_sleep_early_when_cancelled() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::Arc;
+        use std::time::{Duration, Instant};
+
+        let cancel = Arc::new(AtomicBool::new(false));
+        let failures = AtomicUsize::new(0);
+        let gate = NetworkRetryGate {
+            cancel: &cancel,
+            consecutive_failures: &failures,
+            trip_threshold: 2,
+        };
+        let cancel_bg = Arc::clone(&cancel);
+        let handle = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(15));
+            cancel_bg.store(true, Ordering::SeqCst);
+        });
+
+        let t0 = Instant::now();
+        let err = retry_network_op::<()>(
+            Some(&gate),
+            &[Duration::from_secs(5)],
+            Duration::from_millis(5),
+            || Err("timed out".into()),
+        )
+        .unwrap_err();
+        handle.join().unwrap();
+
+        assert_eq!(err, ERR_CANCELLED);
+        assert!(
+            t0.elapsed() < Duration::from_secs(1),
+            "sleep took {:?}",
+            t0.elapsed()
+        );
+    }
+
+    #[test]
+    fn retry_network_op_skips_retry_and_breaker_for_permanent_errors() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::time::Duration;
+
+        let cancel = AtomicBool::new(false);
+        let failures = AtomicUsize::new(0);
+        let gate = NetworkRetryGate {
+            cancel: &cancel,
+            consecutive_failures: &failures,
+            trip_threshold: 1,
+        };
+        let mut calls = 0usize;
+        let err = retry_network_op::<()>(
+            Some(&gate),
+            &[Duration::from_millis(1)],
+            Duration::from_millis(1),
+            || {
+                calls += 1;
+                Err("unexpected http status code: 404; class=Http (34)".into())
+            },
+        )
+        .unwrap_err();
+        assert_eq!(err, "unexpected http status code: 404; class=Http (34)");
+        assert_eq!(calls, 1);
+        assert_eq!(failures.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn default_branch_fast_path_reads_origin_head_symref() {
+        let dir = tempfile::tempdir().unwrap();
+        let origin_ref = dir.path().join(".git/refs/remotes/origin");
+        std::fs::create_dir_all(&origin_ref).unwrap();
+        std::fs::write(origin_ref.join("HEAD"), "ref: refs/remotes/origin/19.0\n").unwrap();
+        let path = dir.path().to_str().unwrap();
+        assert_eq!(default_branch_fast_path(path).as_deref(), Some("19.0"));
+        assert_eq!(default_branch(path).as_deref(), Some("19.0"));
+    }
+
+    #[test]
+    fn init_runtime_limits_configures_bounded_mwindow_caps() {
+        init_runtime_limits();
+        // SAFETY: Reading libgit2 global limits after init_runtime_limits().
+        unsafe {
+            assert_eq!(git2::opts::get_mwindow_size().unwrap(), MWINDOW_SIZE_BYTES);
+            assert_eq!(
+                git2::opts::get_mwindow_mapped_limit().unwrap(),
+                MWINDOW_MAPPED_LIMIT_BYTES
+            );
+        }
+    }
+
+    #[test]
+    fn https_cred_cache_scopes_by_host_and_evicts() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        assert_eq!(
+            parse_https_host("https://GitHub.com/owner/repo.git"),
+            Some(("https".into(), "github.com".into()))
+        );
+        assert_eq!(parse_https_host("http://github.com/owner/repo.git"), None);
+        assert_eq!(parse_https_host("git@github.com:owner/repo.git"), None);
+
+        let key = ("https".to_string(), "unit-test-host.example".to_string());
+        evict_https_cred(&key);
+        let calls = AtomicUsize::new(0);
+        let t0 = Instant::now();
+
+        let first = cached_https_cred_with(&key, t0, |_, _| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Some(("u1".into(), "p1".into()))
+        });
+        assert_eq!(first, Some(("u1".into(), "p1".into())));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        let second = cached_https_cred_with(&key, t0 + Duration::from_secs(30), |_, _| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Some(("u2".into(), "p2".into()))
+        });
+        assert_eq!(second, Some(("u1".into(), "p1".into())));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        evict_https_cred(&key);
+        let third = cached_https_cred_with(&key, t0 + Duration::from_secs(31), |_, _| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Some(("u3".into(), "p3".into()))
+        });
+        assert_eq!(third, Some(("u3".into(), "p3".into())));
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        evict_https_cred(&key);
     }
 }

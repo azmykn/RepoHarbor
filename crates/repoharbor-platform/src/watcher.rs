@@ -24,20 +24,57 @@ use std::time::Duration;
 
 use notify_debouncer_mini::new_debouncer;
 use notify_debouncer_mini::notify::{RecommendedWatcher, RecursiveMode};
-use notify_debouncer_mini::{DebounceEventResult, Debouncer};
+use notify_debouncer_mini::{DebounceEventResult, DebouncedEvent, Debouncer};
 use repoharbor_core::config;
 use repoharbor_core::model::AppConfig;
 use repoharbor_core::scan::{self, expand};
 
 /// How deep under each repo root to register non-recursive directory watches.
 /// Depth 0 is the repo root itself (already watched); 1 = immediate children,
-/// etc. Three levels covers typical `models/`, `views/`, `static/src/…` layouts
-/// without descending into huge generated trees.
-const NESTED_WATCH_DEPTH: usize = 3;
+/// 2 = one nested level (`src/nested`, `models/`, `views/`). Keeps inotify
+/// usage lean on large multi-hundred-repo fleets.
+const NESTED_WATCH_DEPTH: usize = 2;
 
 /// Hard cap on nested directory watches *per repo* (in addition to the repo
 /// root + `.git`). Keeps inotify usage bounded on giant checkouts (Odoo core).
-const NESTED_WATCH_CAP: usize = 96;
+const NESTED_WATCH_CAP: usize = 32;
+
+/// Debounce window for coalescing bursts of filesystem writes before signalling.
+const WATCH_DEBOUNCE: Duration = Duration::from_millis(1_500);
+
+/// Built-in noisy directory names that are always excluded from nested watches
+/// and event triggers, even when not listed in the user's `config.toml` ignore list.
+const BUILTIN_WATCH_IGNORE: &[&str] = &[
+    ".git",
+    ".hg",
+    ".svn",
+    "__pycache__",
+    ".pytest_cache",
+    ".mypy_cache",
+    ".ruff_cache",
+    ".tox",
+    ".nox",
+    "venv",
+    ".venv",
+    ".idea",
+    ".vscode",
+    ".cursor",
+    ".windsurf",
+    ".theia",
+    ".next",
+    ".nuxt",
+    ".svelte-kit",
+    ".turbo",
+    ".parcel-cache",
+    "coverage",
+    "htmlcov",
+    "build",
+    "out",
+    "logs",
+    "tmp",
+    ".gradle",
+    ".dart_tool",
+];
 
 /// What the watcher thread reacts to: a debounced fs change batch from the
 /// debouncer, or a re-arm request from the app.
@@ -69,8 +106,76 @@ fn watch_one(debouncer: &mut Debouncer<RecommendedWatcher>, path: &std::path::Pa
 }
 
 fn ignored_dir(name: &str, ignore: &[String]) -> bool {
-    // VCS metadata + configured scan ignores (node_modules, target, …).
-    name == ".git" || name == ".hg" || name == ".svn" || ignore.iter().any(|p| p == name)
+    // VCS metadata, IDE/cache/runtime output dirs, plus configured scan ignores.
+    BUILTIN_WATCH_IGNORE.contains(&name) || ignore.iter().any(|p| p == name)
+}
+
+/// High-signal files inside `.git/` that represent real repo state transitions
+/// (commits, staging, branch switches, merges, rebases, ref updates). Transient
+/// files like `FETCH_HEAD`, `ORIG_HEAD`, `COMMIT_EDITMSG`, `*.lock`, and `logs/`
+/// are ignored so no-op fetches and external git housekeeping don't storm rescans.
+fn is_meaningful_dotgit_event(after_dotgit: &[&str]) -> bool {
+    match after_dotgit {
+        [] => false,
+        [first, ..] => {
+            if first.ends_with(".lock") {
+                return false;
+            }
+            matches!(
+                *first,
+                "HEAD"
+                    | "index"
+                    | "MERGE_HEAD"
+                    | "REBASE_HEAD"
+                    | "CHERRY_PICK_HEAD"
+                    | "packed-refs"
+                    | "config"
+                    | "refs"
+            )
+        }
+    }
+}
+
+/// True when a filename outside `.git/` is a noisy transient/log/IDE/cache file
+/// that should never trigger a full-workspace git rescan on its own.
+fn is_noisy_filename(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    lower.ends_with(".log")
+        || lower.ends_with(".tmp")
+        || lower.ends_with(".swp")
+        || lower.ends_with(".swo")
+        || lower.ends_with('~')
+        || lower.ends_with(".pyc")
+        || lower.ends_with(".pyo")
+        || lower.ends_with(".sqlite-wal")
+        || lower.ends_with(".sqlite-shm")
+        || lower.ends_with(".sqlite-journal")
+        || lower.ends_with(".stats.json")
+        || matches!(lower.as_str(), "workspace.xml" | "tasks.xml")
+}
+
+/// Decide whether a debounced event batch contains at least one meaningful
+/// repository change worth rescanning. Pure helper — unit-tested below.
+fn should_trigger_rescan(events: &[DebouncedEvent], ignore: &[String]) -> bool {
+    events.iter().any(|ev| {
+        let components: Vec<&str> = ev
+            .path
+            .components()
+            .filter_map(|c| c.as_os_str().to_str())
+            .collect();
+        if let Some(git_pos) = components.iter().position(|&c| c == ".git") {
+            return is_meaningful_dotgit_event(&components[git_pos + 1..]);
+        }
+        if let Some((file_name, parent_dirs)) = components.split_last() {
+            if parent_dirs.iter().any(|dir| ignored_dir(dir, ignore)) {
+                return false;
+            }
+            if is_noisy_filename(file_name) || ignored_dir(file_name, ignore) {
+                return false;
+            }
+        }
+        true
+    })
 }
 
 /// Shallow directory list under `repo` for nested watches. Skips configured
@@ -132,17 +237,19 @@ fn target_paths(cfg: &AppConfig) -> Vec<PathBuf> {
     paths
 }
 
-fn watch_targets(debouncer: &mut Debouncer<RecommendedWatcher>) -> usize {
-    target_paths(&config::load())
-        .iter()
-        .filter(|path| watch_one(debouncer, path))
-        .count()
+fn watch_targets(debouncer: &mut Debouncer<RecommendedWatcher>) -> Vec<String> {
+    let cfg = config::load();
+    for path in target_paths(&cfg) {
+        let _ = watch_one(debouncer, &path);
+    }
+    cfg.ignore
 }
 
 /// Spawn the watcher thread. `on_change` fires on each debounced change batch
-/// (the app rescans). The returned handle re-arms the watch set on demand; the
-/// thread stays alive even with zero established watches so a later re-arm
-/// (e.g. the first root added in Settings) can bring the watch up.
+/// that passes path filtering (the app rescans). The returned handle re-arms
+/// the watch set on demand; the thread stays alive even with zero established
+/// watches so a later re-arm (e.g. the first root added in Settings) can bring
+/// the watch up.
 pub fn spawn(on_change: impl Fn() + Send + 'static) -> WatcherHandle {
     let (tx, rx) = std::sync::mpsc::channel::<Msg>();
     let handle = WatcherHandle { tx: tx.clone() };
@@ -151,32 +258,32 @@ pub fn spawn(on_change: impl Fn() + Send + 'static) -> WatcherHandle {
         // requests arrive on, so one recv loop serves both.
         let make_debouncer = || {
             let tx = tx.clone();
-            new_debouncer(
-                Duration::from_millis(900),
-                move |res: DebounceEventResult| {
-                    let _ = tx.send(Msg::Fs(res));
-                },
-            )
+            new_debouncer(WATCH_DEBOUNCE, move |res: DebounceEventResult| {
+                let _ = tx.send(Msg::Fs(res));
+            })
         };
         let Ok(mut debouncer) = make_debouncer() else {
             return;
         };
-        watch_targets(&mut debouncer);
+        let mut ignore = watch_targets(&mut debouncer);
 
-        // Keep `debouncer` alive for the life of the thread; fire only on real
-        // change batches (`Msg::Fs` also carries notify errors, which we ignore
-        // so a degraded watch can't spam rescans). On re-arm, drop the debouncer
-        // — and with it every existing watch — and register a fresh set from
-        // the current config: recreating is simpler than diffing paths, and
-        // re-arms are rare (explicit user actions). Exits on disconnect.
+        // Keep `debouncer` alive for the life of the thread; fire only on real,
+        // non-noisy change batches (`Msg::Fs` also carries notify errors, which
+        // we ignore so a degraded watch can't spam rescans). On re-arm, drop
+        // the debouncer — and with it every existing watch — and register a
+        // fresh set from the current config. Exits on disconnect.
         while let Ok(msg) = rx.recv() {
             match msg {
-                Msg::Fs(Ok(_events)) => on_change(),
+                Msg::Fs(Ok(events)) => {
+                    if should_trigger_rescan(&events, &ignore) {
+                        on_change();
+                    }
+                }
                 Msg::Fs(Err(_)) => {}
                 Msg::Rearm => {
                     if let Ok(fresh) = make_debouncer() {
                         debouncer = fresh;
-                        watch_targets(&mut debouncer);
+                        ignore = watch_targets(&mut debouncer);
                     }
                 }
             }
@@ -250,5 +357,60 @@ mod tests {
         }
         let dirs = nested_watch_dirs(root.path(), &[]);
         assert!(dirs.len() <= NESTED_WATCH_CAP);
+    }
+
+    #[test]
+    fn ignored_dir_skips_builtin_noisy_dirs() {
+        for noisy in [
+            "__pycache__",
+            ".idea",
+            ".cursor",
+            ".ruff_cache",
+            ".venv",
+            "out",
+            "logs",
+        ] {
+            assert!(ignored_dir(noisy, &[]), "{noisy} must be ignored");
+        }
+        assert!(!ignored_dir("src", &[]));
+        assert!(!ignored_dir(".github", &[]));
+    }
+
+    #[test]
+    fn should_trigger_rescan_filters_noisy_paths() {
+        use notify_debouncer_mini::DebouncedEventKind;
+        let ev = |p: &str| DebouncedEvent {
+            path: PathBuf::from(p),
+            kind: DebouncedEventKind::Any,
+        };
+
+        // Transient git internals & runtime logs/IDE files must not trigger.
+        assert!(!should_trigger_rescan(&[ev("/repo/.git/FETCH_HEAD")], &[]));
+        assert!(!should_trigger_rescan(&[ev("/repo/.git/index.lock")], &[]));
+        assert!(!should_trigger_rescan(
+            &[ev("/repo/tools/out/ns_2024_ship.log")],
+            &[]
+        ));
+        assert!(!should_trigger_rescan(
+            &[ev("/repo/tools/out/ns_archive.sqlite.stats.json")],
+            &[]
+        ));
+        assert!(!should_trigger_rescan(
+            &[ev("/repo/.idea/workspace.xml")],
+            &[]
+        ));
+        assert!(!should_trigger_rescan(
+            &[ev("/repo/pkg/__pycache__/mod.cpython-312.pyc")],
+            &[]
+        ));
+
+        // High-signal git files and real source edits must trigger.
+        assert!(should_trigger_rescan(&[ev("/repo/.git/index")], &[]));
+        assert!(should_trigger_rescan(&[ev("/repo/.git/HEAD")], &[]));
+        assert!(should_trigger_rescan(
+            &[ev("/repo/.git/refs/remotes/origin/main")],
+            &[]
+        ));
+        assert!(should_trigger_rescan(&[ev("/repo/src/main.rs")], &[]));
     }
 }

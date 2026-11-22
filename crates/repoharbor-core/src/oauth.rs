@@ -7,9 +7,34 @@
 //!
 //! Sign out never calls `gh auth logout`.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::{LazyLock, Mutex};
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
+
+/// TTL for a resolved CLI token (`gh auth token` / `glab auth token`).
+/// Prevents spawning a multi-threaded Go CLI binary on every API call or UI render.
+const CLI_TOKEN_HIT_TTL: Duration = Duration::from_secs(300);
+
+/// Shorter negative-cache TTL when the CLI binary is missing or logged out so
+/// a fresh `gh auth login` is picked up quickly without hammering PATH/process spawn.
+const CLI_TOKEN_MISS_TTL: Duration = Duration::from_secs(30);
+
+struct CachedCliToken {
+    fetched_at: Instant,
+    token: Option<String>,
+}
+
+static CLI_TOKEN_CACHE: LazyLock<Mutex<HashMap<String, CachedCliToken>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Clear all cached CLI tokens (`gh` / `glab`). Call after auth state changes.
+pub fn invalidate_cli_token_cache() {
+    let mut cache = CLI_TOKEN_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    cache.clear();
+}
 
 const DEVICE_CODE_URL: &str = "https://github.com/login/device/code";
 const TOKEN_URL: &str = "https://github.com/login/oauth/access_token";
@@ -144,6 +169,7 @@ fn set_signed_out(on: bool) {
 /// Clear the RepoHarbor-only signed-out marker (e.g. after re-enabling CLI/env).
 pub fn clear_signed_out() {
     set_signed_out(false);
+    invalidate_cli_token_cache();
 }
 
 fn save_token(token: &str) -> Result<(), String> {
@@ -172,6 +198,7 @@ fn save_token(token: &str) -> Result<(), String> {
     }
     // A fresh RepoHarbor login supersedes Sign out.
     set_signed_out(false);
+    invalidate_cli_token_cache();
     Ok(())
 }
 
@@ -187,18 +214,57 @@ fn cli_token(bin: &str) -> Option<String> {
     (!token.is_empty()).then_some(token)
 }
 
+fn cli_token_cached_with<F>(bin: &str, now: Instant, fetch: F) -> Option<String>
+where
+    F: FnOnce(&str) -> Option<String>,
+{
+    {
+        let cache = CLI_TOKEN_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(entry) = cache.get(bin) {
+            let ttl = if entry.token.is_some() {
+                CLI_TOKEN_HIT_TTL
+            } else {
+                CLI_TOKEN_MISS_TTL
+            };
+            if now.saturating_duration_since(entry.fetched_at) < ttl {
+                return entry.token.clone();
+            }
+        }
+    }
+    let token = fetch(bin);
+    let mut cache = CLI_TOKEN_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    cache.insert(
+        bin.to_string(),
+        CachedCliToken {
+            fetched_at: now,
+            token: token.clone(),
+        },
+    );
+    token
+}
+
+fn cli_token_cached(bin: &str) -> Option<String> {
+    cli_token_cached_with(bin, Instant::now(), cli_token)
+}
+
 fn allow_cli_token() -> bool {
     crate::config::load().github_allow_cli_token
 }
 
-/// Pure resolution used by [`github_token`] / [`github_token_source`] and tests.
-pub fn resolve_github_token(
+/// Pure lazy resolution so `cli` (`gh auth token`) is never spawned when an
+/// earlier source (stored OAuth, signed-out marker, disabled fallback, or env)
+/// already decides the outcome.
+pub fn resolve_github_token_lazy<FE, FC>(
     stored: Option<String>,
     signed_out: bool,
     allow_cli: bool,
-    env: Option<String>,
-    cli: Option<String>,
-) -> Option<(String, GithubTokenSource)> {
+    env: FE,
+    cli: FC,
+) -> Option<(String, GithubTokenSource)>
+where
+    FE: FnOnce() -> Option<String>,
+    FC: FnOnce() -> Option<String>,
+{
     if let Some(token) = stored.filter(|s| !s.is_empty()) {
         return Some((token, GithubTokenSource::AppOAuth));
     }
@@ -209,34 +275,60 @@ pub fn resolve_github_token(
     if !allow_cli {
         return None;
     }
-    if let Some(token) = env.filter(|s| !s.is_empty()) {
+    if let Some(token) = env().filter(|s| !s.is_empty()) {
         return Some((token, GithubTokenSource::EnvVar));
     }
-    if let Some(token) = cli.filter(|s| !s.is_empty()) {
+    if let Some(token) = cli().filter(|s| !s.is_empty()) {
         return Some((token, GithubTokenSource::GhCli));
     }
     None
 }
 
-/// Resolve a GitHub token and where it came from.
+/// Pure resolution used by tests and callers with pre-resolved values.
+pub fn resolve_github_token(
+    stored: Option<String>,
+    signed_out: bool,
+    allow_cli: bool,
+    env: Option<String>,
+    cli: Option<String>,
+) -> Option<(String, GithubTokenSource)> {
+    resolve_github_token_lazy(stored, signed_out, allow_cli, || env, || cli)
+}
+
+/// Resolve a GitHub token and where it came from (lazy + CLI-cached).
 pub fn github_token_source() -> Option<(String, GithubTokenSource)> {
-    resolve_github_token(
+    resolve_github_token_lazy(
         stored_github_token(),
         is_signed_out(),
         allow_cli_token(),
-        env_token("REPOHARBOR_GITHUB_TOKEN", "ORRERY_GITHUB_TOKEN"),
-        cli_token("gh"),
+        || env_token("REPOHARBOR_GITHUB_TOKEN", "ORRERY_GITHUB_TOKEN"),
+        || cli_token_cached("gh"),
     )
 }
 
-/// Resolve a GitHub token: stored OAuth → (unless signed out) env → `gh`.
+/// Snapshot of GitHub authentication state for UI surfaces (resolved off the UI thread).
+/// Returns `(authed, token_source, signed_out)`.
+pub fn github_auth_state() -> (bool, Option<GithubTokenSource>, bool) {
+    let signed_out = is_signed_out();
+    let source = resolve_github_token_lazy(
+        stored_github_token(),
+        signed_out,
+        allow_cli_token(),
+        || env_token("REPOHARBOR_GITHUB_TOKEN", "ORRERY_GITHUB_TOKEN"),
+        || cli_token_cached("gh"),
+    )
+    .map(|(_, s)| s);
+    (source.is_some(), source, signed_out)
+}
+
+/// Resolve a GitHub token: stored OAuth → (unless signed out) env → cached `gh`.
 pub fn github_token() -> Option<String> {
     github_token_source().map(|(t, _)| t)
 }
 
-/// Resolve a GitLab token: env → `glab auth token`.
+/// Resolve a GitLab token: env → cached `glab auth token`.
 pub fn gitlab_token() -> Option<String> {
-    env_token("REPOHARBOR_GITLAB_TOKEN", "ORRERY_GITLAB_TOKEN").or_else(|| cli_token("glab"))
+    env_token("REPOHARBOR_GITLAB_TOKEN", "ORRERY_GITLAB_TOKEN").or_else(|| cli_token_cached("glab"))
 }
 
 /// True if any GitHub token is available under current Sign-out / fallback rules.
@@ -349,6 +441,7 @@ pub fn sign_out() {
         let _ = std::fs::remove_file(path);
     }
     set_signed_out(true);
+    invalidate_cli_token_cache();
 }
 
 #[cfg(test)]
@@ -400,5 +493,70 @@ mod tests {
         assert_eq!(GithubTokenSource::AppOAuth.label(), "RepoHarbor OAuth");
         assert_eq!(GithubTokenSource::EnvVar.label(), "REPOHARBOR_GITHUB_TOKEN");
         assert_eq!(GithubTokenSource::GhCli.label(), "`gh` CLI");
+    }
+
+    #[test]
+    fn resolve_lazy_skips_cli_when_earlier_source_decides() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let calls = AtomicUsize::new(0);
+        let cli = || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Some("cli".into())
+        };
+
+        assert_eq!(
+            resolve_github_token_lazy(Some("oauth".into()), false, true, || None, cli),
+            Some(("oauth".into(), GithubTokenSource::AppOAuth))
+        );
+        assert_eq!(
+            resolve_github_token_lazy(None, true, true, || None, cli),
+            None
+        );
+        assert_eq!(
+            resolve_github_token_lazy(None, false, false, || None, cli),
+            None
+        );
+        assert_eq!(
+            resolve_github_token_lazy(None, false, true, || Some("env".into()), cli),
+            Some(("env".into(), GithubTokenSource::EnvVar))
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "cli must not be invoked");
+
+        assert_eq!(
+            resolve_github_token_lazy(None, false, true, || None, cli),
+            Some(("cli".into(), GithubTokenSource::GhCli))
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn cli_token_cache_hits_within_ttl_and_invalidates() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let key = "test-cli-cache-bin";
+        invalidate_cli_token_cache();
+        let calls = AtomicUsize::new(0);
+        let t0 = Instant::now();
+
+        let first = cli_token_cached_with(key, t0, |_| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Some("tok1".into())
+        });
+        assert_eq!(first.as_deref(), Some("tok1"));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        let second = cli_token_cached_with(key, t0 + Duration::from_secs(60), |_| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Some("tok2".into())
+        });
+        assert_eq!(second.as_deref(), Some("tok1"));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        invalidate_cli_token_cache();
+        let third = cli_token_cached_with(key, t0 + Duration::from_secs(61), |_| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Some("tok3".into())
+        });
+        assert_eq!(third.as_deref(), Some("tok3"));
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 }

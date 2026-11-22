@@ -92,7 +92,7 @@ pub async fn poll(cfg: &AppConfig) -> PollResult {
     let current: HashSet<String> = items.iter().map(|a| a.key.clone()).collect();
 
     let mut fresh = Vec::new();
-    if let Some(prev) = prev {
+    if let Some(ref prev) = prev {
         if cfg.notify_enabled {
             for a in &items {
                 if prev.contains(&a.key) || !type_enabled(cfg, a.kind) {
@@ -106,8 +106,10 @@ pub async fn poll(cfg: &AppConfig) -> PollResult {
         }
     }
 
-    if let Ok(blob) = serde_json::to_string(&current) {
-        cache::set_meta(SEEN_KEY, &blob);
+    if prev.as_ref() != Some(&current) {
+        if let Ok(blob) = serde_json::to_string(&current) {
+            cache::set_meta(SEEN_KEY, &blob);
+        }
     }
 
     PollResult {
@@ -142,11 +144,11 @@ fn short_repo(repo: &str) -> &str {
 async fn collect() -> (Vec<Attention>, Vec<inbox::InboxItem>) {
     let mut out = Vec::new();
     let mut raw = Vec::new();
-    if oauth::github_token().is_none() {
+    let Some(token) = oauth::github_token() else {
         return (out, raw);
-    }
+    };
 
-    if let Ok(items) = inbox::github_inbox().await {
+    if let Ok(items) = inbox::github_inbox_with_token(&token).await {
         for it in &items {
             let short = short_repo(&it.repo);
             match it.kind.as_str() {
@@ -174,7 +176,7 @@ async fn collect() -> (Vec<Attention>, Vec<inbox::InboxItem>) {
     // failed/required runs, not routine passes). Glance-only since #183: the
     // desktop notification for a failing default branch comes from the
     // attention model's `CiFailing` (see `type_enabled`).
-    if let Ok(notes) = inbox::github_notifications().await {
+    if let Ok(notes) = inbox::github_notifications_with_token(&token).await {
         for n in notes {
             if n.kind == "CheckSuite" {
                 out.push(Attention {

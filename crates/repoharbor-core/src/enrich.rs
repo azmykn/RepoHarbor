@@ -14,6 +14,7 @@
 //! unauthenticated for untrusted hosts.
 
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use futures_util::stream::{self, StreamExt};
 
@@ -26,7 +27,18 @@ use crate::{cache, config, forge, oauth};
 const TTL_SECS: i64 = 6 * 3_600;
 
 /// Max concurrent host-API requests in flight during a refresh.
-const CONCURRENCY: usize = 8;
+const CONCURRENCY: usize = 4;
+
+/// Process-wide in-flight guard so overlapping rescans never stampede host-API passes.
+static ENRICHING: AtomicBool = AtomicBool::new(false);
+
+struct ResetFlag(&'static AtomicBool);
+
+impl Drop for ResetFlag {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
+}
 
 /// A pending host-API fetch: `(host kind, remote domain, slug)`. The domain +
 /// slug pair is also the host-cache key (see [`cache::store_host_info`]).
@@ -64,6 +76,15 @@ fn build_jobs(repos: &[Repo], fresh: &HashSet<(String, String)>) -> Vec<Job> {
 ///
 /// `force` ignores the TTL and re-fetches every repo (the manual "Fetch all").
 pub async fn refresh(repos: &[Repo], now: i64, force: bool) -> usize {
+    let _guard = if !force {
+        if ENRICHING.swap(true, Ordering::SeqCst) {
+            return 0;
+        }
+        Some(ResetFlag(&ENRICHING))
+    } else {
+        None
+    };
+
     let cfg = config::load();
     let github = oauth::github_token();
     let gitlab = oauth::gitlab_token();
@@ -100,12 +121,9 @@ pub async fn refresh(repos: &[Repo], now: i64, force: bool) -> usize {
         .collect::<Vec<_>>()
         .await;
 
-    let mut updated = 0;
-    for (domain, slug, info) in results.into_iter().flatten() {
-        cache::store_host_info(&domain, &slug, &info, now);
-        updated += 1;
-    }
-    updated
+    let entries: Vec<(String, String, crate::model::HostInfo)> =
+        results.into_iter().flatten().collect();
+    cache::store_host_info_batch(&entries, now)
 }
 
 /// Refresh enrichment for the current cached repo snapshot, honoring the TTL.

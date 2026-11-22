@@ -529,6 +529,14 @@ pub struct RepoHarborApp {
     pub update_state: AppUpdateState,
     /// Cached XDG autostart state (`~/.config/autostart/com.digitscode.repoharbor.desktop`).
     pub autostart_enabled: bool,
+    /// True while a background workspace rescan (manual or watcher-driven) is running.
+    pub rescan_in_flight: bool,
+    /// Set when an explicit rescan is requested while another rescan is already running.
+    pub rescan_queued: bool,
+    /// Whether the queued follow-up rescan must also re-arm the filesystem watcher.
+    pub rescan_rearm_pending: bool,
+    /// True while a background `activity::compute` pass is running.
+    pub activity_loading: bool,
 }
 
 /// Live application update-check & installation progress.
@@ -586,6 +594,10 @@ pub struct GridState {
 pub struct Services {
     /// Whether a GitHub token is currently resolvable (Settings account panel).
     pub github_authed: bool,
+    /// Where the active GitHub token came from (resolved off the UI thread).
+    pub github_token_source: Option<repoharbor_core::oauth::GithubTokenSource>,
+    /// Whether the RepoHarbor-only signed-out marker is active (resolved off the UI thread).
+    pub github_signed_out: bool,
     /// An in-progress GitHub device-flow login, if any.
     pub github_device: Option<crate::views::settings::GithubDevice>,
     /// Live AI-backend reachability + model list (Settings AI panel).
@@ -1465,7 +1477,7 @@ impl RepoHarborApp {
                         ("Added scan root", format!("Scanning repos under {store}."))
                     };
                     self.push_toast(ToastKind::Success, title, Some(detail.into()), cx);
-                    self.rescan(cx);
+                    self.rescan_with_rearm(cx);
                 }
                 Err(msg) => self.set_new_project_status(&msg, cx),
             }
@@ -1521,7 +1533,7 @@ impl RepoHarborApp {
             let _ = this.update(cx, |this, cx| match result {
                 Ok(_) => {
                     this.close_overlay();
-                    this.rescan(cx);
+                    this.rescan_with_rearm(cx);
                 }
                 Err(e) => {
                     if let Some(Overlay::NewProject(d)) = &mut this.overlay {
@@ -1982,16 +1994,18 @@ impl RepoHarborApp {
         cx.notify();
     }
 
-    /// Re-resolve whether a GitHub token is available (may shell out to `gh`, so
-    /// off the UI thread).
-    fn refresh_github_authed(&mut self, cx: &mut Context<Self>) {
+    /// Re-resolve GitHub authentication state off the UI thread (may shell out to
+    /// `gh` on cache miss, so never called inside `render()`).
+    pub fn refresh_github_authed(&mut self, cx: &mut Context<Self>) {
         cx.spawn(async move |this, cx| {
-            let authed = cx
+            let (authed, source, signed_out) = cx
                 .background_executor()
-                .spawn(async { repoharbor_core::oauth::github_authed() })
+                .spawn(async { repoharbor_core::oauth::github_auth_state() })
                 .await;
             let _ = this.update(cx, |this, cx| {
                 this.services.github_authed = authed;
+                this.services.github_token_source = source;
+                this.services.github_signed_out = signed_out;
                 cx.notify();
             });
         })
@@ -2072,6 +2086,9 @@ impl RepoHarborApp {
                         let _ = this.update(cx, |this, cx| {
                             this.services.github_device = None;
                             this.services.github_authed = true;
+                            this.services.github_token_source =
+                                Some(repoharbor_core::oauth::GithubTokenSource::AppOAuth);
+                            this.services.github_signed_out = false;
                             cx.notify();
                         });
                         return;
@@ -2109,7 +2126,10 @@ impl RepoHarborApp {
         }
         let _ = repoharbor_core::config::save(&self.config);
         self.services.github_device = None;
-        self.services.github_authed = repoharbor_core::oauth::github_authed();
+        self.services.github_authed = false;
+        self.services.github_token_source = None;
+        self.services.github_signed_out = true;
+        self.refresh_github_authed(cx);
         self.push_toast(
             ToastKind::Success,
             "Signed out of RepoHarbor",
@@ -2130,7 +2150,7 @@ impl RepoHarborApp {
     /// Persist whether RepoHarbor may fall back to `$REPOHARBOR_GITHUB_TOKEN` / `gh`.
     /// Turning it **on** clears the RepoHarbor-only signed-out marker so a previous
     /// Sign out can use machine credentials again without `gh auth login`.
-    pub fn github_set_allow_cli_token(&mut self, on: bool) {
+    pub fn github_set_allow_cli_token(&mut self, on: bool, cx: &mut Context<Self>) {
         self.config.github_allow_cli_token = on;
         if let Some(s) = &mut self.settings {
             s.draft.github_allow_cli_token = on;
@@ -2138,8 +2158,10 @@ impl RepoHarborApp {
         let _ = repoharbor_core::config::save(&self.config);
         if on {
             repoharbor_core::oauth::clear_signed_out();
+        } else {
+            repoharbor_core::oauth::invalidate_cli_token_cache();
         }
-        self.services.github_authed = repoharbor_core::oauth::github_authed();
+        self.refresh_github_authed(cx);
     }
 
     /// Forget the live AI status because the *pending* backend no longer matches
@@ -3457,7 +3479,7 @@ impl RepoHarborApp {
             Some(removed.into()),
             cx,
         );
-        self.rescan(cx);
+        self.rescan_with_rearm(cx);
         cx.notify();
     }
 
@@ -3801,7 +3823,7 @@ impl RepoHarborApp {
         if let Some(msg) = first_err {
             self.push_toast(ToastKind::Info, "Some paths skipped", Some(msg.into()), cx);
         }
-        self.rescan(cx);
+        self.rescan_with_rearm(cx);
         n
     }
 
@@ -3902,7 +3924,7 @@ impl RepoHarborApp {
                 s.ai_note = note.into();
             }
         }
-        self.rescan(cx);
+        self.rescan_with_rearm(cx);
         self.ai_refresh(cx);
         cx.notify();
     }
@@ -4839,18 +4861,33 @@ impl RepoHarborApp {
     /// User-triggered workspace rescan (Refresh button / Palette): mirrors into Action Log.
     pub(crate) fn rescan_user(&mut self, cx: &mut Context<Self>) {
         self.log_action_cmd("repoharbor scan --roots", Some("workspace roots"), true, cx);
-        self.rescan(cx);
+        self.rescan_with_rearm(cx);
+    }
+
+    /// Re-scan roots and re-arm the filesystem watcher (use when roots/repos may
+    /// have been added/removed or on explicit manual Refresh).
+    pub(crate) fn rescan_with_rearm(&mut self, cx: &mut Context<Self>) {
+        self.rescan_inner(cx, true);
     }
 
     /// Re-scan the roots from disk (off the UI thread) and reload the grid, then
-    /// refresh host enrichment. Header **Refresh**, Mission Control toolbar, and
-    /// the command palette all land here.
+    /// refresh host enrichment. Does NOT tear down and rebuild filesystem watches.
     pub(crate) fn rescan(&mut self, cx: &mut Context<Self>) {
-        // Explicit rescans follow repo/root additions (Settings save, New
-        // Project, header/palette refresh) — re-arm the fs watcher so the new
-        // paths get live change events too. The watcher-driven rescan doesn't
-        // come through here, so routine fs events never churn the watches.
-        self.watcher.rearm();
+        self.rescan_inner(cx, false);
+    }
+
+    fn rescan_inner(&mut self, cx: &mut Context<Self>, rearm: bool) {
+        if self.rescan_in_flight {
+            self.rescan_queued = true;
+            if rearm {
+                self.rescan_rearm_pending = true;
+            }
+            return;
+        }
+        self.rescan_in_flight = true;
+        if rearm {
+            self.watcher.rearm();
+        }
         self.activity_log.push(
             crate::data::now_unix(),
             crate::activity_log::LogLevel::Info,
@@ -4869,6 +4906,7 @@ impl RepoHarborApp {
                 .spawn(async { crate::data::rescan() })
                 .await;
             let _ = this.update(cx, |this, cx| {
+                this.rescan_in_flight = false;
                 let n = snap.rows.len();
                 this.apply_snapshot(snap);
                 // Drop selected ids for repos that vanished in the rescan.
@@ -4902,6 +4940,12 @@ impl RepoHarborApp {
                     Some(format!("{n} repos").into()),
                     cx,
                 );
+                if this.rescan_queued {
+                    let next_rearm = this.rescan_rearm_pending;
+                    this.rescan_queued = false;
+                    this.rescan_rearm_pending = false;
+                    this.rescan_inner(cx, next_rearm);
+                }
                 cx.notify();
             });
         })
@@ -4912,11 +4956,12 @@ impl RepoHarborApp {
     /// No-op while the heatmap stays hidden — walking hundreds of repos is
     /// expensive and the Mission Control band is not shown.
     pub fn load_activity(&mut self, cx: &mut Context<Self>) {
-        if !self.grid.activity_open && self.grid.activity.is_none() {
-            // Keep idle: no graph, no background revwalk.
+        if (!self.grid.activity_open && self.grid.activity.is_none()) || self.activity_loading {
+            // Keep idle: no graph, no overlapping background revwalk.
             let _ = cx;
             return;
         }
+        self.activity_loading = true;
         let paths: Vec<String> = self.rows.iter().map(|r| r.id.to_string()).collect();
         cx.spawn(async move |this, cx| {
             let activity = cx
@@ -4924,6 +4969,7 @@ impl RepoHarborApp {
                 .spawn(async move { repoharbor_core::activity::compute(&paths) })
                 .await;
             let _ = this.update(cx, |this, cx| {
+                this.activity_loading = false;
                 this.grid.activity = Some(activity);
                 cx.notify();
             });
@@ -7014,6 +7060,8 @@ impl RepoHarborApp {
                     s,
                     self.view_filter.as_deref(),
                     self.services.github_authed,
+                    self.services.github_token_source,
+                    self.services.github_signed_out,
                     &self.services.github_device,
                     &self.services.ai_status,
                     self.services.ai_ready,
@@ -8383,8 +8431,15 @@ impl RepoHarborApp {
         cx: &mut Context<Self>,
     ) {
         let now = chrono::Local::now().format("%H:%M:%S").to_string();
-        let line =
-            repoharbor_core::terminal::format_log_entry(&now, tag, sgr_color, subject, detail);
+        let subject = crate::data::oneline(subject.to_string());
+        let detail = detail.map(|d| crate::data::oneline(d.to_string()));
+        let line = repoharbor_core::terminal::format_log_entry(
+            &now,
+            tag,
+            sgr_color,
+            &subject,
+            detail.as_deref(),
+        );
         self.append_action_ansi(reveal, &line, cx);
     }
 

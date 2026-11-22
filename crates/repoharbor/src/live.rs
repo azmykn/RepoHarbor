@@ -17,7 +17,9 @@
 //! `cx.notify()`) on the foreground. Heavy work (the rescan) is handed to the
 //! background executor so it never blocks the UI.
 
+use std::collections::VecDeque;
 use std::rc::Rc;
+use std::time::{Duration, Instant};
 
 use gpui::Context;
 use repoharbor_core::inbox::InboxItem;
@@ -29,10 +31,16 @@ use crate::data;
 use crate::shell::RepoHarborApp;
 use crate::theme::Theme;
 
+/// Minimum interval between automatic watcher-driven workspace rescans.
+/// Bursts of filesystem events coalesce into at most one rescan per window.
+const AUTO_RESCAN_COOLDOWN: Duration = Duration::from_secs(5);
+
 /// A desktop signal to apply on the GPUI foreground.
 enum Signal {
-    /// Repos changed on disk — rescan and reload the grid.
+    /// Repos changed on disk — coalesced, cooldown-throttled rescan.
     ReposChanged,
+    /// Explicit tray "Rescan" click — runs immediately via `rescan_user`.
+    ManualRescan,
     /// Desktop theme/accent changed — recompute the theme.
     Appearance(Appearance),
     /// Latest attention-poll result: glance lines (the Inbox nav badge's
@@ -110,7 +118,7 @@ pub fn spawn(
         repoharbor_platform::tray::spawn(move |action| {
             let signal = match action {
                 TrayAction::Show => Signal::ShowWindow,
-                TrayAction::Rescan => Signal::ReposChanged,
+                TrayAction::Rescan => Signal::ManualRescan,
                 TrayAction::Quit => Signal::Quit,
                 TrayAction::Open(_) => return, // handled in the tray
             };
@@ -125,45 +133,114 @@ pub fn spawn(
     // `recompute_attention`, through the clone returned below).
     let tray_for_app = tray.clone();
     cx.spawn(async move |this, cx| {
-        while let Ok(signal) = rx.recv().await {
+        let mut pending: VecDeque<Signal> = VecDeque::new();
+        let mut last_auto_scan: Option<Instant> = None;
+
+        loop {
+            let signal = if let Some(s) = pending.pop_front() {
+                s
+            } else {
+                let Ok(s) = rx.recv().await else {
+                    break;
+                };
+                s
+            };
+
             match signal {
+                Signal::ManualRescan => {
+                    if this.update(cx, |app, cx| app.rescan_user(cx)).is_err() {
+                        break;
+                    }
+                }
                 Signal::ReposChanged => {
-                    // The git scan is slow; run it on the background pool and
-                    // only touch the entity with the finished rows.
-                    let started = this.update(cx, |app, cx| {
+                    // Drain all queued signals immediately so a burst of watcher
+                    // events collapses into a single rescan without dropping
+                    // unrelated signals (Appearance / Attention / Quit).
+                    while let Ok(next) = rx.try_recv() {
+                        if !matches!(next, Signal::ReposChanged) {
+                            pending.push_back(next);
+                        }
+                    }
+
+                    // Enforce a minimum cooldown between automatic rescans.
+                    if let Some(last) = last_auto_scan {
+                        let elapsed = last.elapsed();
+                        if elapsed < AUTO_RESCAN_COOLDOWN {
+                            cx.background_executor()
+                                .timer(AUTO_RESCAN_COOLDOWN - elapsed)
+                                .await;
+                            while let Ok(next) = rx.try_recv() {
+                                if !matches!(next, Signal::ReposChanged) {
+                                    pending.push_back(next);
+                                }
+                            }
+                        }
+                    }
+
+                    // Skip automatic watcher rescans while a Fleet run or an
+                    // explicit rescan is already in flight — Fleet triggers one
+                    // authoritative rescan when it finishes.
+                    let should_scan = this.update(cx, |app, cx| {
+                        if app.fleet_run.is_some() || app.rescan_in_flight {
+                            return false;
+                        }
+                        app.rescan_in_flight = true;
                         app.activity_log.push(
                             data::now_unix(),
                             crate::activity_log::LogLevel::Info,
                             "Scan started",
                         );
                         cx.notify();
+                        true
                     });
-                    if started.is_err() {
+                    let Ok(run_now) = should_scan else {
                         break;
+                    };
+                    if !run_now {
+                        continue;
                     }
+
                     let snap = cx
                         .background_executor()
                         .spawn(async { data::rescan() })
                         .await;
+                    last_auto_scan = Some(Instant::now());
+
+                    // Collapse any duplicate watcher signals emitted during the scan.
+                    while let Ok(next) = rx.try_recv() {
+                        if !matches!(next, Signal::ReposChanged) {
+                            pending.push_back(next);
+                        }
+                    }
+
                     let applied = this.update(cx, |app, cx| {
+                        app.rescan_in_flight = false;
                         app.apply_snapshot(snap);
                         // Drop fleet-selected ids for repos that vanished.
                         app.prune_selection();
                         // Nested WT edits/deletes just triggered this rescan —
                         // keep the open Changes tab in sync with the new status.
                         app.refresh_open_changes(cx);
-                        // New/changed repos → refresh the semantic index (cheap
-                        // when unchanged; a no-op unless AI is ready) and host
-                        // enrichment (skips repos still within the cache TTL).
+                        // Local file edits do not change remote stars/CI; keep
+                        // enrich/CI driven by startup, 180s Attention poll,
+                        // Fleet completion, and manual Refresh.
                         app.index_semantic();
-                        app.enrich_hosts(cx);
-                        app.refresh_ci(cx);
                         app.load_activity(cx);
                         app.activity_log.push(
                             data::now_unix(),
                             crate::activity_log::LogLevel::Info,
                             format!("Scan finished — {} repos", app.rows.len()),
                         );
+                        if app.rescan_queued {
+                            let rearm = app.rescan_rearm_pending;
+                            app.rescan_queued = false;
+                            app.rescan_rearm_pending = false;
+                            if rearm {
+                                app.rescan_with_rearm(cx);
+                            } else {
+                                app.rescan(cx);
+                            }
+                        }
                         cx.notify();
                     });
                     if applied.is_err() {

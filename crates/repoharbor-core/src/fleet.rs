@@ -12,7 +12,7 @@
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Mutex;
 
-use crate::git_ops::{self, OpOutcome};
+use crate::git_ops::{self, NetworkRetryGate, OpOutcome};
 use crate::model::path_is_pull_only;
 
 /// Per-repo outcome of a fleet operation.
@@ -77,12 +77,12 @@ impl FleetReport {
 }
 
 /// Default worker count: enough to hide network latency across a fleet without
-/// hammering the disk or the remote — min(8, available cores).
+/// hammering the disk, libgit2 memory, or the remote — min(4, available cores).
 pub fn default_workers() -> usize {
     std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(4)
-        .min(8)
+        .min(4)
 }
 
 /// Run `op` across `repos` (repo ids, i.e. absolute paths) on up to `workers`
@@ -141,6 +141,8 @@ where
         }
     });
 
+    crate::git_ops::trim_process_heap();
+
     FleetReport {
         results: slots
             .into_inner()
@@ -154,19 +156,82 @@ where
     }
 }
 
-/// Fleet fetch: `git_ops::fetch` per repo, summarising the refreshed status.
-pub fn fetch_op() -> impl Fn(&str) -> Outcome + Sync {
-    |path| match git_ops::fetch(path) {
+fn with_network_gate<'a, F>(
+    cancel: &'a AtomicBool,
+    workers: usize,
+    op: F,
+) -> impl Fn(&str) -> Outcome + Sync + 'a
+where
+    F: Fn(&str, &NetworkRetryGate<'_>) -> Outcome + Sync + 'a,
+{
+    let consecutive_failures = AtomicUsize::new(0);
+    let trip_threshold = workers.max(1);
+    move |path| {
+        let gate = NetworkRetryGate {
+            cancel,
+            consecutive_failures: &consecutive_failures,
+            trip_threshold,
+        };
+        op(path, &gate)
+    }
+}
+
+fn run_fetch(path: &str, gate: Option<&NetworkRetryGate<'_>>) -> Outcome {
+    match git_ops::fetch_with_gate(path, gate) {
         Ok(st) => Outcome::Ok(format!(
             "fetched — {} ahead {}, behind {}",
             st.branch, st.ahead, st.behind
         )),
+        Err(e) if e == git_ops::ERR_CANCELLED => Outcome::Skipped("cancelled".into()),
         Err(e) => Outcome::Failed(e),
     }
 }
 
+/// Fleet fetch: `git_ops::fetch` per repo, summarising the refreshed status.
+pub fn fetch_op() -> impl Fn(&str) -> Outcome + Sync {
+    |path| run_fetch(path, None)
+}
+
+/// Fleet fetch wired to the run's cancellation flag and transient network
+/// circuit breaker so brief Wi-Fi/DNS blips recover cleanly across `workers`.
+pub fn fetch_op_with_cancel<'a>(
+    cancel: &'a AtomicBool,
+    workers: usize,
+) -> impl Fn(&str) -> Outcome + Sync + 'a {
+    with_network_gate(cancel, workers, |path, gate| run_fetch(path, Some(gate)))
+}
+
 /// Sink for per-repo changed paths collected during a fleet Pull.
 pub type PullFileSink = std::sync::Arc<std::sync::Mutex<Vec<(String, Vec<String>)>>>;
+
+fn run_pull(
+    path: &str,
+    file_sink: Option<&PullFileSink>,
+    pull_only_prefixes: &[String],
+    gate: Option<&NetworkRetryGate<'_>>,
+) -> Outcome {
+    let rebase = !path_is_pull_only(path, pull_only_prefixes);
+    match git_ops::pull_with_files_and_gate(path, rebase, gate) {
+        Ok((OpOutcome::Done(s), files)) => {
+            if !files.is_empty() {
+                if let Some(sink) = file_sink {
+                    if let Ok(mut guard) = sink.lock() {
+                        guard.push((path.to_string(), files));
+                    }
+                }
+            }
+            Outcome::Ok(s)
+        }
+        Ok((OpOutcome::Skipped(r), _))
+            if r == git_ops::SKIP_DIVERGED || r == git_ops::SKIP_DIRTY =>
+        {
+            Outcome::Failed(r)
+        }
+        Ok((OpOutcome::Skipped(r), _)) => Outcome::Skipped(r),
+        Err(e) if e == git_ops::ERR_CANCELLED => Outcome::Skipped("cancelled".into()),
+        Err(e) => Outcome::Failed(e),
+    }
+}
 
 /// Fleet pull via [`git_ops::pull_with_files`]. Safety refusals where a pull was
 /// wanted but couldn't happen (diverged / dirty / rebase conflict) are `Failed`;
@@ -183,28 +248,20 @@ pub fn pull_op_collecting(
     file_sink: Option<PullFileSink>,
     pull_only_prefixes: Vec<String>,
 ) -> impl Fn(&str) -> Outcome + Sync {
-    move |path| {
-        let rebase = !path_is_pull_only(path, &pull_only_prefixes);
-        match git_ops::pull_with_files(path, rebase) {
-            Ok((OpOutcome::Done(s), files)) => {
-                if !files.is_empty() {
-                    if let Some(sink) = &file_sink {
-                        if let Ok(mut guard) = sink.lock() {
-                            guard.push((path.to_string(), files));
-                        }
-                    }
-                }
-                Outcome::Ok(s)
-            }
-            Ok((OpOutcome::Skipped(r), _))
-                if r == git_ops::SKIP_DIVERGED || r == git_ops::SKIP_DIRTY =>
-            {
-                Outcome::Failed(r)
-            }
-            Ok((OpOutcome::Skipped(r), _)) => Outcome::Skipped(r),
-            Err(e) => Outcome::Failed(e),
-        }
-    }
+    move |path| run_pull(path, file_sink.as_ref(), &pull_only_prefixes, None)
+}
+
+/// Like [`pull_op_collecting`], wired to the run's cancellation flag and
+/// transient network circuit breaker.
+pub fn pull_op_collecting_with_cancel<'a>(
+    file_sink: Option<PullFileSink>,
+    pull_only_prefixes: Vec<String>,
+    cancel: &'a AtomicBool,
+    workers: usize,
+) -> impl Fn(&str) -> Outcome + Sync + 'a {
+    with_network_gate(cancel, workers, move |path, gate| {
+        run_pull(path, file_sink.as_ref(), &pull_only_prefixes, Some(gate))
+    })
 }
 
 /// Stage every unstaged path in the repo (`git add`-all pending changes).
@@ -283,12 +340,37 @@ pub fn merge_branch_op(branch: String) -> impl Fn(&str) -> Outcome + Sync {
     }
 }
 
+fn run_submodule_update(path: &str, gate: Option<&NetworkRetryGate<'_>>) -> Outcome {
+    match git_ops::submodule_update_with_gate(path, gate) {
+        Ok(s) => Outcome::Ok(s),
+        Err(e) if e == "no submodules" => Outcome::Skipped(e),
+        Err(e) if e == git_ops::ERR_CANCELLED => Outcome::Skipped("cancelled".into()),
+        Err(e) => Outcome::Failed(e),
+    }
+}
+
 /// Discover each parent's submodules and fast-forward-pull on the configured /
 /// current branch. Repos without a `.gitmodules` skip (not fail).
 pub fn submodule_update_op() -> impl Fn(&str) -> Outcome + Sync {
-    |path| match git_ops::submodule_update(path) {
-        Ok(s) => Outcome::Ok(s),
-        Err(e) if e == "no submodules" => Outcome::Skipped(e),
+    |path| run_submodule_update(path, None)
+}
+
+/// Like [`submodule_update_op`], wired to the run's cancellation flag and
+/// transient network circuit breaker.
+pub fn submodule_update_op_with_cancel<'a>(
+    cancel: &'a AtomicBool,
+    workers: usize,
+) -> impl Fn(&str) -> Outcome + Sync + 'a {
+    with_network_gate(cancel, workers, |path, gate| {
+        run_submodule_update(path, Some(gate))
+    })
+}
+
+fn run_reset_hard(path: &str, gate: Option<&NetworkRetryGate<'_>>) -> Outcome {
+    match git_ops::reset_hard_upstream_with_gate(path, gate) {
+        Ok(OpOutcome::Done(s)) => Outcome::Ok(s),
+        Ok(OpOutcome::Skipped(r)) => Outcome::Skipped(r),
+        Err(e) if e == git_ops::ERR_CANCELLED => Outcome::Skipped("cancelled".into()),
         Err(e) => Outcome::Failed(e),
     }
 }
@@ -297,11 +379,18 @@ pub fn submodule_update_op() -> impl Fn(&str) -> Outcome + Sync {
 /// Destructive: discards local commits and dirty work. Skips (not fails) when
 /// there is no upstream / detached HEAD.
 pub fn reset_hard_op() -> impl Fn(&str) -> Outcome + Sync {
-    |path| match git_ops::reset_hard_upstream(path) {
-        Ok(OpOutcome::Done(s)) => Outcome::Ok(s),
-        Ok(OpOutcome::Skipped(r)) => Outcome::Skipped(r),
-        Err(e) => Outcome::Failed(e),
-    }
+    |path| run_reset_hard(path, None)
+}
+
+/// Like [`reset_hard_op`], wired to the run's cancellation flag and transient
+/// network circuit breaker.
+pub fn reset_hard_op_with_cancel<'a>(
+    cancel: &'a AtomicBool,
+    workers: usize,
+) -> impl Fn(&str) -> Outcome + Sync + 'a {
+    with_network_gate(cancel, workers, |path, gate| {
+        run_reset_hard(path, Some(gate))
+    })
 }
 
 /// Discard working-tree + index changes relative to HEAD (`reset --hard HEAD`

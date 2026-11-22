@@ -259,6 +259,8 @@ fn main() {
     if let Some(code) = run_cli_if_requested() {
         std::process::exit(code);
     }
+    // Bound libgit2 mmap/cache memory and glibc arenas before spawning any threads.
+    repoharbor_core::git_ops::init_runtime_limits();
     // Point the bundled llama.cpp backend at a runtime shipped next to the
     // binary, if any: packages install it to `<prefix>/lib/repoharbor/llama-runtime`
     // (the AppImage bundles one; deb/rpm stay lean). A no-op in source builds /
@@ -439,6 +441,10 @@ fn main() {
                             install_kind: repoharbor_core::updater::detect_install_kind(),
                             update_state: Default::default(),
                             autostart_enabled: repoharbor_core::config::is_autostart_enabled(),
+                            rescan_in_flight: false,
+                            rescan_queued: false,
+                            rescan_rearm_pending: false,
+                            activity_loading: false,
                         }
                     });
                     // Close (✕) quits the app. Minimize (−) still hides the
@@ -453,6 +459,7 @@ fn main() {
                         // dots are right on the first paint; host/inbox/agent
                         // facts refine it as their sources load.
                         this.recompute_attention();
+                        this.refresh_github_authed(cx);
                         this.ai_startup(cx);
                         this.enrich_hosts(cx);
                         this.refresh_ci(cx);

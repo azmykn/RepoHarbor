@@ -204,6 +204,8 @@ pub fn render(
     s: &SettingsState,
     filter: Option<&str>,
     authed: bool,
+    token_source: Option<repoharbor_core::oauth::GithubTokenSource>,
+    signed_out: bool,
     device: &Option<GithubDevice>,
     ai: &AiStatus,
     ai_ready: bool,
@@ -225,8 +227,17 @@ pub fn render(
     }
     if show("account") {
         sections.push(
-            account_section(s, authed, device, s.draft.github_allow_cli_token, t, app)
-                .into_any_element(),
+            account_section(
+                s,
+                authed,
+                token_source,
+                signed_out,
+                device,
+                s.draft.github_allow_cli_token,
+                t,
+                app,
+            )
+            .into_any_element(),
         );
     }
     if show("launchers") {
@@ -309,9 +320,12 @@ pub fn render(
 }
 
 /// GitHub account panel: connection status + Connect (device flow) / Sign out + OAuth client id.
+#[allow(clippy::too_many_arguments)]
 fn account_section(
     s: &SettingsState,
     authed: bool,
+    source: Option<repoharbor_core::oauth::GithubTokenSource>,
+    signed_out: bool,
     device: &Option<GithubDevice>,
     allow_cli: bool,
     t: &Theme,
@@ -320,8 +334,6 @@ fn account_section(
     use repoharbor_core::oauth::{self, GithubTokenSource};
 
     let mut col = section(t, "GitHub account");
-    let source = oauth::github_token_source().map(|(_, s)| s);
-    let signed_out = oauth::is_signed_out();
 
     if let Some(d) = device {
         // A device-flow login is in progress: show the code + verification URL.
@@ -500,18 +512,18 @@ fn account_section(
         }
     }
 
-    col.child(toggle(
+    col.child(toggle_cx(
         "Also use `gh` / env token",
         allow_cli,
         t,
         app,
-        |this| {
+        |this, cx| {
             let on = !this
                 .settings
                 .as_ref()
                 .map(|s| s.draft.github_allow_cli_token)
                 .unwrap_or(this.config.github_allow_cli_token);
-            this.github_set_allow_cli_token(on);
+            this.github_set_allow_cli_token(on, cx);
         },
     ))
     .child(note_line(
@@ -3161,6 +3173,40 @@ fn toggle(
                 .on_click(move |_checked, _window, cx| {
                     app.update(cx, |this, cx| {
                         flip(this);
+                        cx.notify();
+                    });
+                }),
+        )
+}
+
+fn toggle_cx(
+    label: &str,
+    on: bool,
+    t: &Theme,
+    app: &Entity<RepoHarborApp>,
+    flip: impl Fn(&mut RepoHarborApp, &mut gpui::Context<RepoHarborApp>) + 'static,
+) -> impl IntoElement {
+    use gpui_component::switch::Switch;
+    let app = app.clone();
+    div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(10.))
+        .child(
+            div()
+                .flex_1()
+                .text_size(px(t.text_small))
+                .text_color(rgb(t.fg1))
+                .child(SharedString::from(label.to_string())),
+        )
+        .child(
+            Switch::new(SharedString::from(format!("tg-{label}")))
+                .checked(on)
+                .color(rgb(t.primary))
+                .on_click(move |_checked, _window, cx| {
+                    app.update(cx, |this, cx| {
+                        flip(this, cx);
                         cx.notify();
                     });
                 }),

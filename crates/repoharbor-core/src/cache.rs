@@ -183,6 +183,8 @@ pub(crate) fn open() -> Result<Connection, String> {
         }
     }
     let conn = Connection::open(&path).map_err(|e| e.to_string())?;
+    let _ = conn.busy_timeout(std::time::Duration::from_millis(5_000));
+    let _ = conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL;");
     init(&conn).map_err(|e| e.to_string())?;
     Ok(conn)
 }
@@ -395,6 +397,42 @@ pub fn store_host_info(host: &str, slug: &str, info: &HostInfo, now: i64) {
     }
 }
 
+pub(crate) fn store_host_info_batch_on(
+    conn: &mut Connection,
+    entries: &[(String, String, HostInfo)],
+    now: i64,
+) -> rusqlite::Result<usize> {
+    if entries.is_empty() {
+        return Ok(0);
+    }
+    let tx = conn.transaction()?;
+    let mut written = 0usize;
+    {
+        let mut stmt = tx.prepare(
+            "INSERT OR REPLACE INTO host_cache (host, slug, data, fetched_at) VALUES (?1, ?2, ?3, ?4)",
+        )?;
+        for (host, slug, info) in entries {
+            if let Ok(json) = serde_json::to_string(info) {
+                stmt.execute(rusqlite::params![host, slug, json, now])?;
+                written += 1;
+            }
+        }
+    }
+    tx.commit()?;
+    Ok(written)
+}
+
+/// Persist a batch of host enrichment entries in a single SQLite transaction.
+pub fn store_host_info_batch(entries: &[(String, String, HostInfo)], now: i64) -> usize {
+    if entries.is_empty() {
+        return 0;
+    }
+    match open() {
+        Ok(mut conn) => store_host_info_batch_on(&mut conn, entries, now).unwrap_or(0),
+        Err(_) => 0,
+    }
+}
+
 /// One cached CI result: the shared four-state vocabulary from `inbox`
 /// ("success" | "failure" | "pending" | "none"), plus the run's web URL when
 /// the API offered one.
@@ -405,6 +443,7 @@ pub struct CiEntry {
     pub updated_at: i64,
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn store_ci_state_on(
     conn: &Connection,
     host: &str,
@@ -417,6 +456,29 @@ pub(crate) fn store_ci_state_on(
         "INSERT OR REPLACE INTO ci_cache (host, slug, state, url, updated_at) VALUES (?1, ?2, ?3, ?4, ?5)",
         rusqlite::params![host, slug, state, url, now],
     );
+}
+
+pub(crate) fn store_ci_states_on(
+    conn: &mut Connection,
+    entries: &[(&str, &str, &str, Option<&str>)],
+    now: i64,
+) -> rusqlite::Result<usize> {
+    if entries.is_empty() {
+        return Ok(0);
+    }
+    let tx = conn.transaction()?;
+    let mut written = 0usize;
+    {
+        let mut stmt = tx.prepare(
+            "INSERT OR REPLACE INTO ci_cache (host, slug, state, url, updated_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+        )?;
+        for (host, slug, state, url) in entries {
+            stmt.execute(rusqlite::params![host, slug, state, url, now])?;
+            written += 1;
+        }
+    }
+    tx.commit()?;
+    Ok(written)
 }
 
 pub(crate) fn fresh_ci_keys_on(
@@ -1160,6 +1222,55 @@ mod tests {
         let fresh = fresh_ci_keys_on(&conn, 300, 1_200);
         assert!(fresh.contains(&("github.com".to_string(), "o/fresh".to_string())));
         assert!(!fresh.contains(&("github.com".to_string(), "o/stale".to_string())));
+    }
+
+    #[test]
+    fn batch_ci_and_host_writes_are_transactional() {
+        let mut conn = mem();
+        let written_ci = store_ci_states_on(
+            &mut conn,
+            &[
+                ("github.com", "o/a", "success", Some("https://example/1")),
+                ("github.com", "o/b", "failure", None),
+            ],
+            5_000,
+        )
+        .unwrap();
+        assert_eq!(written_ci, 2);
+        let states = all_ci_states_on(&conn);
+        assert_eq!(states.len(), 2);
+        assert_eq!(
+            states[&("github.com".into(), "o/a".into())].updated_at,
+            5_000
+        );
+
+        let written_hosts = store_host_info_batch_on(
+            &mut conn,
+            &[
+                (
+                    "github.com".into(),
+                    "o/a".into(),
+                    HostInfo {
+                        stars: 10,
+                        ..HostInfo::default()
+                    },
+                ),
+                (
+                    "github.com".into(),
+                    "o/b".into(),
+                    HostInfo {
+                        stars: 20,
+                        ..HostInfo::default()
+                    },
+                ),
+            ],
+            6_000,
+        )
+        .unwrap();
+        assert_eq!(written_hosts, 2);
+        let hosts = all_host_info_on(&conn);
+        assert_eq!(hosts[&("github.com".into(), "o/a".into())].stars, 10);
+        assert_eq!(hosts[&("github.com".into(), "o/b".into())].stars, 20);
     }
 
     #[test]

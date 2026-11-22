@@ -5,6 +5,32 @@ All notable changes to [RepoHarbor](https://github.com/azmykn/RepoHarbor) by Dig
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project (upstream) uses calendar versioning (`YYYY.M.P`).
 
+## [2026.11.3] - 2026-11-22
+
+### Fixed
+
+- **Resource Consumption, `gh` CLI Storm & Memory Bounds**:
+  - Added an in-memory TTL cache (`300s` hit / `30s` miss) and lazy resolution for `gh`/`glab` CLI tokens in `oauth.rs`, plus cache invalidation on sign-in, sign-out, and fallback toggle changes.
+  - Resolved GitHub tokens once per pass in `ci::refresh` and `notifier::collect` instead of spawning `gh auth token` per repository, and removed synchronous `oauth::github_token_source()` / `is_signed_out()` calls from `views/settings.rs::render()`.
+  - Added a RAM-only 5-minute per-`(scheme, host)` HTTPS git credential cache in `git_ops::remote_callbacks()` (disabled when `credential.useHttpPath = true`, evicted immediately on auth failure), cutting repeated `gh auth git-credential` spawns during large HTTPS fleet runs.
+  - Added process-wide `AtomicBool` in-flight guards to `ci::refresh` and `enrich::refresh`, coalesced watcher `Signal::ReposChanged` bursts with a 5-second cooldown and Fleet-active suppression in `live.rs`, and decoupled local filesystem edits from remote CI/host API refreshes.
+  - Filtered noisy build/IDE/log directories (`__pycache__`, `.idea`, `.cursor`, `.ruff_cache`, `.venv`, `out`, `logs`, …) and transient paths (`.git/FETCH_HEAD`, `*.log`, `*.stats.json`, `workspace.xml`) in `watcher.rs`, reduced nested watch depth/cap (`2` / `32`), and raised debounce to `1500ms`.
+  - Configured bounded `libgit2` memory limits at startup (`16 MiB` mwindow size, `128 MiB` mapped limit, `32 MiB` object cache) plus Linux `glibc` arena cap (`M_ARENA_MAX = 4`) and `malloc_trim(0)`, replaced transient 16-thread scan spawns with a persistent 4-worker pool, and capped `fleet::default_workers()` to `4`.
+  - Enabled SQLite `WAL` mode and `5s` `busy_timeout`, batched `ci_cache` and `host_cache` writes into single transactions, added a fast symref path for `git_ops::default_branch()`, and increased the shared Tokio runtime to 4 threads with `spawn_blocking` for sync git lookups.
+
+## [2026.11.2] - 2026-11-21
+
+### Fixed
+
+- **Fleet Fetch/Pull Transient Network Resilience & Circuit Breaker**:
+  - Added cancel-aware exponential backoff retries (`1s`, `2s`, `3s`, `4s`) for transient DNS, socket, and HTTP `429`/`5xx` transport failures across fleet fetch, pull, reset-hard, and submodule updates (`NetworkRetryGate`), allowing multi-hundred-repo fleet runs to survive brief Wi-Fi roams and DHCP drops instead of failing the remaining queue.
+  - Added a per-run consecutive-failure circuit breaker (`trip_threshold = workers`) that heals automatically on any successful remote operation, so truly offline fleet runs still abort quickly instead of hanging for minutes.
+  - Permanent remote/auth rejections (`404`, `401`, `403`, `Repository not found`, auth/host-key failures) bypass retries and fail immediately.
+- **Fleet Action Log & Notice Failure Visibility**:
+  - Added grouped **Failure cause** summary lines at the tail of the Action Log when a fleet run finishes with errors so failure causes stay visible even when trailing successes scroll past.
+  - Updated Notice overlay / Activity Log context (`fleet_log_context`) to include a grouped **Failure reasons** summary and order per-repo outcomes by severity (failures and skips before successes) instead of letting early successes crowd late failures past the 80-entry cap.
+  - Normalized multi-line `libgit2`/SSH error strings onto a single clean Action Log line.
+
 ## [2026.11.1] - 2026-11-19
 
 ### Added
