@@ -1137,8 +1137,13 @@ impl RepoHarborApp {
                     crate::drawer::load_changes(repo.clone(), cx);
                 }
                 // One rescan for the whole run (not per repo) so the grid
-                // reflects the new ahead/behind/dirty state.
-                this.rescan(cx);
+                // reflects the new ahead/behind/dirty state. Only re-arm the
+                // watcher when submodule checkouts may have been initialized.
+                if matches!(op, FleetOp::SubmoduleUpdate) {
+                    this.rescan_with_rearm(cx);
+                } else {
+                    this.rescan(cx);
+                }
                 // Drain FIFO — same-repo serial is automatic while only one
                 // job holds the execution slot.
                 this.start_next_queued_fleet(cx);

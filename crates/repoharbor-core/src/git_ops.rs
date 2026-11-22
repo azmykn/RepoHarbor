@@ -2,6 +2,12 @@
 //! listing/switching/pruning, worktrees, recent log, and the working diff.
 //! All synchronous; callers run them off the UI thread.
 
+use std::collections::HashMap;
+use std::io::Write;
+use std::process::{Command, Stdio};
+use std::sync::{LazyLock, Mutex, Once};
+use std::time::{Duration, Instant};
+
 use git2::{
     BranchType, Cred, CredentialType, DiffOptions, FetchOptions, RemoteCallbacks, Repository,
     RepositoryState,
@@ -9,6 +15,162 @@ use git2::{
 use serde::{Deserialize, Serialize};
 
 use crate::model::GitStatus;
+
+/// Bounded libgit2 mmap window size (16 MiB instead of the 1 GiB 64-bit default).
+const MWINDOW_SIZE_BYTES: usize = 16 * 1024 * 1024;
+/// Bounded total libgit2 mapped packfile memory (128 MiB instead of the 8 GiB default).
+const MWINDOW_MAPPED_LIMIT_BYTES: usize = 128 * 1024 * 1024;
+/// Bounded libgit2 global object cache (32 MiB instead of the 256 MiB default).
+const CACHE_MAX_SIZE_BYTES: isize = 32 * 1024 * 1024;
+
+/// Configure process-wide libgit2 memory caps and glibc arena limits.
+///
+/// Must be called once at process startup before worker threads open git
+/// repositories. Deliberately avoids `set_mwindow_file_limit`, which has a
+/// known concurrent close data race in libgit2 (`mwindow.c`).
+pub fn init_runtime_limits() {
+    static INIT: Once = Once::new();
+    INIT.call_once(|| {
+        // SAFETY: Called once at startup before any background threads run git2.
+        unsafe {
+            let _ = git2::opts::set_mwindow_size(MWINDOW_SIZE_BYTES);
+            let _ = git2::opts::set_mwindow_mapped_limit(MWINDOW_MAPPED_LIMIT_BYTES);
+            let _ = libgit2_sys::git_libgit2_opts(
+                libgit2_sys::GIT_OPT_SET_CACHE_MAX_SIZE as std::os::raw::c_int,
+                CACHE_MAX_SIZE_BYTES,
+            );
+        }
+        #[cfg(all(target_os = "linux", target_env = "gnu"))]
+        {
+            extern "C" {
+                fn mallopt(param: libc::c_int, value: libc::c_int) -> libc::c_int;
+            }
+            // Limit glibc malloc arenas so transient worker allocations do not
+            // fragment across dozens of arenas on high-core-count CPUs.
+            const M_ARENA_MAX: libc::c_int = -8;
+            // SAFETY: glibc mallopt is safe to call during process initialization.
+            unsafe {
+                let _ = mallopt(M_ARENA_MAX, 4);
+            }
+        }
+    });
+}
+
+/// Ask the platform allocator to return freed heap pages to the OS after heavy
+/// batch operations (workspace scan, fleet runs). No-op outside Linux/glibc.
+pub fn trim_process_heap() {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    {
+        extern "C" {
+            fn malloc_trim(pad: libc::size_t) -> libc::c_int;
+        }
+        // SAFETY: malloc_trim(0) is thread-safe in glibc and releases unused top-of-heap pages.
+        unsafe {
+            let _ = malloc_trim(0);
+        }
+    }
+}
+
+/// In-memory TTL for cached HTTPS git credentials per `(scheme, host)`.
+const HTTPS_CRED_TTL: Duration = Duration::from_secs(300);
+
+struct CachedHttpsCred {
+    fetched_at: Instant,
+    username: String,
+    password: String,
+}
+
+static HTTPS_CRED_CACHE: LazyLock<Mutex<HashMap<(String, String), CachedHttpsCred>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Parse `https://<host[:port]>/...` into `("https", "<lowercase host[:port]>")`.
+/// Rejects non-HTTPS schemes and control characters so credentials are strictly
+/// scoped by scheme + host.
+fn parse_https_host(url: &str) -> Option<(String, String)> {
+    let rest = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("HTTPS://"))?;
+    let authority = rest.split(['/', '?', '#']).next()?;
+    let host = authority.rsplit('@').next()?.trim();
+    if host.is_empty()
+        || host
+            .bytes()
+            .any(|b| b <= 0x20 || b == b'\r' || b == b'\n' || b == b'\\')
+    {
+        return None;
+    }
+    Some(("https".to_string(), host.to_ascii_lowercase()))
+}
+
+fn fill_git_credential(protocol: &str, host: &str) -> Option<(String, String)> {
+    let mut child = Command::new("git")
+        .args(["credential", "fill"])
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    if let Some(mut stdin) = child.stdin.take() {
+        let _ = write!(stdin, "protocol={protocol}\nhost={host}\n\n");
+    }
+    let out = child.wait_with_output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut user = None;
+    let mut pass = None;
+    for line in text.lines() {
+        if let Some(v) = line.strip_prefix("username=") {
+            if !v.is_empty() {
+                user = Some(v.to_string());
+            }
+        } else if let Some(v) = line.strip_prefix("password=") {
+            if !v.is_empty() {
+                pass = Some(v.to_string());
+            }
+        }
+    }
+    match (user, pass) {
+        (Some(u), Some(p)) => Some((u, p)),
+        _ => None,
+    }
+}
+
+fn cached_https_cred_with<F>(
+    key: &(String, String),
+    now: Instant,
+    fetch: F,
+) -> Option<(String, String)>
+where
+    F: FnOnce(&str, &str) -> Option<(String, String)>,
+{
+    {
+        let cache = HTTPS_CRED_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(entry) = cache.get(key) {
+            if now.saturating_duration_since(entry.fetched_at) < HTTPS_CRED_TTL {
+                return Some((entry.username.clone(), entry.password.clone()));
+            }
+        }
+    }
+    let (username, password) = fetch(&key.0, &key.1)?;
+    let mut cache = HTTPS_CRED_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    cache.insert(
+        key.clone(),
+        CachedHttpsCred {
+            fetched_at: now,
+            username: username.clone(),
+            password: password.clone(),
+        },
+    );
+    Some((username, password))
+}
+
+fn evict_https_cred(key: &(String, String)) {
+    let mut cache = HTTPS_CRED_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    cache.remove(key);
+}
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -94,6 +256,22 @@ fn remote_callbacks() -> RemoteCallbacks<'static> {
         }
         if allowed.contains(CredentialType::USER_PASS_PLAINTEXT) {
             if let Ok(config) = git2::Config::open_default() {
+                let use_http_path = config.get_bool("credential.useHttpPath").unwrap_or(false);
+                if let Some(key) = (!use_http_path).then(|| parse_https_host(url)).flatten() {
+                    if attempts == 1 {
+                        if let Some((user, pass)) =
+                            cached_https_cred_with(&key, Instant::now(), fill_git_credential)
+                        {
+                            if let Ok(cred) = Cred::userpass_plaintext(&user, &pass) {
+                                return Ok(cred);
+                            }
+                        }
+                    } else {
+                        // Auth was rejected on the cached credential — evict immediately
+                        // and fall back to the uncached git credential helper.
+                        evict_https_cred(&key);
+                    }
+                }
                 if let Ok(cred) = Cred::credential_helper(&config, url, username) {
                     return Ok(cred);
                 }
@@ -1076,9 +1254,26 @@ fn short_oid(oid: git2::Oid) -> String {
     full[..7.min(full.len())].to_string()
 }
 
+/// Fast-path read of `.git/refs/remotes/origin/HEAD` without opening libgit2.
+fn default_branch_fast_path(path: &str) -> Option<String> {
+    let ref_file = std::path::Path::new(path)
+        .join(".git")
+        .join("refs")
+        .join("remotes")
+        .join("origin")
+        .join("HEAD");
+    let raw = std::fs::read_to_string(ref_file).ok()?;
+    let target = raw.trim().strip_prefix("ref:")?.trim();
+    let name = target.rsplit('/').next()?.trim();
+    (!name.is_empty()).then(|| name.to_string())
+}
+
 /// The repo's default branch name (`origin/HEAD`, else a local main/master) —
 /// the base branch for "Open PR" and the merged checks.
 pub fn default_branch(path: &str) -> Option<String> {
+    if let Some(name) = default_branch_fast_path(path) {
+        return Some(name);
+    }
     Repository::open(path)
         .ok()
         .and_then(|r| default_branch_name(&r))
@@ -4050,5 +4245,68 @@ mod tests {
         assert_eq!(err, "unexpected http status code: 404; class=Http (34)");
         assert_eq!(calls, 1);
         assert_eq!(failures.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn default_branch_fast_path_reads_origin_head_symref() {
+        let dir = tempfile::tempdir().unwrap();
+        let origin_ref = dir.path().join(".git/refs/remotes/origin");
+        std::fs::create_dir_all(&origin_ref).unwrap();
+        std::fs::write(origin_ref.join("HEAD"), "ref: refs/remotes/origin/19.0\n").unwrap();
+        let path = dir.path().to_str().unwrap();
+        assert_eq!(default_branch_fast_path(path).as_deref(), Some("19.0"));
+        assert_eq!(default_branch(path).as_deref(), Some("19.0"));
+    }
+
+    #[test]
+    fn init_runtime_limits_configures_bounded_mwindow_caps() {
+        init_runtime_limits();
+        // SAFETY: Reading libgit2 global limits after init_runtime_limits().
+        unsafe {
+            assert_eq!(git2::opts::get_mwindow_size().unwrap(), MWINDOW_SIZE_BYTES);
+            assert_eq!(
+                git2::opts::get_mwindow_mapped_limit().unwrap(),
+                MWINDOW_MAPPED_LIMIT_BYTES
+            );
+        }
+    }
+
+    #[test]
+    fn https_cred_cache_scopes_by_host_and_evicts() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        assert_eq!(
+            parse_https_host("https://GitHub.com/owner/repo.git"),
+            Some(("https".into(), "github.com".into()))
+        );
+        assert_eq!(parse_https_host("http://github.com/owner/repo.git"), None);
+        assert_eq!(parse_https_host("git@github.com:owner/repo.git"), None);
+
+        let key = ("https".to_string(), "unit-test-host.example".to_string());
+        evict_https_cred(&key);
+        let calls = AtomicUsize::new(0);
+        let t0 = Instant::now();
+
+        let first = cached_https_cred_with(&key, t0, |_, _| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Some(("u1".into(), "p1".into()))
+        });
+        assert_eq!(first, Some(("u1".into(), "p1".into())));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        let second = cached_https_cred_with(&key, t0 + Duration::from_secs(30), |_, _| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Some(("u2".into(), "p2".into()))
+        });
+        assert_eq!(second, Some(("u1".into(), "p1".into())));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        evict_https_cred(&key);
+        let third = cached_https_cred_with(&key, t0 + Duration::from_secs(31), |_, _| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Some(("u3".into(), "p3".into()))
+        });
+        assert_eq!(third, Some(("u3".into(), "p3".into())));
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        evict_https_cred(&key);
     }
 }

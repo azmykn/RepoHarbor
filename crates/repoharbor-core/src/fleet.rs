@@ -77,12 +77,12 @@ impl FleetReport {
 }
 
 /// Default worker count: enough to hide network latency across a fleet without
-/// hammering the disk or the remote — min(8, available cores).
+/// hammering the disk, libgit2 memory, or the remote — min(4, available cores).
 pub fn default_workers() -> usize {
     std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(4)
-        .min(8)
+        .min(4)
 }
 
 /// Run `op` across `repos` (repo ids, i.e. absolute paths) on up to `workers`
@@ -140,6 +140,8 @@ where
             });
         }
     });
+
+    crate::git_ops::trim_process_heap();
 
     FleetReport {
         results: slots

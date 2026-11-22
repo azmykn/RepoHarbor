@@ -5513,7 +5513,7 @@ checksum = "19b30a45b0cd0bcca8037f3d0dc3421eaf95327a17cad11964fb8179b4fc4832"
 
 [[package]]
 name = "repoharbor"
-version = "2026.11.2"
+version = "2026.11.3"
 dependencies = [
  "async-channel 2.5.0",
  "base64",
@@ -5538,7 +5538,7 @@ dependencies = [
 
 [[package]]
 name = "repoharbor-core"
-version = "2026.11.2"
+version = "2026.11.3"
 dependencies = [
  "async-channel 2.5.0",
  "chrono",
@@ -5547,6 +5547,8 @@ dependencies = [
  "futures-util",
  "git2",
  "globset",
+ "libc",
+ "libgit2-sys",
  "portable-pty",
  "reqwest",
  "rusqlite",
@@ -5565,7 +5567,7 @@ dependencies = [
 
 [[package]]
 name = "repoharbor-platform"
-version = "2026.11.2"
+version = "2026.11.3"
 dependencies = [
  "ashpd",
  "dirs",

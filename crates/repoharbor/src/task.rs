@@ -19,7 +19,8 @@ fn runtime() -> &'static Runtime {
     static RT: OnceLock<Runtime> = OnceLock::new();
     RT.get_or_init(|| {
         tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
+            .worker_threads(4)
+            .thread_name("repoharbor-tokio")
             .enable_all()
             .build()
             .expect("build the shared tokio runtime")

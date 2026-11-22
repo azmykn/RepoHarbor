@@ -69,67 +69,137 @@ pub fn scan(
 
     let mut out = parents;
     out.extend(children);
+    crate::git_ops::trim_process_heap();
     out
 }
 
-fn build_repos_parallel(targets: &[(PathBuf, &str, bool)], now: i64) -> Vec<Repo> {
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    let threads = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(4)
-        .min(targets.len().max(1));
-    let out = std::sync::Mutex::new(Vec::with_capacity(targets.len()));
-    let next = AtomicUsize::new(0);
-    std::thread::scope(|scope| {
-        let (out, next, targets) = (&out, &next, targets);
-        for _ in 0..threads {
-            scope.spawn(move || loop {
-                let i = next.fetch_add(1, Ordering::Relaxed);
-                let Some((path, root, fav)) = targets.get(i) else {
-                    break;
-                };
-                if let Some(repo) = build_repo(path, root, *fav, now, None, None) {
-                    out.lock().unwrap_or_else(|e| e.into_inner()).push(repo);
-                }
-            });
+/// Hard cap on concurrent scan workers so scanning hundreds of large git repos
+/// stays responsive without saturating every core or fragmenting allocator arenas.
+const MAX_SCAN_WORKERS: usize = 4;
+
+type PoolTask = Box<dyn FnOnce() + Send + 'static>;
+
+/// Persistent bounded worker pool reused across every workspace scan so we never
+/// spawn and destroy 16 transient OS threads (and glibc arenas) per rescan.
+struct ScanPool {
+    /// Serializes overlapping scan callers so two full-fleet scans never compete.
+    run_lock: std::sync::Mutex<()>,
+    tx: async_channel::Sender<PoolTask>,
+    workers: usize,
+}
+
+impl ScanPool {
+    fn global() -> &'static Self {
+        static POOL: std::sync::OnceLock<ScanPool> = std::sync::OnceLock::new();
+        POOL.get_or_init(|| {
+            let workers = std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(4)
+                .clamp(1, MAX_SCAN_WORKERS);
+            let (tx, rx) = async_channel::unbounded::<PoolTask>();
+            for idx in 0..workers {
+                let rx = rx.clone();
+                let _ = std::thread::Builder::new()
+                    .name(format!("repoharbor-scan-{idx}"))
+                    .spawn(move || {
+                        while let Ok(task) = rx.recv_blocking() {
+                            task();
+                        }
+                    });
+            }
+            Self {
+                run_lock: std::sync::Mutex::new(()),
+                tx,
+                workers,
+            }
+        })
+    }
+
+    fn map<T, R, F>(&self, items: Vec<T>, f: F) -> Vec<R>
+    where
+        T: Send + Sync + 'static,
+        R: Send + 'static,
+        F: Fn(&T) -> Option<R> + Send + Sync + 'static,
+    {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Arc, Condvar, Mutex};
+
+        if items.is_empty() {
+            return Vec::new();
         }
-    });
-    out.into_inner().unwrap_or_else(|e| e.into_inner())
+        let _serial = self.run_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let len = items.len();
+        let active = self.workers.min(len);
+        let items = Arc::new(items);
+        let f = Arc::new(f);
+        let next = Arc::new(AtomicUsize::new(0));
+        let out = Arc::new(Mutex::new(Vec::with_capacity(len)));
+        let done = Arc::new((Mutex::new(0usize), Condvar::new()));
+
+        for _ in 0..active {
+            let items = items.clone();
+            let f = f.clone();
+            let next = next.clone();
+            let out = out.clone();
+            let done = done.clone();
+            let _ = self.tx.send_blocking(Box::new(move || {
+                loop {
+                    let i = next.fetch_add(1, Ordering::Relaxed);
+                    let Some(item) = items.get(i) else {
+                        break;
+                    };
+                    if let Some(res) = f(item) {
+                        out.lock().unwrap_or_else(|e| e.into_inner()).push(res);
+                    }
+                }
+                let (lock, cvar) = &*done;
+                let mut finished = lock.lock().unwrap_or_else(|e| e.into_inner());
+                *finished += 1;
+                if *finished >= active {
+                    cvar.notify_one();
+                }
+            }));
+        }
+
+        let (lock, cvar) = &*done;
+        let mut finished = lock.lock().unwrap_or_else(|e| e.into_inner());
+        while *finished < active {
+            finished = cvar.wait(finished).unwrap_or_else(|e| e.into_inner());
+        }
+        drop(finished);
+
+        match Arc::try_unwrap(out) {
+            Ok(mutex) => mutex.into_inner().unwrap_or_else(|e| e.into_inner()),
+            Err(arc) => std::mem::take(&mut *arc.lock().unwrap_or_else(|e| e.into_inner())),
+        }
+    }
+}
+
+fn build_repos_parallel(targets: &[(PathBuf, &str, bool)], now: i64) -> Vec<Repo> {
+    let owned: Vec<(PathBuf, String, bool)> = targets
+        .iter()
+        .map(|(p, r, fav)| (p.clone(), (*r).to_string(), *fav))
+        .collect();
+    ScanPool::global().map(owned, move |(path, root, fav)| {
+        build_repo(path, root, *fav, now, None, None)
+    })
 }
 
 fn build_submodule_repos_parallel(
     targets: &[(PathBuf, String, String, String, bool)],
     now: i64,
 ) -> Vec<Repo> {
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    let threads = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(4)
-        .min(targets.len().max(1));
-    let out = std::sync::Mutex::new(Vec::with_capacity(targets.len()));
-    let next = AtomicUsize::new(0);
-    std::thread::scope(|scope| {
-        let (out, next, targets) = (&out, &next, targets);
-        for _ in 0..threads {
-            scope.spawn(move || loop {
-                let i = next.fetch_add(1, Ordering::Relaxed);
-                let Some((path, root, parent_id, rel, fav)) = targets.get(i) else {
-                    break;
-                };
-                if let Some(repo) = build_repo(
-                    path,
-                    root,
-                    *fav,
-                    now,
-                    Some(parent_id.clone()),
-                    Some(rel.clone()),
-                ) {
-                    out.lock().unwrap_or_else(|e| e.into_inner()).push(repo);
-                }
-            });
-        }
-    });
-    out.into_inner().unwrap_or_else(|e| e.into_inner())
+    let owned = targets.to_vec();
+    ScanPool::global().map(owned, move |(path, root, parent_id, rel, fav)| {
+        build_repo(
+            path,
+            root,
+            *fav,
+            now,
+            Some(parent_id.clone()),
+            Some(rel.clone()),
+        )
+    })
 }
 
 /// Just the discovered repo paths (no metadata) — used by the watcher to decide

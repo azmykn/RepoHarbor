@@ -621,13 +621,19 @@ async fn gh_search(token: &str, query: &str, kind: &str) -> Result<Vec<InboxItem
 /// assigned to them.
 pub async fn github_inbox() -> Result<Vec<InboxItem>, String> {
     let token = oauth::github_token().ok_or("connect GitHub to use the inbox")?;
-    let login = github_user(&token).await?;
+    github_inbox_with_token(&token).await
+}
+
+/// Same as [`github_inbox`] using a pre-resolved GitHub token (avoids re-running
+/// CLI token resolution across back-to-back calls).
+pub async fn github_inbox_with_token(token: &str) -> Result<Vec<InboxItem>, String> {
+    let login = github_user(token).await?;
 
     let mut items = Vec::new();
-    items.extend(gh_search(&token, &format!("is:open is:pr author:{login}"), "pr").await?);
+    items.extend(gh_search(token, &format!("is:open is:pr author:{login}"), "pr").await?);
     items.extend(
         gh_search(
-            &token,
+            token,
             &format!("is:open is:pr review-requested:{login}"),
             "review",
         )
@@ -635,7 +641,7 @@ pub async fn github_inbox() -> Result<Vec<InboxItem>, String> {
     );
     items.extend(
         gh_search(
-            &token,
+            token,
             &format!("is:open is:issue assignee:{login}"),
             "issue",
         )
@@ -649,6 +655,12 @@ pub async fn github_inbox() -> Result<Vec<InboxItem>, String> {
 /// comes back short; any page failing propagates as an error (same rule as
 /// `gh_search`).
 pub async fn github_notifications() -> Result<Vec<Notification>, String> {
+    let token = oauth::github_token().ok_or("connect GitHub to see notifications")?;
+    github_notifications_with_token(&token).await
+}
+
+/// Same as [`github_notifications`] using a pre-resolved GitHub token.
+pub async fn github_notifications_with_token(token: &str) -> Result<Vec<Notification>, String> {
     #[derive(Deserialize)]
     struct N {
         reason: String,
@@ -667,14 +679,13 @@ pub async fn github_notifications() -> Result<Vec<Notification>, String> {
     }
     const PER_PAGE: usize = 50;
     const MAX_PAGES: usize = 3;
-    let token = oauth::github_token().ok_or("connect GitHub to see notifications")?;
     let mut items = Vec::new();
     for page in 1..=MAX_PAGES {
         let resp = client()
             .get(format!(
                 "{GH}/notifications?per_page={PER_PAGE}&page={page}"
             ))
-            .bearer_auth(&token)
+            .bearer_auth(token)
             .send()
             .await
             .map_err(|e| e.to_string())?;
@@ -1158,6 +1169,24 @@ pub async fn github_approve_pr(slug: &str, number: u64) -> Result<(), String> {
 /// a fine-grained PAT) and org SSO authorization when the remote is under an
 /// org that requires it.
 pub async fn github_ci(slug: &str, branch: Option<&str>) -> Result<CiStatus, String> {
+    // No token → forge calls are gated off entirely; an unconnected app
+    // legitimately shows no CI (this is absence of a source, not a failure).
+    let Some(token) = oauth::github_token() else {
+        return Ok(CiStatus {
+            state: "none".into(),
+            url: None,
+        });
+    };
+    github_ci_with_token(slug, branch, &token).await
+}
+
+/// Fetch the latest default-branch workflow run using a pre-resolved token so
+/// fleet-wide CI passes resolve the token once instead of per repository.
+pub async fn github_ci_with_token(
+    slug: &str,
+    branch: Option<&str>,
+    token: &str,
+) -> Result<CiStatus, String> {
     #[derive(Deserialize)]
     struct Runs {
         #[serde(default)]
@@ -1169,14 +1198,6 @@ pub async fn github_ci(slug: &str, branch: Option<&str>) -> Result<CiStatus, Str
         conclusion: Option<String>,
         html_url: Option<String>,
     }
-    // No token → forge calls are gated off entirely; an unconnected app
-    // legitimately shows no CI (this is absence of a source, not a failure).
-    let Some(token) = oauth::github_token() else {
-        return Ok(CiStatus {
-            state: "none".into(),
-            url: None,
-        });
-    };
     let mut req = client()
         .get(format!("{GH}/repos/{slug}/actions/runs"))
         .query(&[("per_page", "1")]);
@@ -1184,7 +1205,7 @@ pub async fn github_ci(slug: &str, branch: Option<&str>) -> Result<CiStatus, Str
         req = req.query(&[("branch", branch)]);
     }
     let resp = req
-        .bearer_auth(&token)
+        .bearer_auth(token)
         .send()
         .await
         .map_err(|e| e.to_string())?;

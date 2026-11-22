@@ -17,6 +17,7 @@
 //! GitLab pipelines can layer on later behind the same cache shape.
 
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use futures_util::stream::{self, StreamExt};
 
@@ -33,7 +34,19 @@ use crate::{cache, git_ops, oauth};
 const TTL_SECS: i64 = 5 * 60;
 
 /// Max concurrent CI-API requests in flight during a pass.
-const CONCURRENCY: usize = 8;
+const CONCURRENCY: usize = 4;
+
+/// Process-wide in-flight guard so overlapping rescans / attention polls never
+/// stampede concurrent CI passes.
+static CI_REFRESHING: AtomicBool = AtomicBool::new(false);
+
+struct ResetFlag(&'static AtomicBool);
+
+impl Drop for ResetFlag {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
+}
 
 /// A pending CI fetch: `(remote domain, slug, repo path)`. Domain + slug is
 /// the `ci_cache` key (the #159 compound-key lesson); the path is where the
@@ -86,27 +99,43 @@ fn build_jobs(repos: &[Repo], fresh: &HashSet<(String, String)>) -> Vec<Job> {
 /// One fetch result, keyed for the cache write.
 type FetchResult = Result<(String, String, CiStatus), String>;
 
-/// Fold fetch results into cache writes: `Ok` entries are persisted, `Err`s
-/// are only counted — never written — so a failing pass keeps the last known
-/// state (#174). Split out (over a plain connection) for the regression test.
-fn apply_results_on(conn: &rusqlite::Connection, results: Vec<FetchResult>, now: i64) -> Outcome {
+/// Fold fetch results into cache writes: `Ok` entries are persisted in a single
+/// SQLite transaction, `Err`s are only counted — never written — so a failing
+/// pass keeps the last known state (#174). Split out (over a plain connection)
+/// for the regression test.
+fn apply_results_on(
+    conn: &mut rusqlite::Connection,
+    results: Vec<FetchResult>,
+    now: i64,
+) -> Outcome {
     let mut outcome = Outcome::default();
+    let mut ok_entries: Vec<(String, String, CiStatus)> = Vec::new();
     for result in results {
         match result {
-            Ok((domain, slug, status)) => {
-                cache::store_ci_state_on(
-                    conn,
-                    &domain,
-                    &slug,
-                    &status.state,
-                    status.url.as_deref(),
-                    now,
-                );
-                outcome.updated += 1;
-            }
+            Ok(item) => ok_entries.push(item),
             Err(e) => {
                 outcome.errors += 1;
                 outcome.last_error = Some(e);
+            }
+        }
+    }
+    if !ok_entries.is_empty() {
+        let rows: Vec<(&str, &str, &str, Option<&str>)> = ok_entries
+            .iter()
+            .map(|(domain, slug, status)| {
+                (
+                    domain.as_str(),
+                    slug.as_str(),
+                    status.state.as_str(),
+                    status.url.as_deref(),
+                )
+            })
+            .collect();
+        match cache::store_ci_states_on(conn, &rows, now) {
+            Ok(written) => outcome.updated = written,
+            Err(e) => {
+                outcome.errors += ok_entries.len();
+                outcome.last_error = Some(e.to_string());
             }
         }
     }
@@ -120,9 +149,18 @@ fn apply_results_on(conn: &rusqlite::Connection, results: Vec<FetchResult>, now:
 ///
 /// `force` ignores the TTL and re-fetches every repo (the manual "Fetch all").
 pub async fn refresh(repos: &[Repo], now: i64, force: bool) -> Outcome {
-    if oauth::github_token().is_none() {
+    let _guard = if !force {
+        if CI_REFRESHING.swap(true, Ordering::SeqCst) {
+            return Outcome::default();
+        }
+        Some(ResetFlag(&CI_REFRESHING))
+    } else {
+        None
+    };
+
+    let Some(token) = oauth::github_token() else {
         return Outcome::default();
-    }
+    };
     let fresh = if force {
         HashSet::new()
     } else {
@@ -133,15 +171,21 @@ pub async fn refresh(repos: &[Repo], now: i64, force: bool) -> Outcome {
         return Outcome::default();
     }
 
+    let token = std::sync::Arc::new(token);
     let results: Vec<FetchResult> = stream::iter(jobs)
-        .map(|(domain, slug, path)| async move {
-            // Default branch from the local clone (origin/HEAD, else
-            // main/master) — a fast ref read, no API call. `None` (bare
-            // oddities) falls back to the latest run on any branch.
-            let branch = git_ops::default_branch(&path);
-            match inbox::github_ci(&slug, branch.as_deref()).await {
-                Ok(status) => Ok((domain, slug, status)),
-                Err(e) => Err(e),
+        .map(|(domain, slug, path)| {
+            let token = token.clone();
+            async move {
+                // Default branch from the local clone (fast symref read / git2
+                // fallback) offloaded so sync I/O never stalls tokio workers.
+                let branch = tokio::task::spawn_blocking(move || git_ops::default_branch(&path))
+                    .await
+                    .ok()
+                    .flatten();
+                match inbox::github_ci_with_token(&slug, branch.as_deref(), &token).await {
+                    Ok(status) => Ok((domain, slug, status)),
+                    Err(e) => Err(e),
+                }
             }
         })
         .buffer_unordered(CONCURRENCY)
@@ -149,7 +193,7 @@ pub async fn refresh(repos: &[Repo], now: i64, force: bool) -> Outcome {
         .await;
 
     match cache::open() {
-        Ok(conn) => apply_results_on(&conn, results, now),
+        Ok(mut conn) => apply_results_on(&mut conn, results, now),
         Err(e) => Outcome {
             updated: 0,
             errors: results.len(),
@@ -281,7 +325,7 @@ mod tests {
     fn errors_do_not_clobber_cached_state() {
         // Regression for the #174 lesson: an expired token (Err) must keep the
         // last known state — CI must read as an error, not as vanishing.
-        let conn = mem();
+        let mut conn = mem();
         cache::store_ci_state_on(
             &conn,
             "github.com",
@@ -291,8 +335,11 @@ mod tests {
             1_000,
         );
 
-        let outcome =
-            apply_results_on(&conn, vec![Err("GitHub CI 401 Unauthorized".into())], 2_000);
+        let outcome = apply_results_on(
+            &mut conn,
+            vec![Err("GitHub CI 401 Unauthorized".into())],
+            2_000,
+        );
         assert_eq!(outcome.updated, 0);
         assert_eq!(outcome.errors, 1);
         assert_eq!(
@@ -309,9 +356,9 @@ mod tests {
 
     #[test]
     fn ok_results_are_written_alongside_errors() {
-        let conn = mem();
+        let mut conn = mem();
         let outcome = apply_results_on(
-            &conn,
+            &mut conn,
             vec![
                 Ok((
                     "github.com".into(),
@@ -377,5 +424,16 @@ mod tests {
             facts[0].url.as_deref(),
             Some("https://github.com/o/test/actions/runs/2")
         );
+    }
+
+    #[test]
+    fn reset_flag_guard_releases_in_flight_lock_on_drop() {
+        static TEST_FLAG: AtomicBool = AtomicBool::new(false);
+        assert!(!TEST_FLAG.swap(true, Ordering::SeqCst));
+        {
+            let _guard = ResetFlag(&TEST_FLAG);
+            assert!(TEST_FLAG.load(Ordering::SeqCst));
+        }
+        assert!(!TEST_FLAG.load(Ordering::SeqCst));
     }
 }
