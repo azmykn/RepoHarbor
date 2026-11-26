@@ -358,6 +358,9 @@ fn main() {
                         .sidebar_width
                         .clamp(shell::SIDEBAR_MIN, shell::SIDEBAR_MAX);
                     let sidebar_collapsed = config.sidebar_collapsed;
+                    let drawer_width = config
+                        .drawer_width
+                        .clamp(crate::drawer::DRAWER_MIN, crate::drawer::DRAWER_MAX);
                     let terminal_height = config.terminal_height;
                     let view = cx.new(|cx| {
                         // Start the live wiring: filesystem watch, appearance,
@@ -435,6 +438,8 @@ fn main() {
                             sidebar_width,
                             sidebar_collapsed,
                             sidebar_dragging: false,
+                            drawer_width,
+                            drawer_dragging: false,
                             repo_search: None,
                             _repo_search_sub: None,
                             terminal: crate::terminal_view::TerminalDockState::new(terminal_height),

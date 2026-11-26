@@ -516,6 +516,10 @@ pub struct RepoHarborApp {
     pub sidebar_collapsed: bool,
     /// True while the user is dragging the sidebar resize handle.
     pub sidebar_dragging: bool,
+    /// Repo detail drawer width when open (px). Clamped to [`crate::drawer::DRAWER_MIN`]..=[`crate::drawer::DRAWER_MAX`].
+    pub drawer_width: f32,
+    /// True while the user is dragging the drawer resize handle.
+    pub drawer_dragging: bool,
     /// Live text filter for the Mission Control repo grid (name / slug / path).
     /// Created on first paint — `InputState` needs a `Window`.
     pub repo_search: Option<Entity<InputState>>,
@@ -5137,6 +5141,22 @@ impl RepoHarborApp {
         let _ = repoharbor_core::config::save(&self.config);
     }
 
+    /// Write drawer width into config.toml (keeps other settings).
+    pub fn persist_drawer_chrome(&mut self) {
+        self.config.drawer_width = self
+            .drawer_width
+            .clamp(crate::drawer::DRAWER_MIN, crate::drawer::DRAWER_MAX);
+        let _ = repoharbor_core::config::save(&self.config);
+    }
+
+    /// Responsive drawer width clamped to current viewport.
+    pub fn drawer_w(&self, viewport_w: f32) -> f32 {
+        let max_w = (viewport_w - 100.).max(crate::drawer::DRAWER_MIN);
+        self.drawer_width
+            .clamp(crate::drawer::DRAWER_MIN, crate::drawer::DRAWER_MAX)
+            .min(max_w)
+    }
+
     /// Persist workspace groups + active group name.
     fn persist_workspace_groups(&mut self) {
         let _ = repoharbor_core::config::save(&self.config);
@@ -7284,7 +7304,7 @@ impl RepoHarborApp {
             .items_center()
             .gap(px(8.))
             .px(px(16.))
-            .py(px(10.))
+            .py(px(7.))
             .border_b_1()
             .border_color(rgb(t.border))
             .child(
@@ -7453,29 +7473,25 @@ impl RepoHarborApp {
             .items_center()
             .gap(px(7.))
             .px(px(16.))
-            .py(px(9.))
+            .py(px(6.))
             .bg(rgb(t.surface))
             .border_b_1()
             .border_color(rgb(t.border));
         row = row.child(self.select_all_checkbox(t, cx));
-        // Disk/git rescan — labeled + accent so it isn’t a ghost icon.
-        row = row
-            .child(tool_btn_primary(
-                "tb-refresh",
-                "refresh-cw",
-                "Refresh",
-                t,
-                cx.listener(|this, _ev, _w, cx| this.rescan_user(cx)),
-            ))
-            .child(sep());
 
-        // One-click Pull for every repo behind its upstream (vendor trees).
+        // One-click Pull for every repo behind its upstream (vendor trees) — highlights with count.
+        let behind_count = self.rows.iter().filter(|r| r.behind > 0).count();
+        let pull_behind_label = if behind_count > 0 {
+            format!("Pull behind ({behind_count})")
+        } else {
+            "Pull behind".to_string()
+        };
         row = row.child(tool_btn(
             "tb-pull-behind",
             "download",
-            Some("Pull behind"),
+            Some(pull_behind_label.as_str()),
             Some("Pull only the repositories that are behind upstream"),
-            false,
+            behind_count > 0,
             t,
             cx.listener(|this, _ev, _w, cx| this.pull_behind_repos(cx)),
         ));
@@ -7912,15 +7928,11 @@ impl Render for RepoHarborApp {
             }
         }
 
-        let shell = div()
+        let shell_body = div()
             .flex()
             .flex_col()
             .size_full()
             .overflow_hidden()
-            .bg(rgb(t.page))
-            .text_color(rgb(t.fg1))
-            .font_family("sans-serif")
-            .child(title_bar)
             .child(self.chrome_bar(&t, cx))
             .child({
                 let mut workspace_col = div()
@@ -7960,10 +7972,37 @@ impl Render for RepoHarborApp {
                     .child(workspace_col)
             });
 
-        // The shell, with overlays (drawer/palette/dialog) then toasts on top
-        // so AI/fleet errors stay visible above the drawer (toasts are
-        // content-sized bottom-right — they don't block UI).
-        let mut root = div()
+        // Overlays (drawer/palette/dialog) and toasts live inside the body area,
+        // below TitleBar — so client-side window controls (minimize, maximize, close)
+        // in TitleBar stay accessible at all times without occlusion.
+        let mut body = div()
+            .relative()
+            .flex_1()
+            .min_h(px(0.))
+            .min_w(px(0.))
+            .overflow_hidden()
+            .child(shell_body);
+
+        if let Some(overlay) = self.overlay_element(&t, cx, window) {
+            body = body.child(overlay);
+        }
+        if let Some(toasts) = self.toast_layer(&t, cx) {
+            body = body.child(toasts);
+        }
+        if let Some(entry) = &self.notice_detail {
+            body = body
+                .child(crate::views::notice::render(entry, &t, &cx.entity()).into_any_element());
+        }
+        if let Some(repos) = &self.fleet_gen_push {
+            let names = crate::views::fleet_gen_push::repo_names(self, repos);
+            body = body.child(
+                crate::views::fleet_gen_push::render(repos, &t, &cx.entity(), &names)
+                    .into_any_element(),
+            );
+        }
+
+        // The shell, with TitleBar fixed at the top and body holding workspace/overlays.
+        div()
             .track_focus(&self.focus)
             .on_action(cx.listener(|this, _: &crate::ToggleTerminal, window, cx| {
                 this.toggle_terminal(Some(window), cx);
@@ -8030,7 +8069,7 @@ impl Render for RepoHarborApp {
                     this.run_fleet(crate::fleet::FleetOp::Pull, cx);
                 }),
             )
-            // Sidebar + terminal dock resize: track mouse while a handle is held.
+            // Sidebar + terminal dock + drawer resize: track mouse while a handle is held.
             .on_mouse_move(cx.listener(|this, _ev, window, cx| {
                 if this.terminal.dragging {
                     let vh = f32::from(window.viewport_size().height);
@@ -8042,6 +8081,19 @@ impl Render for RepoHarborApp {
                     if (next - this.terminal.height).abs() >= 1. {
                         this.terminal.height = next;
                         this.terminal.maximized = false;
+                        cx.notify();
+                    }
+                    return;
+                }
+                if this.drawer_dragging {
+                    let vw = f32::from(window.viewport_size().width);
+                    let x = f32::from(window.mouse_position().x);
+                    let next = (vw - x).clamp(
+                        crate::drawer::DRAWER_MIN,
+                        (vw - 80.).max(crate::drawer::DRAWER_MIN),
+                    );
+                    if (next - this.drawer_width).abs() >= 1. {
+                        this.drawer_width = next;
                         cx.notify();
                     }
                     return;
@@ -8074,6 +8126,11 @@ impl Render for RepoHarborApp {
                         }
                         cx.notify();
                     }
+                    if this.drawer_dragging {
+                        this.drawer_dragging = false;
+                        this.persist_drawer_chrome();
+                        cx.notify();
+                    }
                     if this.sidebar_dragging {
                         this.sidebar_dragging = false;
                         this.persist_sidebar_chrome();
@@ -8081,27 +8138,15 @@ impl Render for RepoHarborApp {
                     }
                 }),
             )
-            .relative()
+            .flex()
+            .flex_col()
             .size_full()
-            .child(shell);
-        if let Some(overlay) = self.overlay_element(&t, cx) {
-            root = root.child(overlay);
-        }
-        if let Some(toasts) = self.toast_layer(&t, cx) {
-            root = root.child(toasts);
-        }
-        if let Some(entry) = &self.notice_detail {
-            root = root
-                .child(crate::views::notice::render(entry, &t, &cx.entity()).into_any_element());
-        }
-        if let Some(repos) = &self.fleet_gen_push {
-            let names = crate::views::fleet_gen_push::repo_names(self, repos);
-            root = root.child(
-                crate::views::fleet_gen_push::render(repos, &t, &cx.entity(), &names)
-                    .into_any_element(),
-            );
-        }
-        root
+            .overflow_hidden()
+            .bg(rgb(t.page))
+            .text_color(rgb(t.fg1))
+            .font_family("sans-serif")
+            .child(title_bar)
+            .child(body)
     }
 }
 
@@ -8109,7 +8154,12 @@ impl RepoHarborApp {
     /// Build the active overlay's element, if one is open. Returns `None` when
     /// the drawer's repo has vanished (e.g. a rescan dropped it) — which also
     /// leaves the stale overlay to be cleared on the next interaction.
-    fn overlay_element(&self, t: &Theme, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+    fn overlay_element(
+        &self,
+        t: &Theme,
+        cx: &mut Context<Self>,
+        window: &Window,
+    ) -> Option<gpui::AnyElement> {
         match &self.overlay {
             Some(Overlay::Drawer { repo, tab }) => {
                 let row = self.rows.iter().find(|r| &r.id == repo)?;
@@ -8117,6 +8167,8 @@ impl RepoHarborApp {
                     self.config.ide_command.clone(),
                     self.config.agent_command.clone(),
                 );
+                let viewport_w = f32::from(window.viewport_size().width);
+                let drawer_w = self.drawer_w(viewport_w);
                 Some(
                     crate::drawer::drawer(
                         row,
@@ -8128,6 +8180,7 @@ impl RepoHarborApp {
                         &cmds.1,
                         self.services.ai_ready,
                         self.services.github_authed,
+                        drawer_w,
                     )
                     .into_any_element(),
                 )

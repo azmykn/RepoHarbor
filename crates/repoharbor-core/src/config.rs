@@ -265,6 +265,7 @@ impl Default for AppConfig {
             notify_agent_finished: true,
             sidebar_width: crate::model::default_sidebar_width(),
             sidebar_collapsed: false,
+            drawer_width: crate::model::default_drawer_width(),
             layout: crate::model::MissionControlLayout::List,
             workspace_groups: Vec::new(),
             active_workspace_group: None,

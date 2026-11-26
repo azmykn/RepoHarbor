@@ -13,8 +13,8 @@ mod work;
 
 use gpui::{
     App, AppContext, AsyncApp, ClipboardItem, Context, Div, Entity, FontWeight, InteractiveElement,
-    IntoElement, ParentElement, SharedString, StatefulInteractiveElement, Styled, WeakEntity,
-    Window, div, px, rgb, rgba,
+    IntoElement, MouseButton, ParentElement, SharedString, StatefulInteractiveElement, Styled,
+    WeakEntity, Window, div, px, rgb, rgba,
 };
 use gpui_component::menu::{ContextMenuExt as _, PopupMenuItem};
 use repoharbor_core::{cache, git_ops, inbox, launch};
@@ -26,7 +26,9 @@ use crate::theme::Theme;
 use crate::toast::ToastKind;
 
 pub(super) const MONO: &str = "monospace";
-const PANEL_W: f32 = 720.;
+pub const DRAWER_MIN: f32 = 440.;
+pub const DRAWER_MAX: f32 = 960.;
+pub const DRAWER_DEFAULT: f32 = 620.;
 /// Commits drawn on the History tab.
 pub(crate) const HISTORY_LIMIT: usize = 80;
 
@@ -1252,6 +1254,7 @@ pub fn drawer(
     agent_cmd: &str,
     ai_ready: bool,
     github_authed: bool,
+    width: f32,
 ) -> impl IntoElement {
     // Scrim: click anywhere outside the panel to dismiss.
     let backdrop = {
@@ -1269,15 +1272,45 @@ pub fn drawer(
             })
     };
 
+    let resizer = {
+        let app_drag = app.clone();
+        let app_reset = app.clone();
+        div()
+            .id("drawer-resize")
+            .absolute()
+            .top_0()
+            .left(px(-3.))
+            .w(px(7.))
+            .h_full()
+            .cursor(gpui::CursorStyle::ResizeLeftRight)
+            .hover(|s| s.bg(rgb(t.border_accent)))
+            .on_mouse_down(MouseButton::Left, move |_ev, _win, cx| {
+                app_drag.update(cx, |this, cx| {
+                    this.drawer_dragging = true;
+                    cx.notify();
+                });
+            })
+            .on_mouse_down(MouseButton::Right, move |_ev, _win, cx| {
+                app_reset.update(cx, |this, cx| {
+                    this.drawer_width = DRAWER_DEFAULT;
+                    this.drawer_dragging = false;
+                    this.persist_drawer_chrome();
+                    cx.notify();
+                });
+            })
+    };
+
     let mut panel = div()
+        .relative()
         .flex()
         .flex_col()
-        .w(px(PANEL_W))
+        .w(px(width))
         .h_full()
         .bg(rgb(t.page))
         .border_l_1()
         .border_color(rgb(t.border))
-        .child(header(row, t, app, data));
+        .child(resizer)
+        .child(header(row, t, app, data, width));
 
     if data.branch_picker_open {
         panel = panel.child(branch_picker_dropdown(data.repo.clone(), data, t, app));
@@ -1307,6 +1340,7 @@ fn header(
     t: &Theme,
     app: &Entity<RepoHarborApp>,
     data: &DrawerData,
+    width: f32,
 ) -> impl IntoElement {
     let close = {
         let app = app.clone();
@@ -1434,7 +1468,48 @@ fn header(
                 .child(SharedString::from(label)),
         );
     }
-    trailing = trailing.child(close);
+    let toggle_compact = {
+        let app = app.clone();
+        let is_wide = width > 540.;
+        div()
+            .id("drawer-toggle-compact")
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(4.))
+            .px(px(8.))
+            .h(px(30.))
+            .rounded(px(t.r_sm))
+            .bg(rgb(t.button_bg))
+            .border_1()
+            .border_color(rgb(t.border))
+            .cursor_pointer()
+            .hover(move |s| {
+                s.border_color(rgb(t.border_strong))
+                    .bg(rgb(t.surface_hover))
+            })
+            .child(
+                div()
+                    .font_family(MONO)
+                    .text_size(px(t.text_data_sm))
+                    .text_color(rgb(t.fg1))
+                    .child(if is_wide { "Compact" } else { "Expand" }),
+            )
+            .on_click(move |_ev, win, cx| {
+                let vw = f32::from(win.viewport_size().width);
+                app.update(cx, |this, cx| {
+                    if this.drawer_width > 540. {
+                        this.drawer_width = DRAWER_MIN;
+                    } else {
+                        let target = (vw * 0.60).clamp(DRAWER_MIN, DRAWER_MAX);
+                        this.drawer_width = target;
+                    }
+                    this.persist_drawer_chrome();
+                    cx.notify();
+                });
+            })
+    };
+    trailing = trailing.child(toggle_compact).child(close);
 
     div()
         .flex()
@@ -2318,7 +2393,12 @@ pub(super) fn changes_view(
     // single-line subject + an optional multi-line body, joined by a blank
     // line into the commit message.
     if let (Some(input), Some(body_input)) = (&data.commit_input, &data.commit_body_input) {
-        let mut actions = div().flex().flex_row().items_center().gap(px(6.));
+        let mut actions = div()
+            .flex()
+            .flex_row()
+            .flex_wrap()
+            .items_center()
+            .gap(px(6.));
         // External diff tool (meld / configured command).
         {
             let app_d = app.clone();

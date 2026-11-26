@@ -211,6 +211,9 @@ pub struct AppConfig {
     /// Icon-only left rail when true.
     #[serde(default)]
     pub sidebar_collapsed: bool,
+    /// Repo detail drawer width in px when open.
+    #[serde(default = "default_drawer_width")]
+    pub drawer_width: f32,
     /// Mission Control home layout: compact list (default) or card grid.
     /// TREE (parent → submodule) is a sidebar, not this switch.
     #[serde(default)]
@@ -320,6 +323,10 @@ pub fn path_is_attention_muted(path: &str, prefixes: &[String]) -> bool {
 
 pub(crate) fn default_sidebar_width() -> f32 {
     236.0
+}
+
+pub(crate) fn default_drawer_width() -> f32 {
+    620.0
 }
 
 pub(crate) fn default_agent_dispatch_args() -> String {
