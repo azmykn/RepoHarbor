@@ -349,18 +349,24 @@ fn button(
     id: SharedString,
     content: impl IntoElement,
     wide: bool,
+    primary: bool,
+    tooltip: Option<&'static str>,
     t: &Theme,
     on: impl Fn(&mut Window, &mut App) + 'static,
 ) -> impl IntoElement {
-    let (hov_border, hov_fg) = (t.border_strong, t.fg0);
-    let b = div()
+    let (hov_border, hov_bg, hov_fg) = if primary {
+        (t.primary, t.accent_wash, t.primary)
+    } else {
+        (t.border_strong, t.button_bg, t.fg0)
+    };
+    let mut b = div()
         .id(id)
         .flex()
         .flex_row()
         .items_center()
         .justify_center()
         .gap(px(6.))
-        .py(px(8.))
+        .py(px(7.))
         .rounded(px(t.r_sm))
         .bg(rgb(t.button_bg))
         .border_1()
@@ -369,9 +375,18 @@ fn button(
         .text_color(rgb(t.fg1))
         .font_family(MONO)
         .cursor_pointer()
-        .hover(move |s| s.border_color(rgb(hov_border)).text_color(rgb(hov_fg)))
+        .hover(move |s| {
+            s.border_color(rgb(hov_border))
+                .bg(rgb(hov_bg))
+                .text_color(rgb(hov_fg))
+        })
         .on_click(move |_ev, win, cx| on(win, cx))
         .child(content);
+    if let Some(tip) = tooltip {
+        b = b.tooltip(move |window, cx| {
+            gpui_component::tooltip::Tooltip::new(tip).build(window, cx)
+        });
+    }
     if wide {
         b.flex_1().min_w(px(0.))
     } else {
@@ -646,12 +661,14 @@ pub fn card(
     let mut acts = div()
         .flex()
         .flex_row()
-        .gap(px(8.))
-        .mt(px(14.))
+        .gap(px(6.))
+        .mt(px(10.))
         .child(button(
             id_ide,
             SharedString::from("Open in IDE"),
             true,
+            true,
+            Some("Open project in configured IDE"),
             t,
             ide_action,
         ))
@@ -659,6 +676,8 @@ pub fn card(
             id_agent,
             SharedString::from(repoharbor_core::config::agent_launcher_label(agent_cmd)),
             true,
+            false,
+            Some("Open terminal or AI agent session"),
             t,
             agent_action,
         ))
@@ -666,6 +685,8 @@ pub fn card(
             id_folder,
             lucide("folder-open", 15., t.fg1),
             false,
+            false,
+            Some("Open repository directory in file manager"),
             t,
             folder_action,
         ));
@@ -675,6 +696,8 @@ pub fn card(
             id_host,
             lucide("external-link", 15., t.fg1),
             false,
+            false,
+            Some("Open repository on remote host"),
             t,
             move |_win: &mut Window, _cx: &mut App| {
                 let _ = launch::open(&url);
@@ -1037,6 +1060,8 @@ pub(crate) fn list_item(
             SharedString::from(format!("lide-{idx}")),
             lucide("code", 15., t.fg1),
             false,
+            true,
+            Some("Open project in IDE"),
             t,
             ide_action,
         ))
@@ -1044,6 +1069,8 @@ pub(crate) fn list_item(
             SharedString::from(format!("lagent-{idx}")),
             lucide("square-terminal", 15., t.fg1),
             false,
+            false,
+            Some("Open terminal / AI agent"),
             t,
             agent_action,
         ))
@@ -1051,6 +1078,8 @@ pub(crate) fn list_item(
             SharedString::from(format!("lfolder-{idx}")),
             lucide("folder-open", 15., t.fg1),
             false,
+            false,
+            Some("Open repository directory"),
             t,
             folder_action,
         ));
@@ -1060,6 +1089,8 @@ pub(crate) fn list_item(
             SharedString::from(format!("lhost-{idx}")),
             lucide("external-link", 15., t.fg1),
             false,
+            false,
+            Some("Open remote repository on host"),
             t,
             move |_win: &mut Window, _cx: &mut App| {
                 let _ = launch::open(&url);

@@ -929,18 +929,29 @@ fn full_commit_message(subject: &str, body: &str) -> String {
 /// Commit the index as-is with `message`, toast the outcome, then refresh the
 /// file lists + diff. The commit also trips the watcher, refreshing the card.
 fn commit_staged(repo: SharedString, message: String, cx: &mut Context<RepoHarborApp>) {
-    commit_with(repo, message, false, cx);
+    commit_with(repo, message, false, false, cx);
 }
 
 /// Stage any remaining unstaged changes, then commit — Cursor/PyCharm style.
 fn commit_all_changes(repo: SharedString, message: String, cx: &mut Context<RepoHarborApp>) {
-    commit_with(repo, message, true, cx);
+    commit_with(repo, message, true, false, cx);
+}
+
+/// Stage/commit, then immediately push upstream.
+fn commit_and_push(
+    repo: SharedString,
+    message: String,
+    stage_all: bool,
+    cx: &mut Context<RepoHarborApp>,
+) {
+    commit_with(repo, message, stage_all, true, cx);
 }
 
 fn commit_with(
     repo: SharedString,
     message: String,
     stage_all: bool,
+    push_after: bool,
     cx: &mut Context<RepoHarborApp>,
 ) {
     let id = repo.to_string();
@@ -985,6 +996,9 @@ fn commit_with(
                 this.drawer.commit_suggestion = None;
                 // Offer Push even while the grid row's ahead count is stale.
                 this.drawer.committed = true;
+                if push_after {
+                    this.drawer_push(cx);
+                }
             }
             store_changes(this, list, cx);
         });
@@ -1319,7 +1333,17 @@ pub fn drawer(
     let panel = panel
         .child(tab_bar(tab, t, app, data.repo.clone(), github_slug(row)))
         .child(body(row, tab, t, data, app, ai_ready, github_authed))
-        .child(footer(row, t, app, ide_cmd, agent_cmd));
+        .child(footer(
+            row,
+            tab,
+            t,
+            data,
+            app,
+            ide_cmd,
+            agent_cmd,
+            ai_ready,
+            github_authed,
+        ));
 
     div()
         .absolute()
@@ -2373,7 +2397,7 @@ pub(super) fn changes_view(
     t: &Theme,
     app: &Entity<RepoHarborApp>,
     ai_ready: bool,
-    github_authed: bool,
+    _github_authed: bool,
 ) -> impl IntoElement {
     let mut col = div().flex().flex_col().gap(px(12.));
     let has_staged = data
@@ -2385,144 +2409,35 @@ pub(super) fn changes_view(
         .as_ref()
         .is_some_and(|list| list.iter().any(|c| !c.staged));
     let has_changes = has_staged || has_unstaged;
-    // Cursor/PyCharm: when anything is still unstaged, the primary action
-    // stages it then commits ("Commit All"). Pure staged → plain "Commit".
     let commit_all = has_unstaged;
 
-    // Commit composer (the fields exist once the tab has been opened): a
-    // single-line subject + an optional multi-line body, joined by a blank
-    // line into the commit message.
-    if let (Some(input), Some(body_input)) = (&data.commit_input, &data.commit_body_input) {
-        let mut actions = div()
-            .flex()
-            .flex_row()
-            .flex_wrap()
-            .items_center()
-            .gap(px(6.));
-        // External diff tool (meld / configured command).
-        {
-            let app_d = app.clone();
-            let repo_d = row.id.clone();
-            let file = data
-                .change_sel
-                .as_ref()
-                .map(|(p, _)| p.to_string())
-                .unwrap_or_default();
-            actions = actions.child(pr_btn(
-                SharedString::from("ext-diff"),
-                "Open external diff",
-                t,
-                move |_win, cx: &mut gpui::App| {
-                    let file = file.clone();
-                    app_d.update(cx, |this, cx| {
-                        this.open_external_diff(
-                            &repo_d,
-                            if file.is_empty() {
-                                None
-                            } else {
-                                Some(file.as_str())
-                            },
-                            cx,
-                        );
-                    });
-                },
-            ));
-        }
-        // AI: two one-click choices (no modal) — message only, or commit+push.
-        if ai_ready {
-            let app_only = app.clone();
-            actions = actions.child(pr_btn(
-                SharedString::from("gen-only"),
-                "Gen only",
-                t,
-                move |window, cx: &mut gpui::App| {
-                    app_only.update(cx, |this, cx| {
-                        this.run_generate_commit(
-                            crate::views::generate_commit::GenerateCommitChoice::MessageOnly,
-                            vec![this.drawer.repo.to_string()],
-                            true,
-                            window,
-                            cx,
-                        );
-                    });
-                },
-            ));
-            let app_push = app.clone();
-            actions = actions.child(pr_btn(
-                SharedString::from("gen-push"),
-                "Gen & push",
-                t,
-                move |window, cx: &mut gpui::App| {
-                    app_push.update(cx, |this, cx| {
-                        this.run_generate_commit(
-                            crate::views::generate_commit::GenerateCommitChoice::CommitAndPush,
-                            vec![this.drawer.repo.to_string()],
-                            true,
-                            window,
-                            cx,
-                        );
-                    });
-                },
-            ));
-        }
-        if has_changes {
-            let app_fast = app.clone();
-            actions = actions.child(pr_btn(
-                SharedString::from("fast-commit"),
-                "Fast commit",
-                t,
-                move |window, cx: &mut gpui::App| {
-                    app_fast.update(cx, |this, cx| {
-                        this.drawer_fast_commit(window, cx);
-                    });
-                },
-            ));
-        }
-        actions = actions.child(div().flex_1());
-        if has_changes {
-            let repo = row.id.clone();
-            let app2 = app.clone();
-            let input2 = input.clone();
-            let body2 = body_input.clone();
-            let stage_all = commit_all;
-            let label = if commit_all { "Commit All" } else { "Commit" };
-            actions = actions.child(pr_btn(
-                SharedString::from("commit"),
-                label,
-                t,
-                move |_win, cx: &mut gpui::App| {
-                    let repo = repo.clone();
-                    let subject = input2.read(cx).value();
-                    if subject.trim().is_empty() {
-                        return;
-                    }
-                    let msg = full_commit_message(&subject, &body2.read(cx).value());
-                    app2.update(cx, |_this, cx| {
-                        if stage_all {
-                            commit_all_changes(repo, msg, cx);
-                        } else {
-                            commit_staged(repo, msg, cx);
-                        }
-                    });
-                },
-            ));
-        } else {
-            // Working tree clean — say why (once lists have loaded).
-            if data.changes.is_some() {
-                actions = actions.child(
+    // Working tree clean empty state: friendly and clean.
+    if !has_changes && data.changes.as_ref().is_some_and(|list| list.is_empty()) {
+        col = col.child(
+            div()
+                .flex()
+                .flex_col()
+                .items_center()
+                .justify_center()
+                .py(px(36.))
+                .gap(px(10.))
+                .child(lucide("check-circle", 36., t.clean))
+                .child(
                     div()
-                        .font_family(MONO)
-                        .text_size(px(t.text_data_sm))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_size(px(t.text_h3))
+                        .text_color(rgb(t.fg1))
+                        .child(SharedString::from("Working tree clean")),
+                )
+                .child(
+                    div()
+                        .text_size(px(t.text_small))
                         .text_color(rgb(t.fg3))
-                        .child(SharedString::from("Nothing to commit")),
-                );
-            }
-            actions = actions.child(disabled_btn("Commit", t));
-        }
-        col = col
-            .child(gpui_component::input::Input::new(input))
-            .child(gpui_component::input::Input::new(body_input))
-            .child(actions);
+                        .child(SharedString::from(
+                            "No uncommitted changes in this repository.",
+                        )),
+                ),
+        );
     }
 
     // The AI commit-message suggestion (subject + optional body), with a
@@ -2578,104 +2493,32 @@ pub(super) fn changes_view(
         col = col.child(card);
     }
 
-    // Push / Open PR / Reset hard — the last mile after committing. Push shows when there's
-    // something to push (ahead, or a commit made in this drawer session while
-    // the row's ahead count may be stale), including pull-only checkouts that
-    // Needs me already marked "Not pushed".
-    // Open PR shows only when it can work: a GitHub remote, a GitHub token, a
-    // known default branch, and the current branch isn't it — hidden otherwise,
-    // never broken (the aiReady philosophy; only the AI *drafting* inside the
-    // flow is gated on aiReady).
-    let show_push = row.ahead > 0 || data.committed;
-    let show_reset = !row.branch.is_empty();
-    let show_pr = github_authed
-        && github_slug(row).is_some()
-        && data
-            .default_branch
-            .as_ref()
-            .is_some_and(|d| *d != row.branch);
-    if show_push || show_pr || show_reset || data.pr_url.is_some() {
-        let mut sync = div()
-            .flex()
-            .flex_row()
-            .items_center()
-            .gap(px(6.))
-            .flex_wrap();
-        if show_push {
-            if data.push_busy {
-                sync = sync.child(disabled_btn("Pushing…", t));
-            } else {
-                let app6 = app.clone();
-                sync = sync.child(pr_btn(
-                    SharedString::from("push"),
-                    "Push",
-                    t,
-                    move |_win, cx: &mut gpui::App| {
-                        app6.update(cx, |this, cx| this.drawer_push(cx));
-                    },
-                ));
-            }
-        }
-        if show_reset {
-            if data.reset_hard_busy {
-                sync = sync.child(disabled_btn("Resetting…", t));
-            } else {
-                let app_r = app.clone();
-                let label = if data.reset_hard_armed {
-                    format!("Confirm reset --hard origin/{}", row.branch)
-                } else {
-                    format!("Reset hard origin/{}", row.branch)
-                };
-                sync = sync.child(pr_btn(
-                    SharedString::from("reset-hard"),
-                    &label,
-                    t,
-                    move |_win, cx: &mut gpui::App| {
-                        app_r.update(cx, |this, cx| this.drawer_reset_hard(cx));
-                    },
-                ));
-            }
-        }
-        if show_pr {
-            if data.pr_busy {
-                sync = sync.child(disabled_btn("Opening PR…", t));
-            } else {
-                let app7 = app.clone();
-                sync = sync.child(pr_btn(
-                    SharedString::from("open-pr"),
-                    "Open PR",
-                    t,
-                    move |_win, cx: &mut gpui::App| {
-                        app7.update(cx, |this, cx| this.drawer_open_pr(cx));
-                    },
-                ));
-            }
-        }
-        if let Some(url) = &data.pr_url {
-            let url = url.clone();
-            sync = sync.child(
-                div()
-                    .id("view-pr")
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap(px(4.))
-                    .px(px(8.))
-                    .py(px(5.))
-                    .rounded(px(t.r_sm))
-                    .font_family(MONO)
-                    .text_size(px(t.text_data_sm))
-                    .text_color(rgb(t.fg1))
-                    .cursor_pointer()
-                    .hover(|s| s.bg(rgb(t.surface_hover)))
-                    .child(lucide("external-link", 12., t.fg2))
-                    .child(SharedString::from("View PR"))
-                    .on_click(move |_ev, _win, _cx| {
-                        let _ = launch::open(&url);
-                    }),
-            );
-        }
-        col = col.child(sync);
+    if let Some(url) = &data.pr_url {
+        let url = url.clone();
+        col = col.child(
+            div()
+                .id("view-pr")
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(4.))
+                .px(px(8.))
+                .py(px(5.))
+                .rounded(px(t.r_sm))
+                .bg(rgb(t.surface))
+                .border_1()
+                .border_color(rgb(t.border))
+                .font_family(MONO)
+                .text_size(px(t.text_data_sm))
+                .text_color(rgb(t.fg1))
+                .cursor_pointer()
+                .hover(|s| s.bg(rgb(t.surface_hover)))
+                .child(lucide("external-link", 12., t.fg2))
+                .child(SharedString::from("View PR"))
+                .on_click(move |_ev, _win, _cx| {
+                    let _ = launch::open(&url);
+                }),
+        );
     }
 
     // Unstaged / Staged file lists, then the selected file's diff.
@@ -3629,6 +3472,95 @@ fn pr_card(
     card.child(actions)
 }
 
+/// A prominent primary action button (accent background, high contrast, optional shortcut badge).
+pub(super) fn primary_action_btn(
+    id: SharedString,
+    label: &str,
+    badge: Option<&str>,
+    t: &Theme,
+    on: impl Fn(&mut Window, &mut gpui::App) + 'static,
+) -> impl IntoElement {
+    let mut b = div()
+        .id(id)
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(6.))
+        .px(px(12.))
+        .py(px(5.))
+        .rounded(px(t.r_sm))
+        .bg(rgb(t.primary))
+        .border_1()
+        .border_color(rgb(t.primary))
+        .font_family(MONO)
+        .text_size(px(t.text_data_sm))
+        .font_weight(FontWeight::SEMIBOLD)
+        .text_color(rgb(t.page))
+        .cursor_pointer()
+        .hover(|s| s.opacity(0.9))
+        .child(SharedString::from(label.to_string()));
+    if let Some(badge) = badge {
+        b = b.child(
+            div()
+                .px(px(4.))
+                .py(px(1.))
+                .rounded(px(t.r_xs))
+                .bg(rgb(t.accent_wash))
+                .text_size(px(t.text_small))
+                .text_color(rgb(t.primary))
+                .font_weight(FontWeight::NORMAL)
+                .child(SharedString::from(badge.to_string())),
+        );
+    }
+    b.on_click(move |_ev, win, cx| on(win, cx))
+}
+
+/// A dangerous/destructive action button (red border/badge, warning icon, confirmed state).
+pub(super) fn danger_btn(
+    id: SharedString,
+    label: &str,
+    armed: bool,
+    t: &Theme,
+    on: impl Fn(&mut Window, &mut gpui::App) + 'static,
+) -> impl IntoElement {
+    let (bg, border, fg) = if armed {
+        (t.behind, t.behind, t.page)
+    } else {
+        (t.danger_badge, t.behind, t.behind)
+    };
+    div()
+        .id(id)
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(5.))
+        .px(px(10.))
+        .py(px(5.))
+        .rounded(px(t.r_sm))
+        .bg(rgb(bg))
+        .border_1()
+        .border_color(rgb(border))
+        .font_family(MONO)
+        .text_size(px(t.text_data_sm))
+        .font_weight(if armed {
+            FontWeight::SEMIBOLD
+        } else {
+            FontWeight::NORMAL
+        })
+        .text_color(rgb(fg))
+        .cursor_pointer()
+        .hover(move |s| {
+            if armed {
+                s.opacity(0.9)
+            } else {
+                s.bg(rgb(t.behind)).text_color(rgb(t.page))
+            }
+        })
+        .child(lucide("alert-triangle", 12., fg))
+        .child(SharedString::from(label.to_string()))
+        .on_click(move |_ev, win, cx| on(win, cx))
+}
+
 /// A small PR action button. Passes `Window` so callers that need InputState
 /// (e.g. Gen only → drawer_generate_commit) can use it.
 pub(super) fn pr_btn(
@@ -3952,13 +3884,486 @@ pub(super) fn notes_view(
     col.child(note)
 }
 
-fn footer(
+#[allow(clippy::too_many_arguments)]
+fn work_footer(
     row: &Row,
     t: &Theme,
+    data: &DrawerData,
     app: &Entity<RepoHarborApp>,
     ide_cmd: &str,
     agent_cmd: &str,
+    ai_ready: bool,
+    github_authed: bool,
 ) -> impl IntoElement {
+    let has_staged = data
+        .changes
+        .as_ref()
+        .is_some_and(|list| list.iter().any(|c| c.staged));
+    let has_unstaged = data
+        .changes
+        .as_ref()
+        .is_some_and(|list| list.iter().any(|c| !c.staged));
+    let has_changes = has_staged || has_unstaged;
+    let commit_all = has_unstaged;
+
+    let show_push = row.ahead > 0 || data.committed;
+    let show_reset = !row.branch.is_empty();
+    let show_pr = github_authed
+        && github_slug(row).is_some()
+        && data
+            .default_branch
+            .as_ref()
+            .is_some_and(|d| *d != row.branch);
+
+    // Common launcher actions:
+    let ide_action = {
+        let (path, cmd, app) = (row.id.clone(), ide_cmd.to_string(), app.clone());
+        move |_win: &mut Window, cx: &mut App| {
+            if let Err(e) = launch::launch(&cmd, &path) {
+                app.update(cx, |this, cx| {
+                    this.push_toast(ToastKind::Error, "Couldn't open IDE", Some(e.into()), cx);
+                });
+            }
+        }
+    };
+    let agent_action = {
+        let (path, name, cmd, app) = (
+            row.id.clone(),
+            row.name.clone(),
+            agent_cmd.to_string(),
+            app.clone(),
+        );
+        move |win: &mut Window, cx: &mut App| {
+            app.update(cx, |this, cx| {
+                if this.config.terminal_embedded_default {
+                    this.open_terminal_in(&path, &name, None, false, Some(win), cx);
+                } else if let Err(e) = launch::spawn(&cmd, &path) {
+                    this.push_toast(
+                        ToastKind::Error,
+                        "Couldn't open terminal",
+                        Some(e.into()),
+                        cx,
+                    );
+                }
+            });
+        }
+    };
+    let folder_action = {
+        let (path, app) = (row.id.clone(), app.clone());
+        move |_win: &mut Window, cx: &mut App| {
+            if let Err(e) = launch::open(&path) {
+                app.update(cx, |this, cx| {
+                    this.push_toast(ToastKind::Error, "Couldn't open folder", Some(e.into()), cx);
+                });
+            }
+        }
+    };
+
+    if has_changes {
+        let mut footer_box = div()
+            .flex()
+            .flex_col()
+            .gap(px(8.))
+            .px(px(16.))
+            .py(px(10.))
+            .bg(rgb(t.surface))
+            .border_t_1()
+            .border_color(rgb(t.border));
+
+        // Commit input composer
+        if let (Some(input), Some(body_input)) = (&data.commit_input, &data.commit_body_input) {
+            footer_box = footer_box.child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(5.))
+                    .child(gpui_component::input::Input::new(input).cleanable(true))
+                    .child(gpui_component::input::Input::new(body_input).cleanable(true)),
+            );
+
+            // Primary actions row
+            let mut actions = div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(6.))
+                .flex_wrap();
+
+            // Commit & Push (Primary 1)
+            let repo = row.id.clone();
+            let app_cp = app.clone();
+            let input_cp = input.clone();
+            let body_cp = body_input.clone();
+            let stage_all = commit_all;
+            let cp_label = if commit_all {
+                "Commit All & Push"
+            } else {
+                "Commit & Push"
+            };
+            actions = actions.child(primary_action_btn(
+                SharedString::from("footer-commit-push"),
+                cp_label,
+                Some("⌘↵"),
+                t,
+                move |_win, cx: &mut gpui::App| {
+                    let repo = repo.clone();
+                    let subject = input_cp.read(cx).value();
+                    if subject.trim().is_empty() {
+                        return;
+                    }
+                    let msg = full_commit_message(&subject, &body_cp.read(cx).value());
+                    app_cp.update(cx, |_this, cx| {
+                        commit_and_push(repo, msg, stage_all, cx);
+                    });
+                },
+            ));
+
+            // Commit only (Secondary)
+            let repo_c = row.id.clone();
+            let app_c = app.clone();
+            let input_c = input.clone();
+            let body_c = body_input.clone();
+            let c_label = if commit_all { "Commit All" } else { "Commit" };
+            actions = actions.child(pr_btn(
+                SharedString::from("footer-commit"),
+                c_label,
+                t,
+                move |_win, cx: &mut gpui::App| {
+                    let repo = repo_c.clone();
+                    let subject = input_c.read(cx).value();
+                    if subject.trim().is_empty() {
+                        return;
+                    }
+                    let msg = full_commit_message(&subject, &body_c.read(cx).value());
+                    app_c.update(cx, |_this, cx| {
+                        if stage_all {
+                            commit_all_changes(repo, msg, cx);
+                        } else {
+                            commit_staged(repo, msg, cx);
+                        }
+                    });
+                },
+            ));
+
+            // AI Generate Msg
+            if ai_ready {
+                let app_only = app.clone();
+                actions = actions.child(pr_btn(
+                    SharedString::from("footer-gen-only"),
+                    "✨ Gen Msg",
+                    t,
+                    move |window, cx: &mut gpui::App| {
+                        app_only.update(cx, |this, cx| {
+                            this.run_generate_commit(
+                                crate::views::generate_commit::GenerateCommitChoice::MessageOnly,
+                                vec![this.drawer.repo.to_string()],
+                                true,
+                                window,
+                                cx,
+                            );
+                        });
+                    },
+                ));
+            }
+
+            // Fast commit
+            let app_fast = app.clone();
+            actions = actions.child(pr_btn(
+                SharedString::from("footer-fast-commit"),
+                "Fast commit",
+                t,
+                move |window, cx: &mut gpui::App| {
+                    app_fast.update(cx, |this, cx| {
+                        this.drawer_fast_commit(window, cx);
+                    });
+                },
+            ));
+
+            // Ext diff
+            let app_d = app.clone();
+            let repo_d = row.id.clone();
+            let file = data
+                .change_sel
+                .as_ref()
+                .map(|(p, _)| p.to_string())
+                .unwrap_or_default();
+            actions = actions.child(pr_btn(
+                SharedString::from("footer-ext-diff"),
+                "Ext diff",
+                t,
+                move |_win, cx: &mut gpui::App| {
+                    let file = file.clone();
+                    app_d.update(cx, |this, cx| {
+                        this.open_external_diff(
+                            &repo_d,
+                            if file.is_empty() {
+                                None
+                            } else {
+                                Some(file.as_str())
+                            },
+                            cx,
+                        );
+                    });
+                },
+            ));
+
+            // Spacer
+            actions = actions.child(div().flex_1());
+
+            // Push (if ahead or committed)
+            if show_push {
+                if data.push_busy {
+                    actions = actions.child(disabled_btn("Pushing…", t));
+                } else {
+                    let app_p = app.clone();
+                    actions = actions.child(pr_btn(
+                        SharedString::from("footer-push"),
+                        "Push",
+                        t,
+                        move |_win, cx: &mut gpui::App| {
+                            app_p.update(cx, |this, cx| this.drawer_push(cx));
+                        },
+                    ));
+                }
+            }
+
+            // Reset hard (Tier 4: Danger)
+            if show_reset {
+                if data.reset_hard_busy {
+                    actions = actions.child(disabled_btn("Resetting…", t));
+                } else {
+                    let app_r = app.clone();
+                    let label = if data.reset_hard_armed {
+                        format!("Confirm reset --hard origin/{}", row.branch)
+                    } else {
+                        format!("Reset hard origin/{}", row.branch)
+                    };
+                    actions = actions.child(danger_btn(
+                        SharedString::from("footer-reset-hard"),
+                        &label,
+                        data.reset_hard_armed,
+                        t,
+                        move |_win, cx: &mut gpui::App| {
+                            app_r.update(cx, |this, cx| this.drawer_reset_hard(cx));
+                        },
+                    ));
+                }
+            }
+
+            // Compact launchers
+            actions = actions
+                .child(div().w(px(1.)).h(px(18.)).mx(px(2.)).bg(rgb(t.border)))
+                .child(launch_btn(
+                    "footer-ide",
+                    lucide("code", 14., t.fg1),
+                    false,
+                    t,
+                    ide_action,
+                ))
+                .child(launch_btn(
+                    "footer-agent",
+                    lucide("terminal", 14., t.fg1),
+                    false,
+                    t,
+                    agent_action,
+                ))
+                .child(launch_btn(
+                    "footer-folder",
+                    lucide("folder-open", 14., t.fg1),
+                    false,
+                    t,
+                    folder_action,
+                ));
+            if !row.url.is_empty() {
+                let url = row.url.clone();
+                let app_url = app.clone();
+                actions = actions.child(launch_btn(
+                    "footer-host",
+                    lucide("external-link", 14., t.fg1),
+                    false,
+                    t,
+                    move |_win: &mut Window, cx: &mut App| {
+                        if let Err(e) = launch::open(&url) {
+                            app_url.update(cx, |this, cx| {
+                                this.push_toast(
+                                    ToastKind::Error,
+                                    "Couldn't open remote",
+                                    Some(e.into()),
+                                    cx,
+                                );
+                            });
+                        }
+                    },
+                ));
+            }
+
+            footer_box = footer_box.child(actions);
+        }
+
+        footer_box
+    } else {
+        // Working tree clean state:
+        let mut bar = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(8.))
+            .px(px(18.))
+            .py(px(12.))
+            .border_t_1()
+            .border_color(rgb(t.border));
+
+        if show_push {
+            if data.push_busy {
+                bar = bar.child(disabled_btn("Pushing…", t));
+            } else {
+                let app_p = app.clone();
+                let push_label = if row.ahead > 0 {
+                    format!("Push ({})", row.ahead)
+                } else {
+                    "Push".to_string()
+                };
+                bar = bar.child(primary_action_btn(
+                    SharedString::from("footer-push-ahead"),
+                    &push_label,
+                    None,
+                    t,
+                    move |_win, cx: &mut gpui::App| {
+                        app_p.update(cx, |this, cx| this.drawer_push(cx));
+                    },
+                ));
+            }
+        }
+
+        if show_reset {
+            if data.reset_hard_busy {
+                bar = bar.child(disabled_btn("Resetting…", t));
+            } else {
+                let app_r = app.clone();
+                let label = if data.reset_hard_armed {
+                    format!("Confirm reset --hard origin/{}", row.branch)
+                } else {
+                    format!("Reset hard origin/{}", row.branch)
+                };
+                bar = bar.child(danger_btn(
+                    SharedString::from("footer-reset-hard"),
+                    &label,
+                    data.reset_hard_armed,
+                    t,
+                    move |_win, cx: &mut gpui::App| {
+                        app_r.update(cx, |this, cx| this.drawer_reset_hard(cx));
+                    },
+                ));
+            }
+        }
+
+        if show_pr {
+            if data.pr_busy {
+                bar = bar.child(disabled_btn("Opening PR…", t));
+            } else {
+                let app_pr = app.clone();
+                bar = bar.child(pr_btn(
+                    SharedString::from("footer-open-pr"),
+                    "Open PR",
+                    t,
+                    move |_win, cx: &mut gpui::App| {
+                        app_pr.update(cx, |this, cx| this.drawer_open_pr(cx));
+                    },
+                ));
+            }
+        }
+
+        if !show_push && !show_reset {
+            bar = bar.child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(6.))
+                    .text_size(px(t.text_small))
+                    .text_color(rgb(t.clean))
+                    .child(lucide("check-circle", 14., t.clean))
+                    .child(SharedString::from("Working tree clean")),
+            );
+        }
+
+        bar = bar
+            .child(div().flex_1())
+            .child(launch_btn(
+                "drawer-ide",
+                SharedString::from("Open in IDE"),
+                true,
+                t,
+                ide_action,
+            ))
+            .child(launch_btn(
+                "drawer-agent",
+                SharedString::from(repoharbor_core::config::agent_launcher_label(agent_cmd)),
+                true,
+                t,
+                agent_action,
+            ))
+            .child(launch_btn(
+                "drawer-folder",
+                lucide("folder-open", 15., t.fg1),
+                false,
+                t,
+                folder_action,
+            ));
+
+        if !row.url.is_empty() {
+            let url = row.url.clone();
+            let app_url = app.clone();
+            bar = bar.child(launch_btn(
+                "drawer-host",
+                lucide("external-link", 15., t.fg1),
+                false,
+                t,
+                move |_win: &mut Window, cx: &mut App| {
+                    if let Err(e) = launch::open(&url) {
+                        app_url.update(cx, |this, cx| {
+                            this.push_toast(
+                                ToastKind::Error,
+                                "Couldn't open remote",
+                                Some(e.into()),
+                                cx,
+                            );
+                        });
+                    }
+                },
+            ));
+        }
+
+        bar
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn footer(
+    row: &Row,
+    tab: DrawerTab,
+    t: &Theme,
+    data: &DrawerData,
+    app: &Entity<RepoHarborApp>,
+    ide_cmd: &str,
+    agent_cmd: &str,
+    ai_ready: bool,
+    github_authed: bool,
+) -> impl IntoElement {
+    if tab == DrawerTab::Work {
+        return work_footer(
+            row,
+            t,
+            data,
+            app,
+            ide_cmd,
+            agent_cmd,
+            ai_ready,
+            github_authed,
+        )
+        .into_any_element();
+    }
+
     let mut bar = div()
         .flex()
         .flex_row()
@@ -4059,7 +4464,7 @@ fn footer(
             },
         ));
     }
-    bar
+    bar.into_any_element()
 }
 
 /// A drawer launcher button. `on` receives `&mut Window` and `&mut App`.

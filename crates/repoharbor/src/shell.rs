@@ -7790,36 +7790,6 @@ fn tool_btn(
     b
 }
 
-/// Always-on primary toolbar control (icon + label, accent wash, `fg0` text).
-fn tool_btn_primary(
-    id: &'static str,
-    icon: &'static str,
-    label: &'static str,
-    t: &Theme,
-    on: impl Fn(&gpui::ClickEvent, &mut Window, &mut gpui::App) + 'static,
-) -> impl IntoElement {
-    let hov = t.border_strong;
-    div()
-        .id(id)
-        .flex()
-        .flex_row()
-        .items_center()
-        .gap(px(6.))
-        .px(px(12.))
-        .py(px(6.))
-        .rounded(px(t.r_sm))
-        .bg(rgb(t.accent_wash))
-        .border_1()
-        .border_color(rgb(t.border_accent))
-        .text_size(px(t.text_small))
-        .text_color(rgb(t.fg0))
-        .cursor_pointer()
-        .hover(move |s| s.border_color(rgb(hov)))
-        .on_click(on)
-        .child(lucide(icon, 15., t.accent_bright))
-        .child(SharedString::from(label))
-}
-
 /// Responsive column count from the window width: aim for ~340px-wide cards
 /// (after the sidebar), clamped to a sensible range.
 fn columns(viewport_width: f32, sidebar_w: f32) -> usize {
