@@ -256,8 +256,9 @@ impl TerminalSession {
     /// Scroll backward (`delta > 0`) or forward (`delta < 0`) in scrollback history.
     pub fn scroll_by(&self, delta: isize) {
         if let Ok(mut p) = self.parser.lock() {
+            let max_offset = p.screen().size().0 as usize;
             let current = p.screen().scrollback() as isize;
-            let next = (current + delta).max(0) as usize;
+            let next = (current + delta).clamp(0, max_offset as isize) as usize;
             p.set_scrollback(next);
         }
     }
@@ -265,7 +266,8 @@ impl TerminalSession {
     /// Pin scrollback to `offset` lines above the live prompt (`0` = bottom).
     pub fn set_scrollback(&self, offset: usize) {
         if let Ok(mut p) = self.parser.lock() {
-            p.set_scrollback(offset);
+            let max_offset = p.screen().size().0 as usize;
+            p.set_scrollback(offset.min(max_offset));
         }
     }
 
@@ -279,6 +281,10 @@ impl TerminalSession {
                 return;
             }
             p.set_size(rows, cols);
+            let current = p.screen().scrollback();
+            if current > rows as usize {
+                p.set_scrollback(rows as usize);
+            }
         }
         if let Ok(m) = self.master.lock() {
             let _ = m.resize(PtySize {
@@ -297,7 +303,12 @@ impl TerminalSession {
 
     /// Build a compact, styled-span snapshot of the current viewport.
     pub fn snapshot(&self) -> TerminalSnapshot {
-        let guard = self.parser.lock().unwrap_or_else(|p| p.into_inner());
+        let mut guard = self.parser.lock().unwrap_or_else(|p| p.into_inner());
+        let (rows, _) = guard.screen().size();
+        let cur = guard.screen().scrollback();
+        if cur > rows as usize {
+            guard.set_scrollback(rows as usize);
+        }
         let exited = *self.exit_code.lock().unwrap_or_else(|p| p.into_inner());
         snapshot_screen(guard.screen(), exited)
     }
@@ -378,8 +389,9 @@ impl TerminalLogStream {
     /// Scroll backward (`delta > 0`) or forward (`delta < 0`) in log scrollback.
     pub fn scroll_by(&self, delta: isize) {
         if let Ok(mut p) = self.parser.lock() {
+            let max_offset = p.screen().size().0 as usize;
             let current = p.screen().scrollback() as isize;
-            let next = (current + delta).max(0) as usize;
+            let next = (current + delta).clamp(0, max_offset as isize) as usize;
             p.set_scrollback(next);
         }
     }
@@ -387,7 +399,8 @@ impl TerminalLogStream {
     /// Pin scrollback to `offset` lines (`0` = live bottom).
     pub fn set_scrollback(&self, offset: usize) {
         if let Ok(mut p) = self.parser.lock() {
-            p.set_scrollback(offset);
+            let max_offset = p.screen().size().0 as usize;
+            p.set_scrollback(offset.min(max_offset));
         }
     }
 
@@ -399,13 +412,22 @@ impl TerminalLogStream {
             let (cur_r, cur_c) = p.screen().size();
             if cur_r != rows || cur_c != cols {
                 p.set_size(rows, cols);
+                let current = p.screen().scrollback();
+                if current > rows as usize {
+                    p.set_scrollback(rows as usize);
+                }
             }
         }
     }
 
     /// Snapshot the current log screen for GPUI rendering.
     pub fn snapshot(&self) -> TerminalSnapshot {
-        let guard = self.parser.lock().unwrap_or_else(|p| p.into_inner());
+        let mut guard = self.parser.lock().unwrap_or_else(|p| p.into_inner());
+        let (rows, _) = guard.screen().size();
+        let cur = guard.screen().scrollback();
+        if cur > rows as usize {
+            guard.set_scrollback(rows as usize);
+        }
         snapshot_screen(guard.screen(), None)
     }
 
@@ -953,5 +975,21 @@ Not a command line here
             .expect("isolated cursor span at col 4");
         assert_eq!(cursor_span.cols, 1);
         assert_eq!(cursor_span.text, "s");
+    }
+
+    #[test]
+    fn scrollback_clamping_prevents_vt100_underflow_panic() {
+        let (tx, _rx) = event_channel();
+        let log = TerminalLogStream::new("test-scroll-clamp", 10, 60, tx);
+        for i in 0..50 {
+            log.append_ansi(&format!("Line {i}\n"));
+        }
+        log.scroll_by(100);
+        let snap = log.snapshot();
+        assert!(snap.scrollback_offset <= 10);
+
+        log.resize(5, 40);
+        let snap2 = log.snapshot();
+        assert!(snap2.scrollback_offset <= 5);
     }
 }
