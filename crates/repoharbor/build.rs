@@ -3,14 +3,24 @@
 //! but the `.so` dev symlink only comes with `libxkbcommon-x11-devel`. Rather
 //! than require that package, synthesize the dev symlink in OUT_DIR and point
 //! the linker at it. No root needed; the SONAME satisfies the runtime loader too.
-use std::path::Path;
 
 fn main() {
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("linux") {
         return;
     }
 
-    let out_dir = std::env::var("OUT_DIR").expect("OUT_DIR");
+    #[cfg(unix)]
+    link_xkbcommon();
+}
+
+#[cfg(unix)]
+fn link_xkbcommon() {
+    use std::path::Path;
+
+    let out_dir = match std::env::var("OUT_DIR") {
+        Ok(dir) => dir,
+        Err(_) => return,
+    };
     let link_name = Path::new(&out_dir).join("libxkbcommon-x11.so");
 
     // If the system already provides the dev symlink, do nothing extra.
