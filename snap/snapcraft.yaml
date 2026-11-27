@@ -1,12 +1,28 @@
 name: repoharbor
+title: RepoHarbor
 base: core24
 version: '2026.11.3'
-summary: Native GPU git repository manager and developer dashboard
+summary: Native GPU git repository manager and developer fleet dashboard
 description: |
-  RepoHarbor is a native GPU-accelerated desktop application for Linux built on GPUI.
-  It helps you manage, inspect, search, and run git operations across all your local repositories.
+  **RepoHarbor** is a native GPU-accelerated desktop application for Linux built on GPUI.
+  A high-performance command center for your entire local Git fleet.
+
+  ### Key Features:
+  - ⚡ **Instant Fleet Status:** libgit2 native scanning for hundreds of repos in milliseconds.
+  - 🎨 **Flat Modern GPUI:** 60/120fps hardware-accelerated interface without Electron/Webview overhead.
+  - 📝 **Interactive Commit Composer:** Stage hunks, write commits, and push with one click.
+  - 🚀 **Universal Launchers:** Launch your preferred IDEs (VS Code, Cursor, Zed) and terminal emulators.
+  - 🔍 **Submodule & Worktree Inspection:** Deep dive into branches, stashes, and remote tracking.
+  - 💾 **Local SQLite Cache:** Instant startup, zero latency, completely offline-capable.
+
+  Designed and maintained by Digital Integrated Transformation Solutions (DigitsCode).
 grade: stable
 confinement: classic
+license: MIT
+website: https://azmykn.github.io/RepoHarbor/
+contact: info@digitscode.com
+issues: https://github.com/azmykn/RepoHarbor/issues
+source-code: https://github.com/azmykn/RepoHarbor
 
 apps:
   repoharbor:
