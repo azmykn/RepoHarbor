@@ -791,6 +791,38 @@ impl RepoHarborApp {
         // Keep the HashSet honest with the badge (selected ∩ visible) so a
         // leftover off-filter id can't make Actions (N) disagree with checks.
         self.prune_selection_to_visible();
+        // Muted repositories are completely frozen from all fleet operations!
+        let before_count = repos.len();
+        repos.retain(|path| !self.is_repo_muted(path));
+        let muted_count = before_count - repos.len();
+        if muted_count > 0 {
+            if repos.is_empty() {
+                self.push_toast(
+                    ToastKind::Info,
+                    "Repositories muted",
+                    Some(
+                        format!(
+                            "Skipped {muted_count} muted repository(ies) — muted repos are frozen from all fleet operations."
+                        )
+                        .into(),
+                    ),
+                    cx,
+                );
+                return;
+            } else {
+                self.push_toast(
+                    ToastKind::Info,
+                    "Skipping muted repos",
+                    Some(
+                        format!(
+                            "Skipped {muted_count} muted repository(ies) (frozen from fleet operations)."
+                        )
+                        .into(),
+                    ),
+                    cx,
+                );
+            }
+        }
         // Empty commit, Push, and Gen & push stay off vendor / pull-only trees.
         // Mixed selections drop those paths with an Info toast; all-pull-only → Error.
         if matches!(

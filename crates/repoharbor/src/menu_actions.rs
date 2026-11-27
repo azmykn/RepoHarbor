@@ -25,16 +25,29 @@ pub(crate) struct FleetMenuCaps {
     /// these paths.
     pub has_pushable_path: bool,
     pub has_submodules: bool,
-    /// At least one target is not yet on `mute_attention_prefixes`.
+    /// At least one target is not yet muted.
     pub has_unmuted: bool,
+    /// At least one target is muted.
+    pub has_muted: bool,
+    /// At least one target is not hidden.
+    pub has_unhidden: bool,
+    /// At least one target is hidden.
+    pub has_hidden: bool,
 }
 
 /// Compute menu enablement from the live grid rows for `targets`.
 pub(crate) fn fleet_menu_caps(app: &RepoHarborApp, targets: &[String]) -> FleetMenuCaps {
     let mut caps = FleetMenuCaps::default();
     for id in targets {
-        if !app.is_attention_muted(id) {
+        if !app.is_repo_muted(id) {
             caps.has_unmuted = true;
+        } else {
+            caps.has_muted = true;
+        }
+        if !app.is_repo_hidden(id) {
+            caps.has_unhidden = true;
+        } else {
+            caps.has_hidden = true;
         }
         let Some(row) = app.rows.iter().find(|r| r.id.as_ref() == id.as_str()) else {
             continue;
@@ -349,22 +362,57 @@ pub(crate) fn fill_fleet_actions_menu(
     );
     m = m.separator();
 
-    // ── Attention mute ─────────────────────────────────────────────────────
-    let mute_on = on && opts.caps.has_unmuted;
-    let (a, r) = (app.clone(), repos.clone());
-    m = m.item(
-        PopupMenuItem::new(if opts.caps.has_unmuted {
-            "Mute attention"
-        } else {
-            "Mute attention (already muted)"
-        })
-        .disabled(!mute_on)
-        .on_click(move |_, _, cx| {
-            a.update(cx, |this, cx| {
-                this.mute_attention_for_repos(&r, cx);
-            });
-        }),
-    );
+    // ── Mute / Unmute ──────────────────────────────────────────────────────
+    if opts.caps.has_unmuted {
+        let (a, r) = (app.clone(), repos.clone());
+        m = m.item(
+            PopupMenuItem::new("Mute repo (freeze ops)")
+                .disabled(!on)
+                .on_click(move |_, _, cx| {
+                    a.update(cx, |this, cx| {
+                        this.mute_attention_for_repos(&r, cx);
+                    });
+                }),
+        );
+    }
+    if opts.caps.has_muted {
+        let (a, r) = (app.clone(), repos.clone());
+        m = m.item(
+            PopupMenuItem::new("Unmute repo")
+                .disabled(!on)
+                .on_click(move |_, _, cx| {
+                    a.update(cx, |this, cx| {
+                        this.unmute_attention_for_repos(&r, cx);
+                    });
+                }),
+        );
+    }
+
+    // ── Hide / Unhide ──────────────────────────────────────────────────────
+    if opts.caps.has_unhidden {
+        let (a, r) = (app.clone(), repos.clone());
+        m = m.item(
+            PopupMenuItem::new("Hide repo")
+                .disabled(!on)
+                .on_click(move |_, _, cx| {
+                    a.update(cx, |this, cx| {
+                        this.hide_repos(&r, cx);
+                    });
+                }),
+        );
+    }
+    if opts.caps.has_hidden {
+        let (a, r) = (app.clone(), repos.clone());
+        m = m.item(
+            PopupMenuItem::new("Unhide repo")
+                .disabled(!on)
+                .on_click(move |_, _, cx| {
+                    a.update(cx, |this, cx| {
+                        this.unhide_repos(&r, cx);
+                    });
+                }),
+        );
+    }
     m = m.separator();
 
     // ── Launch / selection ─────────────────────────────────────────────────

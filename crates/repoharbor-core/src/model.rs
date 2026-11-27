@@ -239,6 +239,9 @@ pub struct AppConfig {
     /// Does not edit files inside the repo — mute is local to RepoHarbor.
     #[serde(default)]
     pub mute_attention_prefixes: Vec<String>,
+    /// Repositories hidden by user request so they don't appear in default fleet views.
+    #[serde(default)]
+    pub hidden_repos: Vec<String>,
     /// External diff/merge tool for the Changes drawer. `{path}` = repo dir;
     /// `{file}` = selected relative path when available. Empty → detect `meld`
     /// / `code` / `xdg-open`.

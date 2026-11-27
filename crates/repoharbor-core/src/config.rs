@@ -272,6 +272,7 @@ impl Default for AppConfig {
             pull_only_prefixes: Vec::new(),
             pull_only_opt_out: Vec::new(),
             mute_attention_prefixes: Vec::new(),
+            hidden_repos: Vec::new(),
             diff_command: crate::model::default_diff_command(),
             terminal_embedded_default: true,
             terminal_confirm_destructive: true,

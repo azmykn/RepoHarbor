@@ -1314,6 +1314,8 @@ pub fn drawer(
             })
     };
 
+    let is_muted = app.read(cx).is_repo_muted(&row.id);
+    let is_hidden = app.read(cx).is_repo_hidden(&row.id);
     let mut panel = div()
         .relative()
         .flex()
@@ -1324,7 +1326,7 @@ pub fn drawer(
         .border_l_1()
         .border_color(rgb(t.border))
         .child(resizer)
-        .child(header(row, t, app, data, width));
+        .child(header(row, t, app, data, width, is_muted, is_hidden));
 
     if data.branch_picker_open {
         panel = panel.child(branch_picker_dropdown(data.repo.clone(), data, t, app));
@@ -1339,6 +1341,8 @@ pub fn drawer(
             ide_cmd,
             agent_cmd,
             github_authed,
+            is_muted,
+            is_hidden,
         ))
         .child(tab_bar(tab, t, app, data.repo.clone(), github_slug(row)))
         .child(body(row, tab, t, data, app, ai_ready, github_authed));
@@ -1363,6 +1367,8 @@ fn header(
     app: &Entity<RepoHarborApp>,
     data: &DrawerData,
     width: f32,
+    is_muted: bool,
+    is_hidden: bool,
 ) -> impl IntoElement {
     let close = {
         let app = app.clone();
@@ -1394,6 +1400,36 @@ fn header(
         .font_weight(FontWeight::SEMIBOLD)
         .text_color(rgb(t.fg0))
         .child(div().min_w(px(0.)).truncate().child(row.name.clone()));
+    if is_muted {
+        title = title.child(
+            div()
+                .px(px(6.))
+                .py(px(1.5))
+                .rounded(px(t.r_sm))
+                .bg(rgb(t.warn_wash))
+                .border_1()
+                .border_color(rgb(t.warn))
+                .text_size(px(t.text_caption))
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(rgb(t.warn))
+                .child("Muted"),
+        );
+    }
+    if is_hidden {
+        title = title.child(
+            div()
+                .px(px(6.))
+                .py(px(1.5))
+                .rounded(px(t.r_sm))
+                .bg(rgb(t.surface))
+                .border_1()
+                .border_color(rgb(t.border))
+                .text_size(px(t.text_caption))
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(rgb(t.fg2))
+                .child("Hidden"),
+        );
+    }
     if !row.host.is_empty() {
         title = title.child(brand(&row.host, 15., t.fg2));
     }
@@ -4054,6 +4090,8 @@ fn action_bar(
     ide_cmd: &str,
     agent_cmd: &str,
     github_authed: bool,
+    is_muted: bool,
+    is_hidden: bool,
 ) -> impl IntoElement {
     let ide_action = {
         let (path, cmd, app) = (row.id.clone(), ide_cmd.to_string(), app.clone());

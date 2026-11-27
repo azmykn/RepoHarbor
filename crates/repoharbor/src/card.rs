@@ -100,6 +100,10 @@ pub struct CardState {
     pub reason_subtitle: Option<SharedString>,
     /// True when this parent repo is currently focused for submodule inspection.
     pub tree_focused: bool,
+    /// Repository is muted (frozen from fleet operations and attention).
+    pub muted: bool,
+    /// Repository is hidden from default fleet views.
+    pub hidden: bool,
 }
 
 /// Interactive `"N sub"` pill that focuses Mission Control on a parent repository
@@ -474,7 +478,33 @@ pub fn card(
                     state
                         .active
                         .then(|| lucide("square-terminal", 13., t.clean)),
-                ),
+                )
+                .children(state.muted.then(|| {
+                    div()
+                        .px(px(6.))
+                        .py(px(1.5))
+                        .rounded(px(t.r_sm))
+                        .bg(rgb(t.warn_wash))
+                        .border_1()
+                        .border_color(rgb(t.warn))
+                        .text_size(px(t.text_caption))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(rgb(t.warn))
+                        .child("Muted")
+                }))
+                .children(state.hidden.then(|| {
+                    div()
+                        .px(px(6.))
+                        .py(px(1.5))
+                        .rounded(px(t.r_sm))
+                        .bg(rgb(t.surface))
+                        .border_1()
+                        .border_color(rgb(t.border))
+                        .text_size(px(t.text_caption))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(rgb(t.fg2))
+                        .child("Hidden")
+                })),
         )
         .child(fav_star);
 
@@ -822,11 +852,41 @@ pub(crate) fn list_item(
     let name_col = {
         let mut col = div().flex().flex_col().min_w(px(0.)).child(
             div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(6.))
                 .truncate()
                 .font_weight(FontWeight::MEDIUM)
                 .text_size(px(t.text_small))
                 .text_color(rgb(t.fg0))
-                .child(row.name.clone()),
+                .child(row.name.clone())
+                .children(state.muted.then(|| {
+                    div()
+                        .px(px(5.))
+                        .py(px(1.))
+                        .rounded(px(t.r_sm))
+                        .bg(rgb(t.warn_wash))
+                        .border_1()
+                        .border_color(rgb(t.warn))
+                        .text_size(px(t.text_caption))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(rgb(t.warn))
+                        .child("Muted")
+                }))
+                .children(state.hidden.then(|| {
+                    div()
+                        .px(px(5.))
+                        .py(px(1.))
+                        .rounded(px(t.r_sm))
+                        .bg(rgb(t.surface))
+                        .border_1()
+                        .border_color(rgb(t.border))
+                        .text_size(px(t.text_caption))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(rgb(t.fg2))
+                        .child("Hidden")
+                })),
         );
         col = col.child(
             div()

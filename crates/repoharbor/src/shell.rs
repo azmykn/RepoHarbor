@@ -81,6 +81,8 @@ pub enum RepoFilter {
     /// agents, …. Live `AgentRunning` sessions stay off this filter (terminal
     /// icon only). Driven by the Needs me work mode.
     Attention,
+    /// Repositories marked hidden by the user. Only revealed under this filter.
+    Hidden,
 }
 
 /// Mission Control work mode — the top-level segmented control that gates
@@ -101,19 +103,24 @@ pub enum WorkMode {
 
 /// Always-visible Mission Control chips (top filter strip) — visibility /
 /// bookkeeping filters independent of the active work mode.
-const VISIBILITY_CHIPS: [RepoFilter; 4] = [
+const VISIBILITY_CHIPS: [RepoFilter; 5] = [
     RepoFilter::Public,
     RepoFilter::Private,
     RepoFilter::Starred,
     RepoFilter::Stale,
+    RepoFilter::Hidden,
 ];
 
-/// True for Public / Private / Starred / Stale — orthogonal to work-mode filters
+/// True for Public / Private / Starred / Stale / Hidden — orthogonal to work-mode filters
 /// (AND’d, never switches Needs me / Behind / Working → All).
 fn is_visibility_filter(f: RepoFilter) -> bool {
     matches!(
         f,
-        RepoFilter::Public | RepoFilter::Private | RepoFilter::Starred | RepoFilter::Stale
+        RepoFilter::Public
+            | RepoFilter::Private
+            | RepoFilter::Starred
+            | RepoFilter::Stale
+            | RepoFilter::Hidden
     )
 }
 
@@ -171,7 +178,8 @@ impl WorkMode {
             | RepoFilter::Public
             | RepoFilter::Private
             | RepoFilter::Starred
-            | RepoFilter::Stale => WorkMode::All,
+            | RepoFilter::Stale
+            | RepoFilter::Hidden => WorkMode::All,
         }
     }
 }
@@ -191,6 +199,7 @@ impl RepoFilter {
             RepoFilter::Starred => "Starred",
             RepoFilter::Stale => "Stale",
             RepoFilter::Attention => "Needs me",
+            RepoFilter::Hidden => "Hidden",
         }
     }
 
@@ -208,6 +217,7 @@ impl RepoFilter {
             RepoFilter::Starred => Some("star"),
             RepoFilter::Stale => Some("clock"),
             RepoFilter::Attention => Some("circle-alert"),
+            RepoFilter::Hidden => Some("eye"),
             RepoFilter::All => None,
         }
     }
@@ -233,6 +243,7 @@ impl RepoFilter {
             RepoFilter::Starred => r.favorite,
             RepoFilter::Stale => r.activity == Activity::Stale,
             RepoFilter::Attention => attention.contains_key(&r.id),
+            RepoFilter::Hidden => true,
         }
     }
 }
@@ -907,6 +918,9 @@ impl SearchQueryFilter {
                     if r.activity != repoharbor_core::model::Activity::Stale {
                         return false;
                     }
+                }
+                "hidden" | "muted" => {
+                    // Processed orthogonally in visible_rows
                 }
                 // Unknown `is:` values don't match
                 _ => return false,
@@ -5242,7 +5256,7 @@ impl RepoHarborApp {
         let repos: Vec<String> = self
             .rows
             .iter()
-            .filter(|r| r.behind > 0)
+            .filter(|r| r.behind > 0 && !self.is_repo_muted(&r.id) && !self.is_repo_hidden(&r.id))
             .map(|r| r.id.to_string())
             .collect();
         if repos.is_empty() {
@@ -5276,6 +5290,108 @@ impl RepoHarborApp {
             repo_id,
             &self.config.mute_attention_prefixes,
         )
+    }
+
+    pub fn is_repo_muted(&self, repo_id: &str) -> bool {
+        self.is_attention_muted(repo_id)
+    }
+
+    pub fn is_repo_hidden(&self, repo_id: &str) -> bool {
+        repoharbor_core::model::path_is_attention_muted(
+            repo_id,
+            &self.config.hidden_repos,
+        )
+    }
+
+    pub fn hide_repos(&mut self, repos: &[String], cx: &mut Context<Self>) {
+        let mut added = 0usize;
+        for raw in repos {
+            let store = repoharbor_core::scan::expand(raw)
+                .to_string_lossy()
+                .into_owned();
+            if store.is_empty() {
+                continue;
+            }
+            let already = self.config.hidden_repos.iter().any(|p| {
+                repoharbor_core::scan::expand(p) == repoharbor_core::scan::expand(&store)
+            });
+            if already {
+                continue;
+            }
+            self.config.hidden_repos.push(store);
+            added += 1;
+        }
+        if added > 0 {
+            let _ = repoharbor_core::config::save(&self.config);
+            self.clear_selection_quiet();
+            self.push_toast(
+                ToastKind::Info,
+                "Repository hidden",
+                Some(format!("Hidden {added} repository(ies). Click the 'Hidden' chip to view or unhide.").into()),
+                cx,
+            );
+            cx.notify();
+        }
+    }
+
+    pub fn unhide_repos(&mut self, repos: &[String], cx: &mut Context<Self>) {
+        let mut removed = 0usize;
+        for raw in repos {
+            let store = repoharbor_core::scan::expand(raw)
+                .to_string_lossy()
+                .into_owned();
+            if store.is_empty() {
+                continue;
+            }
+            let pos = self.config.hidden_repos.iter().position(|p| {
+                repoharbor_core::scan::expand(p) == repoharbor_core::scan::expand(&store)
+            });
+            if let Some(idx) = pos {
+                self.config.hidden_repos.remove(idx);
+                removed += 1;
+            }
+        }
+        if removed > 0 {
+            let _ = repoharbor_core::config::save(&self.config);
+            self.clear_selection_quiet();
+            self.push_toast(
+                ToastKind::Info,
+                "Repository unhidden",
+                Some(format!("Unhid {removed} repository(ies). Now visible in fleet views.").into()),
+                cx,
+            );
+            cx.notify();
+        }
+    }
+
+    pub fn unmute_attention_for_repos(&mut self, repos: &[String], cx: &mut Context<Self>) {
+        let mut removed = 0usize;
+        for raw in repos {
+            let store = repoharbor_core::scan::expand(raw)
+                .to_string_lossy()
+                .into_owned();
+            if store.is_empty() {
+                continue;
+            }
+            let pos = self.config.mute_attention_prefixes.iter().position(|p| {
+                repoharbor_core::scan::expand(p) == repoharbor_core::scan::expand(&store)
+            });
+            if let Some(idx) = pos {
+                self.config.mute_attention_prefixes.remove(idx);
+                removed += 1;
+            }
+        }
+        if removed > 0 {
+            let _ = repoharbor_core::config::save(&self.config);
+            self.recompute_attention();
+            self.push_toast(
+                ToastKind::Success,
+                "Unmuted repository",
+                Some(format!("Unmuted {removed} repository(ies). Now active for fleet operations and attention.").into()),
+                cx,
+            );
+            cx.notify();
+        }
     }
 
     /// Force-refresh host enrichment for every repo (ignores the TTL), then
@@ -5638,10 +5754,29 @@ impl RepoHarborApp {
     /// language AND name query), in the active sort order.
     pub(crate) fn visible_rows(&self) -> Vec<usize> {
         let q_filter = SearchQueryFilter::parse(&self.grid.query);
+        let show_hidden = self.grid.filter == RepoFilter::Hidden
+            || self.grid.visibility == Some(RepoFilter::Hidden)
+            || q_filter.is_filters.iter().any(|f| f == "hidden");
+        let filter_muted = q_filter.is_filters.iter().any(|f| f == "muted");
         let mut v: Vec<usize> = self
             .rows
             .iter()
             .enumerate()
+            .filter(|(_, r)| {
+                let hidden = self.is_repo_hidden(&r.id);
+                if show_hidden {
+                    hidden
+                } else {
+                    !hidden
+                }
+            })
+            .filter(|(_, r)| {
+                if filter_muted {
+                    self.is_repo_muted(&r.id)
+                } else {
+                    true
+                }
+            })
             .filter(|(_, r)| self.row_matches_chips(r))
             .filter(|(_, r)| self.grid.root.as_ref().is_none_or(|root| &r.root == root))
             .filter(|(_, r)| {
@@ -5910,6 +6045,8 @@ impl RepoHarborApp {
             reasons_more,
             reason_subtitle,
             tree_focused: self.grid.tree_focus.as_ref() == Some(id),
+            muted: self.is_repo_muted(id),
+            hidden: self.is_repo_hidden(id),
         }
     }
 
