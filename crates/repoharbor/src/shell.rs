@@ -5297,10 +5297,7 @@ impl RepoHarborApp {
     }
 
     pub fn is_repo_hidden(&self, repo_id: &str) -> bool {
-        repoharbor_core::model::path_is_attention_muted(
-            repo_id,
-            &self.config.hidden_repos,
-        )
+        repoharbor_core::model::path_is_attention_muted(repo_id, &self.config.hidden_repos)
     }
 
     pub fn hide_repos(&mut self, repos: &[String], cx: &mut Context<Self>) {
@@ -5312,9 +5309,10 @@ impl RepoHarborApp {
             if store.is_empty() {
                 continue;
             }
-            let already = self.config.hidden_repos.iter().any(|p| {
-                repoharbor_core::scan::expand(p) == repoharbor_core::scan::expand(&store)
-            });
+            let already =
+                self.config.hidden_repos.iter().any(|p| {
+                    repoharbor_core::scan::expand(p) == repoharbor_core::scan::expand(&store)
+                });
             if already {
                 continue;
             }
@@ -5327,7 +5325,12 @@ impl RepoHarborApp {
             self.push_toast(
                 ToastKind::Info,
                 "Repository hidden",
-                Some(format!("Hidden {added} repository(ies). Click the 'Hidden' chip to view or unhide.").into()),
+                Some(
+                    format!(
+                        "Hidden {added} repository(ies). Click the 'Hidden' chip to view or unhide."
+                    )
+                    .into(),
+                ),
                 cx,
             );
             cx.notify();
@@ -5357,7 +5360,9 @@ impl RepoHarborApp {
             self.push_toast(
                 ToastKind::Info,
                 "Repository unhidden",
-                Some(format!("Unhid {removed} repository(ies). Now visible in fleet views.").into()),
+                Some(
+                    format!("Unhid {removed} repository(ies). Now visible in fleet views.").into(),
+                ),
                 cx,
             );
             cx.notify();
@@ -5764,11 +5769,7 @@ impl RepoHarborApp {
             .enumerate()
             .filter(|(_, r)| {
                 let hidden = self.is_repo_hidden(&r.id);
-                if show_hidden {
-                    hidden
-                } else {
-                    !hidden
-                }
+                if show_hidden { hidden } else { !hidden }
             })
             .filter(|(_, r)| {
                 if filter_muted {
@@ -8276,6 +8277,8 @@ impl RepoHarborApp {
                 );
                 let viewport_w = f32::from(window.viewport_size().width);
                 let drawer_w = self.drawer_w(viewport_w);
+                let is_muted = self.is_repo_muted(&row.id);
+                let is_hidden = self.is_repo_hidden(&row.id);
                 Some(
                     crate::drawer::drawer(
                         row,
@@ -8288,6 +8291,8 @@ impl RepoHarborApp {
                         self.services.ai_ready,
                         self.services.github_authed,
                         drawer_w,
+                        is_muted,
+                        is_hidden,
                     )
                     .into_any_element(),
                 )
@@ -9854,6 +9859,7 @@ mod tests {
         assert!(is_visibility_filter(RepoFilter::Private));
         assert!(is_visibility_filter(RepoFilter::Starred));
         assert!(is_visibility_filter(RepoFilter::Stale));
+        assert!(is_visibility_filter(RepoFilter::Hidden));
         assert!(!is_visibility_filter(RepoFilter::Dirty));
         assert!(!is_visibility_filter(RepoFilter::Attention));
         assert!(!is_visibility_filter(RepoFilter::All));

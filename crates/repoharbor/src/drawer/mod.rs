@@ -1269,6 +1269,8 @@ pub fn drawer(
     ai_ready: bool,
     github_authed: bool,
     width: f32,
+    is_muted: bool,
+    is_hidden: bool,
 ) -> impl IntoElement {
     // Scrim: click anywhere outside the panel to dismiss.
     let backdrop = {
@@ -1314,8 +1316,6 @@ pub fn drawer(
             })
     };
 
-    let is_muted = app.read(cx).is_repo_muted(&row.id);
-    let is_hidden = app.read(cx).is_repo_hidden(&row.id);
     let mut panel = div()
         .relative()
         .flex()
@@ -1406,12 +1406,12 @@ fn header(
                 .px(px(6.))
                 .py(px(1.5))
                 .rounded(px(t.r_sm))
-                .bg(rgb(t.warn_wash))
+                .bg(rgb(t.surface))
                 .border_1()
-                .border_color(rgb(t.warn))
-                .text_size(px(t.text_caption))
+                .border_color(rgb(t.dirty))
+                .text_size(px(t.text_data_sm))
                 .font_weight(FontWeight::SEMIBOLD)
-                .text_color(rgb(t.warn))
+                .text_color(rgb(t.dirty))
                 .child("Muted"),
         );
     }
@@ -1424,7 +1424,7 @@ fn header(
                 .bg(rgb(t.surface))
                 .border_1()
                 .border_color(rgb(t.border))
-                .text_size(px(t.text_caption))
+                .text_size(px(t.text_data_sm))
                 .font_weight(FontWeight::SEMIBOLD)
                 .text_color(rgb(t.fg2))
                 .child("Hidden"),
@@ -4201,6 +4201,41 @@ fn action_bar(
             },
         ));
     }
+
+    let (app_m, repo_m) = (app.clone(), row.id.clone());
+    bar = bar.child(launch_btn(
+        "drawer-mute-toggle",
+        SharedString::from(if is_muted { "Unmute" } else { "Mute" }),
+        is_muted,
+        t,
+        move |_win: &mut Window, cx: &mut App| {
+            let r = repo_m.clone();
+            app_m.update(cx, |this, cx| {
+                if this.is_repo_muted(&r) {
+                    this.unmute_attention_for_repos(&[r.to_string()], cx);
+                } else {
+                    this.mute_attention_for_repos(&[r.to_string()], cx);
+                }
+            });
+        },
+    ));
+    let (app_h, repo_h) = (app.clone(), row.id.clone());
+    bar = bar.child(launch_btn(
+        "drawer-hide-toggle",
+        SharedString::from(if is_hidden { "Unhide" } else { "Hide" }),
+        is_hidden,
+        t,
+        move |_win: &mut Window, cx: &mut App| {
+            let r = repo_h.clone();
+            app_h.update(cx, |this, cx| {
+                if this.is_repo_hidden(&r) {
+                    this.unhide_repos(&[r.to_string()], cx);
+                } else {
+                    this.hide_repos(&[r.to_string()], cx);
+                }
+            });
+        },
+    ));
 
     if show_push || show_reset || show_pr {
         bar = bar.child(div().w(px(1.)).h(px(18.)).mx(px(2.)).bg(rgb(t.border)));
