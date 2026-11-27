@@ -75,3 +75,4 @@ github_token
 .claude/
 .codex/
 agent-transcripts/
+*.snap
