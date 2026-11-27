@@ -42,6 +42,9 @@ On first launch, RepoHarbor automatically scans common workspace folders (`~/odo
 Or grab the latest artifact for your distro from the [releases page](https://github.com/azmykn/RepoHarbor/releases):
 
 ```sh
+# Snap (Ubuntu, Debian, Fedora, Arch, etc.)
+sudo snap install --classic repoharbor
+
 # AppImage — portable, no install
 chmod +x RepoHarbor_*_amd64.AppImage
 ./RepoHarbor_*_amd64.AppImage

@@ -1,0 +1,48 @@
+name: repoharbor
+base: core24
+version: '2026.11.3'
+summary: Native GPU git repository manager and developer dashboard
+description: |
+  RepoHarbor is a native GPU-accelerated desktop application for Linux built on GPUI.
+  It helps you manage, inspect, search, and run git operations across all your local repositories.
+grade: stable
+confinement: classic
+
+apps:
+  repoharbor:
+    command: bin/repoharbor
+    desktop: usr/share/applications/repoharbor.desktop
+    environment:
+      XDG_DATA_DIRS: $SNAP/usr/share:${XDG_DATA_DIRS:-/usr/local/share:/usr/share}
+
+parts:
+  repoharbor:
+    plugin: rust
+    source: .
+    rust-channel: '1.95.0'
+    build-packages:
+      - build-essential
+      - cmake
+      - pkg-config
+      - libvulkan-dev
+      - libwayland-dev
+      - libxkbcommon-dev
+      - libxkbcommon-x11-dev
+      - libxcb1-dev
+      - libfontconfig1-dev
+      - libssl-dev
+    stage-packages:
+      - libvulkan1
+      - libwayland-client0
+      - libxkbcommon0
+      - libxkbcommon-x11-0
+      - libxcb1
+      - libfontconfig1
+      - libssl3
+    override-build: |
+      cargo build --release -p repoharbor
+      mkdir -p $CRAFT_PART_INSTALL/bin
+      cp target/release/repoharbor $CRAFT_PART_INSTALL/bin/repoharbor
+      install -Dm644 packaging/repoharbor.desktop $CRAFT_PART_INSTALL/usr/share/applications/repoharbor.desktop
+      install -Dm644 packaging/icons/128x128@2x.png $CRAFT_PART_INSTALL/usr/share/icons/hicolor/256x256/apps/repoharbor.png
+      install -Dm644 packaging/icons/repoharbor.svg $CRAFT_PART_INSTALL/usr/share/icons/hicolor/scalable/apps/repoharbor.svg
