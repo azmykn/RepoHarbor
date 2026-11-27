@@ -2,20 +2,39 @@ name: repoharbor
 title: RepoHarbor
 base: core24
 version: '2026.11.3'
-summary: Native GPU git repository manager and developer fleet dashboard
+summary: Command center to manage, inspect, and sync fleets of Git repositories
 description: |
-  **RepoHarbor** is a native GPU-accelerated desktop application for Linux built on GPUI.
-  A high-performance command center for your entire local Git fleet.
+  **RepoHarbor** is a high-performance desktop command center built specifically for Linux developers who manage dozens or hundreds of Git repositories, microservices, and nested submodule trees.
 
-  ### Key Features:
-  - ⚡ **Instant Fleet Status:** libgit2 native scanning for hundreds of repos in milliseconds.
-  - 🎨 **Flat Modern GPUI:** 60/120fps hardware-accelerated interface without Electron/Webview overhead.
-  - 📝 **Interactive Commit Composer:** Stage hunks, write commits, and push with one click.
-  - 🚀 **Universal Launchers:** Launch your preferred IDEs (VS Code, Cursor, Zed) and terminal emulators.
-  - 🔍 **Submodule & Worktree Inspection:** Deep dive into branches, stashes, and remote tracking.
-  - 💾 **Local SQLite Cache:** Instant startup, zero latency, completely offline-capable.
+  Unlike single-repo tools or bloated webview/Electron clients, RepoHarbor is engineered in pure Rust on GPUI (the GPU-native framework powering Zed). It renders directly via Vulkan over Wayland and X11 at a buttery 60/120+ FPS, consumes minimal system memory, and works completely offline thanks to a persistent local SQLite cache.
 
-  Designed and maintained by Digital Integrated Transformation Solutions (DigitsCode).
+  ### ⚡ Instant Fleet Situational Awareness
+  - **High-Density Virtualized Fleet:** Scales effortlessly to 500+ repositories with zero scroll stutter or memory leaks.
+  - **Smart Attention Queues:**
+    - **Needs Me:** Automatically flags broken CI builds, pending PR reviews, uncommitted changes, merge conflicts, and diverged branches.
+    - **Behind:** Highlights every repository lagging behind remote upstreams at a glance.
+    - **Working:** Instantly filters to active workspaces with unstaged edits, staged index files, or unpushed commits.
+  - **Multi-Faceted Instant Search:** Filter in real-time by name, folder prefix, language (`lang:rust`, `lang:python`), state (`is:dirty`, `is:behind`), or remote host (`host:github`, `host:gitlab`).
+
+  ### 🚀 Coordinated Fleet Operations
+  - **Bulk Fetch & Pull:** Synchronize 5, 20, or 100 repositories simultaneously with atomic progress indicators.
+  - **Pull Behind:** One-click fast-forward for all out-of-date repositories in one single pass.
+  - **Deep Submodule Management:** Automatically discovers nested `.gitmodules` trees, suppresses noise from top-level views, and provides one-click bulk submodule updates across your whole workspace.
+  - **Protected Upstream Trees:** Guard critical framework cores and vendor directories from accidental commits or force-pushes with pull-only rules.
+
+  ### 🛠️ Deep-Dive Inspection Drawer
+  - **Interactive Syntax-Highlighted Diff:** Inspect changes per hunk with side-by-side or unified views and copy full absolute file paths with one click.
+  - **Interactive Commit Composer:** Stage individual hunks or entire files, author clean commit messages, and push directly.
+  - **Pre-Commit Secret Scanner:** Automatically scans commit payloads for accidental API tokens, secret keys, and credentials before creating unsafe commits.
+  - **Universal Launchers:** Open any repository or specific file directly inside your preferred IDE (VS Code, Cursor, Zed, PyCharm, CLion) or terminal emulator (`kitty`, `alacritty`, `ghostty`, `gnome-terminal`).
+  - **Branch Switching & Merge Recovery:** Quick-switch branches, merge into HEAD with one click, and cleanly abort conflicting merges.
+
+  ### 🔒 Privacy & Performance Contract
+  - **Zero Webview Overhead:** Native GPU-rendered UI that stays responsive even under heavy compilation loads.
+  - **Local-First & Offline Capable:** All repository states, branch histories, and caches reside in a local SQLite database on your machine.
+  - **Optional On-Device AI:** Generate commit messages and changelogs locally via Ollama / llama.cpp without sending private code to external clouds.
+
+  Developed by Digital Integrated Transformation Solutions (DigitsCode).
 grade: stable
 confinement: classic
 license: MIT
